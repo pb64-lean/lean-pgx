@@ -51,19 +51,34 @@ private def users : Pgx.RelationIR := {
   columns := #[
     { name := "age", ordinal := 1, ty := base "int4", nullable := true },
     { name := "status", ordinal := 2, ty := { key := statusKey }, nullable := false },
-    { name := "display_name", ordinal := 3, ty := base "varchar" (some 68), nullable := false }
+    { name := "display_name", ordinal := 3, ty := base "varchar" (some 68), nullable := false },
+    { name := "amount", ordinal := 4, ty := base "numeric", nullable := false }
   ]
 }
 
 private def deterministic : Options := { deterministicTextEquality := true }
 
-private def expectError {α : Type} (category : DiagnosticCategory)
+private def expectCategory {α : Type} (category : DiagnosticCategory)
     (result : Except Diagnostic α) : IO Unit :=
   match result with
-  | .error error =>
+  | .error error => do
       unless error.category == category do
         panic! s!"expected {category.tag}, received {error.category.tag}: {error}"
   | .ok _ => panic! s!"expected {category.tag} diagnostic"
+
+private def expectDiagnostic {α : Type} (category : DiagnosticCategory)
+    (offset : Nat) (message : String) (result : Except Diagnostic α) : IO Unit :=
+  match result with
+  | .ok _ => panic! s!"expected {category.tag} diagnostic"
+  | .error error => do
+      unless error.category == category do
+        panic! s!"expected {category.tag}, received {error.category.tag}: {error}"
+      unless error.offset > 0 do
+        panic! s!"diagnostic offset must be nonzero: {error}"
+      unless error.offset == offset do
+        panic! s!"expected offset {offset}, received {error.offset}: {error}"
+      unless error.message == message do
+        panic! s!"expected message {repr message}, received {repr error.message}"
 
 private partial def hasBtrimValue : ValueExpr → Bool
   | .btrim .. => true
@@ -120,25 +135,42 @@ def main : IO Unit := do
     | .error error => panic! toString error
   assert! lengthCheck.expression.referencedColumns == #["display_name"]
 
-  expectError .unsupportedFunction <| parseTableCheck users #[status] #[trimmed, email]
+  expectDiagnostic .unsupportedFunction 7
+    "function lower is not supported in local constraints" <|
+    parseTableCheck users #[status] #[trimmed, email]
     "CHECK (lower(display_name) = 'someone'::text)" deterministic
-  expectError .unsupportedOperator <| parseTableCheck users #[status] #[trimmed, email]
+  expectDiagnostic .unsupportedOperator 20
+    "operator ~ is not supported in local constraints" <|
+    parseTableCheck users #[status] #[trimmed, email]
     "CHECK (display_name ~ '^[a-z]+$'::text)" deterministic
-  expectError .unsupportedOperator <| parseTableCheck users #[status] #[trimmed, email]
+  expectDiagnostic .unsupportedType 14
+    "pg_catalog.numeric comparisons are unsupported because exact ordering is not modeled" <|
+    parseTableCheck users #[status] #[trimmed, email]
+    "CHECK (amount >= 1.25)"
+  expectCategory .unsupportedOperator <| parseTableCheck users #[status] #[trimmed, email]
     "CHECK (display_name = 'someone'::text)"
-  expectError .unsupportedOperator <| parseTableCheck users #[status] #[trimmed, email]
+  expectCategory .unsupportedOperator <| parseTableCheck users #[status] #[trimmed, email]
     "CHECK (display_name < 'someone'::text)" deterministic
-  expectError .unsupportedOperator <| parseTableCheck users #[status] #[trimmed, email]
+  expectCategory .unsupportedOperator <| parseTableCheck users #[status] #[trimmed, email]
     "CHECK ((age + 1) > 0)"
-  expectError .unsafeCast <| parseTableCheck users #[status] #[trimmed, email]
+  expectDiagnostic .unsafeCast 11
+    "cast from pg_catalog.int4 (base) to pg_catalog.int2 (base) is not known to preserve modeled values" <|
+    parseTableCheck users #[status] #[trimmed, email]
     "CHECK ((age::int2) >= 0)"
-  expectError .unknownIdentifier <| parseTableCheck users #[status] #[trimmed, email]
+  expectDiagnostic .unknownIdentifier 7 "unknown constraint column missing" <|
+    parseTableCheck users #[status] #[trimmed, email]
     "CHECK (missing >= 0)"
-  expectError .invalidLiteral <| parseTableCheck users #[status] #[trimmed, email]
+  expectCategory .invalidLiteral <| parseTableCheck users #[status] #[trimmed, email]
     "CHECK (status = 'pending'::app.user_status)"
-  expectError .nonBooleanCheck <| parseTableCheck users #[status] #[trimmed, email]
+  expectDiagnostic .typeMismatch 11
+    "incompatible operand types pg_catalog.int4 (base) and app.user_status (enum)" <|
+    parseTableCheck users #[status] #[trimmed, email]
+    "CHECK (age = status)"
+  expectDiagnostic .nonBooleanCheck 7
+    "check expression has scalar type pg_catalog.int4 (base), not Boolean" <|
+    parseTableCheck users #[status] #[trimmed, email]
     "CHECK (age)"
-  expectError .typeMismatch <| parseTableCheck users #[status] #[trimmed, email]
+  expectCategory .typeMismatch <| parseTableCheck users #[status] #[trimmed, email]
     "CHECK (btrim(display_name, 'x'::text) = display_name)" deterministic
 
   IO.println "PASS typed PostgreSQL constraint parser"

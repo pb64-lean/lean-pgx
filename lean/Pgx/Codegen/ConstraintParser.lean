@@ -850,6 +850,9 @@ private partial def resolveComparison (scope : Scope) (offset : Nat)
         | .error _ => throw firstError
         | .ok right => pure (← resolveValue scope rawLeft (some right.type), right)
   let common ← chooseCommonType offset left.type right.type
+  if common.base matches .numeric then
+    throw (diagnostic .unsupportedType offset
+      "pg_catalog.numeric comparisons are unsupported because exact ordering is not modeled")
   if common.isText && op != .eq && op != .ne then
     throw (diagnostic .unsupportedOperator offset
       "text ordering is collation-sensitive and is not modeled")

@@ -166,6 +166,54 @@ def position (needle haystack : String) : Int :=
   if needle.isEmpty then 1
   else Int.ofNat (positionChars needle.toList haystack.toList 1)
 
+/-! ## Character type modifiers
+
+PostgreSQL stores `varchar(n)` and `bpchar(n)` type modifiers as `n + 4`.
+The distinguished raw value `-1` means unbounded.  Canonical `TypeRef` values
+normally represent that value as `none`, but accepting both forms keeps this
+helper useful at the wire/catalog boundary as well as during emission.
+-/
+
+/-- Decode a raw PostgreSQL `varchar`/`bpchar` type modifier. -/
+def decodeRawCharacterTypmod (typmod : Int32) :
+    Except EvaluationError (Option Nat) :=
+  if typmod == -1 then
+    .ok none
+  else
+    let raw := typmod.toInt
+    if raw ≤ 4 then
+      .error (.invalidValue "character typmod"
+        s!"expected -1 or a stored typmod of at least 5, got {raw}")
+    else
+      .ok (some (raw - 4).toNat)
+
+/-- Decode the canonical optional type modifier carried by `Pgx.TypeRef`. -/
+def decodeCharacterTypmod : Option Int32 → Except EvaluationError (Option Nat)
+  | none => .ok none
+  | some typmod => decodeRawCharacterTypmod typmod
+
+/-- Evaluate the local proposition induced by a decoded character limit.
+Null produces SQL unknown, while an unbounded non-null value always passes.
+`String.length` counts Unicode scalar values rather than UTF-8 bytes. -/
+def characterLengthBound (limit : Option Nat) : Option String → SqlTruth
+  | none => .unknown
+  | some value =>
+      match limit with
+      | none => .true
+      | some maximum => if value.length ≤ maximum then .true else .false
+
+/-- Decode and evaluate a `varchar`/`bpchar` type-modifier refinement. -/
+def evaluateCharacterTypmod (typmod : Option Int32) (value : Option String) :
+    Except EvaluationError SqlTruth := do
+  pure (characterLengthBound (← decodeCharacterTypmod typmod) value)
+
+/-- Numeric precision/scale typmods do not yet have a sound local
+proposition.  Code generation can use this stable diagnostic instead of
+silently treating them as character-style bounds. -/
+def unsupportedNumericTypmod (typmod : Option Int32) : EvaluationError :=
+  .invalidValue "numeric typmod"
+    s!"local numeric precision/scale propositions are unsupported ({repr typmod})"
+
 /-- One independently named PostgreSQL check over a decoded Lean value. -/
 structure Check (α : Type u) where
   name : String

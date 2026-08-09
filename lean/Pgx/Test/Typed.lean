@@ -121,4 +121,7 @@ def main : IO UInt32 := do
     | .error error => throw (IO.userError (toString error))
   assert! encoded.format == 0
   assert! encoded.value == some "42".toUTF8
+  assert! toString (Error.constraintViolation
+    (.checkFailed "users_display_name_not_blank")) ==
+      "local constraint violation: PostgreSQL check users_display_name_not_blank evaluated to false"
   return 0

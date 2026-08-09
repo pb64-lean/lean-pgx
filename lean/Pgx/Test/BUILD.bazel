@@ -64,3 +64,10 @@ lean_test(
     deps = ["//lean/Pgx/Codegen:projection"],
     strip_module_prefix = "lean",
 )
+
+lean_test(
+    name = "typmod_test",
+    srcs = ["Typmod.lean"],
+    deps = ["//lean/Pgx/Constraint:semantics"],
+    strip_module_prefix = "lean",
+)

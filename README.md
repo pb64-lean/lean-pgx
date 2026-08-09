@@ -5,17 +5,24 @@ DDL and literal SQL. PostgreSQL itself performs SQL parsing, name resolution,
 cast selection, and result description; generated code stores only symbolic
 schema/type identities and verifies the live descriptors before decoding.
 
-Milestone 1 includes:
+The current implementation includes:
 
 - deterministic schema/query IR for schemas, enums, domains, tables, columns,
   constraints, indexes, parameters, result columns, and cardinality;
 - a pinned PostgreSQL 18.2 generation action and PostgreSQL 17.8 compatibility
   test;
-- generated enum codecs, branded domains, `Params`, `Row`, and checked runners;
+- generated enum codecs, proof-refined domains, `Params`, proof-refined `Row`
+  values, and checked runners;
+- a typed local-constraint IR with PostgreSQL three-valued Boolean semantics,
+  proof-producing domain/row validators, and soundness/completeness theorems;
+- provenance-checked propagation of domain and same-row `CHECK` refinements
+  through complete direct query projections;
 - conservative result nullability (`Option` whenever non-null cannot be
   established);
 - runtime symbolic OID resolution, schema attachment, prepared-descriptor
   verification, and typed `SchemaDrift`/`QueryDrift` errors;
+- local revalidation during decoding, reported as typed constraint-violation
+  errors when stored data does not establish the generated proposition;
 - explicit type overrides and hard generation errors for unsupported types.
 
 ## Bazel usage
@@ -128,6 +135,22 @@ compares schema descriptors. Each query's first use prepares with resolved
 parameter OIDs and compares the returned parameter/result descriptors before
 binding or decoding.
 
+Generated domains and row-returning queries separate freely constructible
+`Data` from their proof-bearing public value:
+
+```lean
+def ValidPred : Data → Prop
+def validate : Data → Except Pgx.ConstraintViolation Row
+theorem validate_sound ...
+theorem validate_complete ...
+```
+
+`CHECK` evaluation is performed again in Lean. As in PostgreSQL, only SQL
+`false` violates a check; `true` and `unknown` both pass. No database axiom is
+used to construct the subtype proof. Unique, primary-key uniqueness,
+foreign-key, exclusion, and index properties remain metadata because they are
+not predicates of one value.
+
 The generated runners map cardinality to results as follows:
 
 | Manifest value | Lean result |
@@ -140,7 +163,7 @@ The generated runners map cardinality to results as follows:
 ## Type overrides
 
 Arrays, ranges, composites, pseudo-types, and unrecognized extension types are
-rejected in Milestone 1 unless the manifest declares an override:
+rejected by the current type surface unless the manifest declares an override:
 
 ```json
 {
@@ -168,7 +191,8 @@ bazel test //...
 
 The end-to-end fixture in `examples/app_db` exercises DDL replay, all four
 cardinalities, enum/domain generation, conservative outer-join nullability,
-shifted user OIDs, runtime cardinality checks, `QueryDrift`, `SchemaDrift`, and
+shifted user OIDs, proof-producing local validation, invalid stored-data
+rejection, runtime cardinality checks, `QueryDrift`, `SchemaDrift`, and
 PostgreSQL 17/18 compatibility.
 
 Lake supplies the editor project model; Bazel remains authoritative:

@@ -99,6 +99,19 @@ def main : IO UInt32 := do
       { emailColumn with name := "age", ty := intType } intType with
   | .ok logical => assert! logical.isNone
   | .error error => panic! toString error
+  let unsupportedSource := "CHECK (lower(age) > 0)"
+  let unsupportedDiagnostic : Pgx.Constraint.Diagnostic := {
+    category := .unsupportedFunction
+    offset := 7
+    message := "function lower is not supported in local constraints"
+  }
+  let rendered := toString (Error.unsupportedConstraint "app.users"
+    "users_age_check" unsupportedSource unsupportedDiagnostic)
+  assert! rendered.contains "app.users"
+  assert! rendered.contains "users_age_check"
+  assert! rendered.contains "category=unsupported-function"
+  assert! rendered.contains "offset=7"
+  assert! rendered.contains unsupportedSource
   assert! !Pg17.adapter.supportsNativeNotNull
   assert! Pg18.adapter.supportsNativeNotNull
   assert! !Pg17.adapter.constraintTypeTags.contains "n"
