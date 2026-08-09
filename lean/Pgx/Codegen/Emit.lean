@@ -1292,6 +1292,7 @@ private def rawEncodeBody (use : TypeUse) : List String :=
   match use.codec with
   | some codec => [s!"  {codec}.encode resolve resolved value"]
   | none => [
+      "  let _ := resolved",
       "  pure {",
       s!"    format := Pg.PgEncode.format {use.leanType}",
       "    value := Pg.PgEncode.encode value",
@@ -1313,9 +1314,10 @@ private def componentEncodeBody (ref : Pgx.TypeRef) (use : TypeUse) : List Strin
       [s!"  {codec}.encodeText resolve ({typeRefExpr ref}) value"]
   | none =>
       if ref.key.schema == "pg_catalog" && ref.key.name == "bytea" then
-        [s!"  pure ({stringLiteral "\\x"} ++ Pg.Crypto.toHexLower value)"]
+        ["  let _ := resolve",
+          s!"  pure ({stringLiteral "\\x"} ++ Pg.Crypto.toHexLower value)"]
       else
-        ["  Pgx.Typed.encodeBuiltinText value"]
+        ["  let _ := resolve", "  Pgx.Typed.encodeBuiltinText value"]
 
 private def componentDecodeTextBody (ref : Pgx.TypeRef) (use : TypeUse) : List String :=
   match use.codec with

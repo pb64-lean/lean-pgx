@@ -7,8 +7,9 @@ schema/type identities and verifies the live descriptors before decoding.
 
 The current implementation includes:
 
-- deterministic schema/query IR for schemas, enums, domains, tables, columns,
-  constraints, indexes, parameters, result columns, and cardinality;
+- deterministic schema/query IR for schemas, enums, domains, arrays,
+  composites, ranges, multiranges, tables, views, routines, constraints,
+  indexes, parameters, result columns, and cardinality;
 - a pinned PostgreSQL 18.2 generation action and PostgreSQL 17.8 compatibility
   test;
 - generated enum codecs, proof-refined domains, `Params`, proof-refined `Row`
@@ -21,6 +22,12 @@ The current implementation includes:
   established);
 - runtime symbolic OID resolution, schema attachment, prepared-descriptor
   verification, and typed `SchemaDrift`/`QueryDrift` errors;
+- generated one-dimensional arrays of built-in and generated values, named
+  composite cells, and range/multirange values with resolver-aware codecs;
+- local character, exact numeric precision/scale, temporal precision, and
+  interval precision refinements;
+- reusable extension codec packages whose installed version and owned types
+  are recorded in the generated contract;
 - local revalidation during decoding, reported as typed constraint-violation
   errors when stored data does not establish the generated proposition;
 - explicit type overrides and hard generation errors for unsupported types.
@@ -131,9 +138,24 @@ let checked ← AppDb.attach raw
 
 Attachment installs and verifies the generated session contract, checks the
 server major, resolves every symbolic type/relation against local OIDs, and
-compares schema descriptors. Each query's first use prepares with resolved
-parameter OIDs and compares the returned parameter/result descriptors before
-binding or decoding.
+compares schema descriptors, including array elements, composite fields, and
+range/multirange links. Each query's first use prepares with resolved parameter
+OIDs and compares the returned parameter/result descriptors before binding or
+decoding.
+
+Generated container values use these runtime shapes:
+
+```lean
+Pgx.Typed.PgArray α       -- Array (Option α), one dimension
+Pgx.Typed.PgRange α       -- empty or finite/infinite typed bounds
+Pgx.Typed.PgMultirange α  -- Array (PgRange α)
+```
+
+A named PostgreSQL composite becomes a generated structure. Every composite
+field is an `Option`: table `NOT NULL` constraints do not constrain a row-type
+value used independently. `AppDb.Constraints.views` and
+`AppDb.Constraints.routines` expose normalized view and overload/table-result
+metadata captured from PostgreSQL.
 
 Generated domains and row-returning queries separate freely constructible
 `Data` from their proof-bearing public value:
@@ -175,10 +197,10 @@ The generated runners map cardinality to results as follows:
 | `zeroOrOne` | `Option Row` |
 | `many` | `Array Row` |
 
-## Type overrides
+## Type overrides and extension packages
 
-Arrays, ranges, composites, pseudo-types, and unrecognized extension types are
-rejected by the current type surface unless the manifest declares an override:
+Unknown base/extension types and pseudo-types are rejected unless the manifest
+declares an override:
 
 ```json
 {
@@ -197,6 +219,32 @@ The `codec` declaration must have type
 `Pgx.Typed.ResolvedCodec MyVector.Vector`; add its Bazel Lean target to the
 `deps` of `lean_pg_library`.
 
+When several codecs belong to one PostgreSQL extension, declare them as a
+package. The package owns one import module, so nested overrides omit
+`importModule`:
+
+```json
+{
+  "extensionCodecPackages": [
+    {
+      "extension": "vector",
+      "importModule": "PgVector",
+      "typeOverrides": [
+        {
+          "key": {"schema": "public", "name": "vector", "kind": "base"},
+          "leanType": "PgVector.Vector",
+          "codec": "PgVector.codec"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Generation requires that extension to be installed, resolves its installed
+version, rejects overlapping package ownership, and records deterministic
+package provenance alongside the resolved overrides.
+
 ## Build and tests
 
 ```sh
@@ -205,10 +253,11 @@ bazel test //...
 ```
 
 The end-to-end fixture in `examples/app_db` exercises DDL replay, all four
-cardinalities, enum/domain generation, conservative outer-join nullability,
-shifted user OIDs, proof-producing local validation, invalid stored-data
-rejection, runtime cardinality checks, `QueryDrift`, `SchemaDrift`, and
-PostgreSQL 17/18 compatibility.
+cardinalities, enum/domain arrays, composite cells, ranges/multiranges,
+numeric/time modifiers, view and table-valued-function metadata,
+conservative outer-join nullability, shifted user OIDs, proof-producing local
+validation, invalid stored-data rejection, runtime cardinality checks,
+`QueryDrift`, `SchemaDrift`, and live PostgreSQL 17/18 compatibility.
 
 Lake supplies the editor project model; Bazel remains authoritative:
 
