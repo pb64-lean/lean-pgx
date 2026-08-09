@@ -1,3 +1,4 @@
+import Pgx.Typed
 import Pgx.Core
 
 /-!

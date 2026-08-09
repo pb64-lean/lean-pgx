@@ -5,6 +5,17 @@ load("@rules_lean//lean:defs.bzl", "lean_library")
 package(default_visibility = ["//visibility:public"])
 
 lean_library(
+    name = "pg_typed",
+    srcs = ["Typed.lean"],
+    deps = [
+        "//lean/Pgx/Typed:catalog",
+        "//lean/Pgx/Typed:descriptors",
+        "//lean/Pgx/Typed:query",
+    ],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
     name = "ir",
     srcs = ["IR.lean"],
     deps = ["@pg_lean//:pg_lean"],

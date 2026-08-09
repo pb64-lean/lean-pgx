@@ -226,7 +226,7 @@ structure SessionContract where
   deriving Repr, BEq, Inhabited
 
 /-- Escape hatch for an extension/user type.  `codec` names a Lean declaration
-of type `Pg.Typed.ResolvedCodec leanType`; the Bazel target containing it is a
+of type `Pgx.Typed.ResolvedCodec leanType`; the Bazel target containing it is a
 normal dependency of the generated library. -/
 structure TypeOverrideIR where
   key : TypeKey
@@ -273,6 +273,9 @@ private def typeRefAtom (ref : TypeRef) : String :=
 private def relationKeyAtom (key : RelationKey) : String :=
   atom key.schema ++ atom key.name
 
+private def schemaAtom (schema : SchemaIR) : String :=
+  atom schema.name
+
 private def relationColumnAtom (column : RelationColumnIR) : String :=
   atom column.name ++ atom (toString column.ordinal) ++ typeRefAtom column.ty ++
     boolAtom column.nullable ++ boolAtom column.identity ++ boolAtom column.generated ++
@@ -316,23 +319,95 @@ private def queryAtom (query : QueryIR) : String :=
   atom query.name ++ atom query.sqlHash ++ arrayAtom paramAtom query.params ++
     arrayAtom queryColumnAtom query.columns ++ atom query.cardinality.tag
 
-/-- Canonical material for the type-relevant contract.  Physical OIDs, ACLs,
-owners, and performance-only index details cannot influence it. -/
-def DatabaseIR.contractMaterial (db : DatabaseIR) : String :=
-  atom (toString db.formatVersion) ++ atom (toString db.serverMajor) ++
+private def sortByAtom (f : α → String) (values : Array α) : Array α :=
+  (values.toList.mergeSort fun left right =>
+    compare (f left) (f right) == Ordering.lt).toArray
+
+private def relationColumnLess
+    (left right : RelationColumnIR) : Bool :=
+  match compare left.ordinal right.ordinal with
+  | .lt => true
+  | .gt => false
+  | .eq =>
+      match compare left.name right.name with
+      | .lt => true
+      | .gt => false
+      | .eq => compare (relationColumnAtom left) (relationColumnAtom right) == Ordering.lt
+
+private def paramLess (left right : ParamIR) : Bool :=
+  match compare left.position right.position with
+  | .lt => true
+  | .gt => false
+  | .eq =>
+      match compare left.name right.name with
+      | .lt => true
+      | .gt => false
+      | .eq => compare (paramAtom left) (paramAtom right) == Ordering.lt
+
+private def normalizeDomain (domain : DomainIR) : DomainIR :=
+  { domain with constraints := sortByAtom id domain.constraints }
+
+private def normalizeRelation (relation : RelationIR) : RelationIR :=
+  { relation with columns := relation.columns.toList.mergeSort relationColumnLess |>.toArray }
+
+private def normalizeQuery (query : QueryIR) : QueryIR :=
+  { query with params := query.params.toList.mergeSort paramLess |>.toArray }
+
+/-- Put every unordered IR collection in a stable order before serialization.
+Arrays whose order is part of PostgreSQL semantics (including enum labels,
+query result columns, constraint/index columns, and `search_path`) are
+deliberately preserved. -/
+def DatabaseIR.normalize (db : DatabaseIR) : DatabaseIR :=
+  let domains := db.domains.map normalizeDomain
+  let relations := db.relations.map normalizeRelation
+  let queries := db.queries.map normalizeQuery
+  { db with
+    serverFeatures := sortByAtom id db.serverFeatures
+    schemas := sortByAtom schemaAtom db.schemas
+    enums := sortByAtom enumAtom db.enums
+    domains := sortByAtom domainAtom domains
+    relations := sortByAtom relationAtom relations
+    constraints := sortByAtom constraintAtom db.constraints
+    indexes := sortByAtom indexAtom db.indexes
+    queries := sortByAtom queryAtom queries
+    requiredExtensions := sortByAtom (fun value => atom value.1 ++ atom value.2)
+      db.requiredExtensions
+    typeOverrides := sortByAtom overrideAtom db.typeOverrides }
+
+private def databaseMaterial (includeServerMajor : Bool) (db : DatabaseIR) : String :=
+  atom (toString db.formatVersion) ++
+    (if includeServerMajor then atom (toString db.serverMajor) else "") ++
     arrayAtom id db.serverFeatures ++ arrayAtom id db.session.searchPath ++ atom db.session.timezone ++
     atom db.session.encoding ++ boolAtom db.session.standardConformingStrings ++
-    arrayAtom enumAtom db.enums ++ arrayAtom domainAtom db.domains ++
-    arrayAtom relationAtom db.relations ++ arrayAtom constraintAtom db.constraints ++
+    arrayAtom schemaAtom db.schemas ++ arrayAtom enumAtom db.enums ++
+    arrayAtom domainAtom db.domains ++ arrayAtom relationAtom db.relations ++
+    arrayAtom constraintAtom db.constraints ++
     arrayAtom indexAtom (db.indexes.filter fun value => value.unique || value.primary) ++
     arrayAtom queryAtom db.queries ++ arrayAtom (fun value =>
       atom value.1 ++ atom value.2) db.requiredExtensions ++
     arrayAtom overrideAtom db.typeOverrides
+
+/-- Canonical material for the type-relevant contract.  Physical OIDs, ACLs,
+owners, and performance-only index details cannot influence it. -/
+def DatabaseIR.contractMaterial (db : DatabaseIR) : String :=
+  databaseMaterial true db.normalize
+
+/-- Canonical material used to compare contracts produced by different
+PostgreSQL majors.  It differs from `contractMaterial` only by omitting the
+server major itself. -/
+def DatabaseIR.compatibilityMaterial (db : DatabaseIR) : String :=
+  databaseMaterial false db.normalize
 
 def DatabaseIR.contractHashBytes (db : DatabaseIR) : ByteArray :=
   Pg.Crypto.sha256 db.contractMaterial.toUTF8
 
 def DatabaseIR.contractHash (db : DatabaseIR) : String :=
   Pg.Crypto.toHexLower db.contractHashBytes
+
+def DatabaseIR.compatibilityHashBytes (db : DatabaseIR) : ByteArray :=
+  Pg.Crypto.sha256 db.compatibilityMaterial.toUTF8
+
+def DatabaseIR.compatibilityHash (db : DatabaseIR) : String :=
+  Pg.Crypto.toHexLower db.compatibilityHashBytes
 
 end Pgx

@@ -8,3 +8,10 @@ lean_test(
     deps = ["//lean/Pgx:type_mapping"],
     strip_module_prefix = "lean",
 )
+
+lean_test(
+    name = "typed_test",
+    srcs = ["Typed.lean"],
+    deps = ["//lean/Pgx/Typed:descriptors"],
+    strip_module_prefix = "lean",
+)

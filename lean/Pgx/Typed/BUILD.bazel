@@ -1,0 +1,36 @@
+"""Typed runtime targets for generated PostgreSQL contracts."""
+
+load("@rules_lean//lean:defs.bzl", "lean_library")
+
+package(default_visibility = ["//visibility:public"])
+
+lean_library(
+    name = "descriptors",
+    srcs = ["Descriptors.lean"],
+    deps = [
+        "//lean/Pgx:ir",
+        "@pg_lean//:pg_lean",
+    ],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
+    name = "catalog",
+    srcs = ["Catalog.lean"],
+    deps = [
+        ":descriptors",
+        "@pg_lean//Pg:connection",
+    ],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
+    name = "query",
+    srcs = ["Query.lean"],
+    deps = [
+        ":catalog",
+        ":descriptors",
+        "@pg_lean//:pg_lean",
+    ],
+    strip_module_prefix = "lean",
+)

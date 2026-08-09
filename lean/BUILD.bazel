@@ -4,9 +4,17 @@ load("@rules_lean//lean:defs.bzl", "lean_library")
 
 package(default_visibility = ["//visibility:public"])
 
+alias(
+    name = "pg_typed",
+    actual = "//lean/Pgx:pg_typed",
+)
+
 lean_library(
     name = "pgx",
     srcs = ["Pgx.lean"],
-    deps = ["//lean/Pgx:core"],
+    deps = [
+        ":pg_typed",
+        "//lean/Pgx:core",
+    ],
     strip_module_prefix = "lean",
 )
