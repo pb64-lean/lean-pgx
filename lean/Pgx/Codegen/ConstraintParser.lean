@@ -653,6 +653,38 @@ private def castPreservation? (source target : ScalarType) : Option CastPreserva
     | some _, none => if target.base matches .numeric then some .exactNumeric else none
     | _, _ => none
 
+private def constrainedTargetDomain? (scope : Scope)
+    (target : ScalarType) : Option Pgx.DomainIR := Id.run do
+  for key in target.domains do
+    if let some domain := scope.domains.find? (fun domain => domain.key == key) then
+      if domain.notNull || !domain.localConstraints.isEmpty || domain.base.typmod.isSome then
+        return some domain
+  return none
+
+private def ensureExplicitDomainCastPreserving (scope : Scope) (offset : Nat)
+    (source target : ScalarType) : Except Diagnostic Unit := do
+  match constrainedTargetDomain? scope target with
+  | none =>
+      unless target.domains.isEmpty || source.base == target.base do
+        let key := target.domains[0]!
+        throw (diagnostic .unsafeCast offset
+          s!"cast into domain {key.display} changes its modeled base type")
+  | some domain =>
+      let validation :=
+        if domain.base.typmod.isSome &&
+            (domain.notNull || !domain.localConstraints.isEmpty) then
+          "domain constraints and a base type modifier"
+        else if domain.base.typmod.isSome then
+          "a base type modifier"
+        else if domain.notNull && !domain.localConstraints.isEmpty then
+          "NOT NULL and CHECK constraints"
+        else if domain.notNull then
+          "a NOT NULL constraint"
+        else
+          "CHECK constraints"
+      throw (diagnostic .unsafeCast offset
+        s!"cast into domain {domain.key.display} may enforce {validation}")
+
 private def preservingCast (offset : Nat) (value : ValueExpr) (target : ScalarType) :
     Except Diagnostic ValueExpr := do
   let some preservation := castPreservation? value.type target
@@ -757,6 +789,7 @@ private partial def resolveValue (scope : Scope) (raw : RawExpr)
       let target ← resolveTypeSyntax scope typeSyntax
       match rawValue, target.base with
       | .string literalOffset label, .enumeration key =>
+          ensureExplicitDomainCastPreserving scope offset textType target
           let some enum := scope.enums.find? (fun enum => enum.key == key)
             | throw (diagnostic .unsupportedType literalOffset
                 s!"enum metadata is missing for {key.display}")
@@ -766,6 +799,7 @@ private partial def resolveValue (scope : Scope) (raw : RawExpr)
           pure (.cast .enumLiteral (.literal (.text label) textType) target)
       | _, _ =>
           let value ← resolveValue scope rawValue (some target)
+          ensureExplicitDomainCastPreserving scope offset value.type target
           preservingCast offset value target
   | .unary offset .plus value =>
       let value ← resolveValue scope value expected

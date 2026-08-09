@@ -28,6 +28,24 @@ private def emailKey : Pgx.TypeKey := {
   kind := .domain
 }
 
+private def checkedKey : Pgx.TypeKey := {
+  schema := "app"
+  name := "checked_text"
+  kind := .domain
+}
+
+private def limitedKey : Pgx.TypeKey := {
+  schema := "app"
+  name := "limited_text"
+  kind := .domain
+}
+
+private def wideIntKey : Pgx.TypeKey := {
+  schema := "app"
+  name := "wide_int"
+  kind := .domain
+}
+
 private def status : Pgx.EnumIR := {
   key := statusKey
   labels := #["active", "disabled"]
@@ -45,6 +63,29 @@ private def email : Pgx.DomainIR := {
   notNull := true
 }
 
+private def checked : Pgx.DomainIR := {
+  key := checkedKey
+  base := base "text"
+  notNull := false
+  localConstraints := #[{
+    name := "checked_text_check"
+    source := "CHECK (false)"
+    expression := .constant (some false)
+  }]
+}
+
+private def limited : Pgx.DomainIR := {
+  key := limitedKey
+  base := base "varchar" (some 7)
+  notNull := false
+}
+
+private def wideInt : Pgx.DomainIR := {
+  key := wideIntKey
+  base := base "int8"
+  notNull := false
+}
+
 private def users : Pgx.RelationIR := {
   key := { schema := "app", name := "users" }
   kind := .table
@@ -53,7 +94,9 @@ private def users : Pgx.RelationIR := {
     { name := "status", ordinal := 2, ty := { key := statusKey }, nullable := false },
     { name := "display_name", ordinal := 3, ty := base "varchar" (some 68), nullable := false },
     { name := "amount", ordinal := 4, ty := base "numeric", nullable := false },
-    { name := "code", ordinal := 5, ty := base "bpchar" (some 7), nullable := false }
+    { name := "code", ordinal := 5, ty := base "bpchar" (some 7), nullable := false },
+    { name := "email", ordinal := 6, ty := { key := emailKey }, nullable := false },
+    { name := "checked_value", ordinal := 7, ty := { key := checkedKey }, nullable := false }
   ]
 }
 
@@ -102,6 +145,15 @@ private partial def hasNestedDomain : ValueExpr → Bool
       hasNestedDomain value
   | .add left right _ | .sub left right _ | .position left right _ =>
       hasNestedDomain left || hasNestedDomain right
+  | _ => false
+
+private partial def hasDomainUnwrap : ValueExpr → Bool
+  | .cast .domain value target =>
+      (!value.type.domains.isEmpty && target.domains.isEmpty) || hasDomainUnwrap value
+  | .cast _ value _ | .neg value _ | .charLength value _ | .btrim value _ =>
+      hasDomainUnwrap value
+  | .add left right _ | .sub left right _ | .position left right _ =>
+      hasDomainUnwrap left || hasDomainUnwrap right
   | _ => false
 
 private partial def anyValue (predicate : ValueExpr → Bool) : TruthExpr → Bool
@@ -189,6 +241,52 @@ def main : IO Unit := do
     "pg_catalog.bpchar local constraint semantics are unsupported because fixed-length blank padding is not modeled" <|
     parseTableCheck users #[status] #[trimmed, email]
       "CHECK (display_name::bpchar IS NOT NULL)"
+
+  expectDiagnostic .unsafeCast 19
+    "cast into domain app.email_address (domain) may enforce a NOT NULL constraint" <|
+    parseTableCheck users #[status] #[trimmed, email, checked]
+      "CHECK (display_name::app.email_address IS NOT NULL)"
+  expectDiagnostic .unsafeCast 19
+    "cast into domain app.checked_text (domain) may enforce CHECK constraints" <|
+    parseTableCheck users #[status] #[trimmed, email, checked]
+      "CHECK (display_name::app.checked_text IS NOT NULL)"
+  expectDiagnostic .unsafeCast 9
+    "cast into domain app.checked_text (domain) may enforce CHECK constraints" <|
+    parseTableCheck users #[status] #[trimmed, email, checked]
+      "CHECK (''::app.checked_text IS NOT NULL)"
+  expectDiagnostic .unsafeCast 11
+    "cast into domain app.email_address (domain) may enforce a NOT NULL constraint" <|
+    parseTableCheck users #[status] #[trimmed, email, checked]
+      "CHECK (NULL::app.email_address IS NULL)"
+  expectDiagnostic .unsafeCast 19
+    "cast into domain app.limited_text (domain) may enforce a base type modifier" <|
+    parseTableCheck users #[status] #[trimmed, email, checked, limited]
+      "CHECK (display_name::app.limited_text IS NOT NULL)"
+  expectDiagnostic .unsafeCast 10
+    "cast into domain app.wide_int (domain) changes its modeled base type" <|
+    parseTableCheck users #[status] #[trimmed, email, checked, wideInt]
+      "CHECK (age::app.wide_int IS NOT NULL)"
+
+  let safeDomainWrap ← match parseTableCheck users #[status] #[trimmed, email, checked]
+      "CHECK (display_name::app.trimmed_text IS NOT NULL)" with
+    | .ok parsed => pure parsed
+    | .error error => panic! toString error
+  assert! safeDomainWrap.expression.referencedColumns == #["display_name"]
+  let safeDomainUnwrap ← match parseTableCheck users #[status] #[trimmed, email, checked]
+      "CHECK (email::text IS NOT NULL)" with
+    | .ok parsed => pure parsed
+    | .error error => panic! toString error
+  assert! anyValue hasDomainUnwrap safeDomainUnwrap.expression
+  let safeCheckedUnwrap ← match
+      parseTableCheck users #[status] #[trimmed, email, checked]
+        "CHECK (checked_value::text IS NOT NULL)" with
+    | .ok parsed => pure parsed
+    | .error error => panic! toString error
+  assert! anyValue hasDomainUnwrap safeCheckedUnwrap.expression
+  expectDiagnostic .unsafeCast 20
+    "cast into domain app.checked_text (domain) may enforce CHECK constraints" <|
+    parseTableCheck users #[status] #[trimmed, email, checked]
+      "CHECK (checked_value::app.checked_text IS NOT NULL)"
 
   expectDiagnostic .unsupportedFunction 7
     "function lower is not supported in local constraints" <|
