@@ -15,3 +15,31 @@ lean_test(
     deps = ["//lean/Pgx/Typed:descriptors"],
     strip_module_prefix = "lean",
 )
+
+lean_test(
+    name = "manifest_test",
+    srcs = ["Manifest.lean"],
+    deps = ["//lean/Pgx/Codegen:manifest"],
+    strip_module_prefix = "lean",
+)
+
+lean_test(
+    name = "emit_test",
+    srcs = ["Emit.lean"],
+    deps = ["//lean/Pgx/Codegen:emit"],
+    strip_module_prefix = "lean",
+)
+
+lean_test(
+    name = "probe_test",
+    srcs = ["Probe.lean"],
+    deps = ["//lean/Pgx/Codegen:probe"],
+    strip_module_prefix = "lean",
+)
+
+lean_test(
+    name = "compatibility_test",
+    srcs = ["Compatibility.lean"],
+    deps = ["//lean/Pgx/IR:json"],
+    strip_module_prefix = "lean",
+)

@@ -1,0 +1,1149 @@
+import Pgx.TypeMapping
+import Pg.Connection
+import Lean.Data.Json
+
+/-!
+# PostgreSQL generation probe
+
+This module runs after migrations have been applied to an already-connected
+server.  Catalog OIDs are retained only in private, transient lookup records;
+the public result is the symbolic `Pgx.DatabaseIR` consumed by source
+generation.
+-/
+
+namespace Pgx.Codegen.Probe
+
+open Std.Async
+
+/-- Parameter facts PostgreSQL cannot infer from a parsed statement. -/
+structure ParameterInput where
+  /-- One-based PostgreSQL parameter position. -/
+  position : Nat
+  name : String
+  nullable : Bool
+  deriving Repr, BEq, Inhabited
+
+/-- One literal SQL source and its non-SQL contract metadata. -/
+structure QueryInput where
+  name : String
+  sql : String
+  cardinality : Pgx.Cardinality
+  parameters : Array ParameterInput := #[]
+  deriving Repr, BEq, Inhabited
+
+/-- Inputs which affect the normalized database contract.  The connection is
+expected to point at an empty-cluster migration result owned by the caller. -/
+structure Config where
+  schemas : Array String
+  session : Pgx.SessionContract
+  queries : Array QueryInput := #[]
+  supportedServerMajors : Array Nat := #[17, 18]
+  requiredExtensions : Array String := #[]
+  typeOverrides : Array Pgx.TypeOverrideIR := #[]
+  deriving Repr, BEq, Inhabited
+
+inductive Error where
+  | invalidConfig (message : String)
+  | postgres (context : String) (error : Pg.Error)
+  | catalog (message : String)
+  | invalidQuery (query : String) (message : String)
+  | unsupportedType (context : String) (key : Pgx.TypeKey)
+  deriving Repr
+
+namespace Error
+
+def toMessage : Error → String
+  | .invalidConfig message => s!"invalid probe configuration: {message}"
+  | .postgres context error => s!"{context}: {error}"
+  | .catalog message => s!"invalid PostgreSQL catalog result: {message}"
+  | .invalidQuery query message => s!"query {query}: {message}"
+  | .unsupportedType context key =>
+      s!"{context}: unsupported PostgreSQL type {key}"
+
+end Error
+
+instance : ToString Error := ⟨Error.toMessage⟩
+
+/-- Result of the deliberately one-sided plan inspection.  Both `outerJoin`
+and `uncertain` force every result field back to nullable. -/
+inductive OuterJoinAnalysis where
+  | noOuterJoin
+  | outerJoin
+  | uncertain
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+private def sqlLiteral (value : String) : String :=
+  "'" ++ value.replace "'" "''" ++ "'"
+
+private def sqlIdentifier (value : String) : String :=
+  "\"" ++ value.replace "\"" "\"\"" ++ "\""
+
+private def isSpace : Char → Bool
+  | ' ' | '\t' | '\r' | '\n' => true
+  | _ => false
+
+private def isBlank (value : String) : Bool :=
+  value.toList.all isSpace
+
+private def hasDuplicates [BEq α] (values : Array α) : Bool := Id.run do
+  let mut seen : Array α := #[]
+  for value in values do
+    if seen.contains value then return true
+    seen := seen.push value
+  return false
+
+private def queryOne (conn : Pg.Connection) (context sql : String) :
+    Async (Except Error Pg.Rows) := do
+  match ← Pg.Connection.query conn sql with
+  | .error error => pure (.error (.postgres context error))
+  | .ok results =>
+    match results with
+    | #[rows] => pure (.ok rows)
+    | _ => pure (.error (.catalog
+        s!"{context}: expected one result set, received {results.size}"))
+
+private def cell? (context : String) (row : Array (Option ByteArray))
+    (index : Nat) : Except Error (Option String) := do
+  let some value := row[index]?
+    | throw (.catalog s!"{context}: result row has no column {index}")
+  match value with
+  | none => pure none
+  | some bytes =>
+    let some value := String.fromUTF8? bytes
+      | throw (.catalog s!"{context}: result column {index} is not UTF-8")
+    pure (some value)
+
+private def cell (context : String) (row : Array (Option ByteArray))
+    (index : Nat) : Except Error String := do
+  let some value ← cell? context row index
+    | throw (.catalog s!"{context}: result column {index} is NULL")
+  pure value
+
+private def parseNat (context value : String) : Except Error Nat := do
+  let some parsed := value.toNat?
+    | throw (.catalog s!"{context}: expected an unsigned integer, received {value}")
+  pure parsed
+
+private def parseUInt32 (context value : String) : Except Error UInt32 := do
+  let parsed ← parseNat context value
+  if parsed < 4294967296 then
+    pure (UInt32.ofNat parsed)
+  else
+    throw (.catalog s!"{context}: value is outside the UInt32 range: {value}")
+
+private def parseUInt16 (context value : String) : Except Error UInt16 := do
+  let parsed ← parseNat context value
+  if parsed < 65536 then
+    pure (UInt16.ofNat parsed)
+  else
+    throw (.catalog s!"{context}: value is outside the UInt16 range: {value}")
+
+private def parseInt32 (context value : String) : Except Error Int32 := do
+  let some parsed := value.toInt?
+    | throw (.catalog s!"{context}: expected an integer, received {value}")
+  if (-2147483648 : Int) ≤ parsed ∧ parsed ≤ 2147483647 then
+    pure (Int32.ofInt parsed)
+  else
+    throw (.catalog s!"{context}: value is outside the Int32 range: {value}")
+
+private def parseBool (context : String) : String → Except Error Bool
+  | "t" | "true" | "on" => pure true
+  | "f" | "false" | "off" => pure false
+  | value => throw (.catalog s!"{context}: expected a boolean, received {value}")
+
+private def parseTypeKind (context : String) : String → Except Error Pgx.TypeKind
+  | "base" => pure .base
+  | "enum" => pure .enum
+  | "domain" => pure .domain
+  | "array" => pure .array
+  | "range" => pure .range
+  | "multirange" => pure .multirange
+  | "composite" => pure .composite
+  | "pseudo" => pure .pseudo
+  | value => throw (.catalog s!"{context}: unknown type kind {value}")
+
+private def parseRelationKind (context : String) : String → Except Error Pgx.RelationKind
+  | "r" => pure .table
+  | "p" => pure .partitionedTable
+  | "v" => pure .view
+  | "m" => pure .materializedView
+  | "f" => pure .foreignTable
+  | value => throw (.catalog s!"{context}: unknown relation kind {value}")
+
+private def parseConstraintKind (context : String) : String → Except Error Pgx.ConstraintKind
+  | "c" => pure .check
+  | "p" => pure .primaryKey
+  | "u" => pure .unique
+  | "f" => pure .foreignKey
+  | "x" => pure .exclusion
+  | value => throw (.catalog s!"{context}: unknown constraint kind {value}")
+
+private def kindSql (alias : String) : String :=
+  s!"CASE WHEN {alias}.typcategory = 'A' AND {alias}.typelem <> 0 THEN 'array' \
+     WHEN {alias}.typtype = 'b' THEN 'base' \
+     WHEN {alias}.typtype = 'c' THEN 'composite' \
+     WHEN {alias}.typtype = 'd' THEN 'domain' \
+     WHEN {alias}.typtype = 'e' THEN 'enum' \
+     WHEN {alias}.typtype = 'p' THEN 'pseudo' \
+     WHEN {alias}.typtype = 'r' THEN 'range' \
+     WHEN {alias}.typtype = 'm' THEN 'multirange' ELSE 'pseudo' END"
+
+private def setConfig (conn : Pg.Connection) (name value : String) :
+    Async (Except Error Unit) := do
+  let sql := s!"SELECT pg_catalog.set_config({sqlLiteral name}, {sqlLiteral value}, false)"
+  match ← queryOne conn s!"set session parameter {name}" sql with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    if rows.rows.size == 1 then pure (.ok ())
+    else pure (.error (.catalog
+      s!"set session parameter {name}: expected one row, received {rows.rows.size}"))
+
+private def currentSetting (conn : Pg.Connection) (name : String) :
+    Async (Except Error String) := do
+  match ← queryOne conn s!"read session parameter {name}"
+      s!"SELECT pg_catalog.current_setting({sqlLiteral name})" with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    let some row := rows.rows[0]?
+      | return .error (.catalog s!"read session parameter {name}: no row returned")
+    if rows.rows.size != 1 then
+      return .error (.catalog
+        s!"read session parameter {name}: expected one row, received {rows.rows.size}")
+    pure (cell s!"read session parameter {name}" row 0)
+
+/-- Validate and install the session settings which are later fingerprinted. -/
+def configureSession (conn : Pg.Connection) (session : Pgx.SessionContract) :
+    Async (Except Error Unit) := do
+  if session.searchPath.isEmpty then
+    return .error (.invalidConfig "session search_path must not be empty")
+  if hasDuplicates session.searchPath then
+    return .error (.invalidConfig "session search_path contains duplicates")
+  if session.searchPath.any isBlank then
+    return .error (.invalidConfig "session search_path contains an empty schema")
+  unless session.encoding.toUpper == "UTF8" do
+    return .error (.invalidConfig "Milestone 1 requires UTF8 client encoding")
+  if isBlank session.timezone then
+    return .error (.invalidConfig "session timezone must not be empty")
+  let searchPath := String.intercalate ", "
+    (session.searchPath.map sqlIdentifier).toList
+  for (name, value) in #[
+      ("search_path", searchPath),
+      ("TimeZone", session.timezone),
+      ("client_encoding", session.encoding),
+      ("standard_conforming_strings",
+        if session.standardConformingStrings then "on" else "off")] do
+    match ← setConfig conn name value with
+    | .error error => return .error error
+    | .ok () => pure ()
+  match ← currentSetting conn "TimeZone" with
+  | .error error => return .error error
+  | .ok actual =>
+    unless actual == session.timezone do
+      return .error (.invalidConfig
+        s!"PostgreSQL canonicalized timezone {session.timezone} to {actual}; \
+          use the canonical value in the session contract")
+  match ← currentSetting conn "client_encoding" with
+  | .error error => return .error error
+  | .ok actual =>
+    unless actual.toUpper == session.encoding.toUpper do
+      return .error (.catalog
+        s!"client_encoding is {actual}, expected {session.encoding}")
+  match ← currentSetting conn "standard_conforming_strings" with
+  | .error error => return .error error
+  | .ok actual =>
+    match parseBool "standard_conforming_strings" actual with
+    | .error error => return .error error
+    | .ok enabled =>
+      unless enabled == session.standardConformingStrings do
+        return .error (.catalog
+          s!"standard_conforming_strings is {actual}, expected \
+            {session.standardConformingStrings}")
+  match ← queryOne conn "read effective search_path"
+      "SELECT schema_name FROM pg_catalog.unnest(pg_catalog.current_schemas(false)) \
+       WITH ORDINALITY AS path(schema_name, ordinal) ORDER BY ordinal" with
+  | .error error => return .error error
+  | .ok rows =>
+    let mut actual : Array String := #[]
+    for row in rows.rows do
+      match cell "read effective search_path" row 0 with
+      | .error error => return .error error
+      | .ok schema => actual := actual.push schema
+    unless actual == session.searchPath do
+      return .error (.invalidConfig
+        s!"effective search_path is {repr actual}, expected {repr session.searchPath}; \
+          list pg_catalog explicitly and remove missing schemas")
+  pure (.ok ())
+
+private def validateParameterInput (query : QueryInput) : Except Error Unit := do
+  let ordered := query.parameters.toList.mergeSort
+    (fun left right => left.position < right.position) |>.toArray
+  let mut names : Array String := #[]
+  for index in [:ordered.size] do
+    let parameter := ordered[index]!
+    unless parameter.position == index + 1 do
+      throw (.invalidQuery query.name
+        s!"parameter positions must be dense and one-based; expected {index + 1}, \
+          received {parameter.position}")
+    if isBlank parameter.name then
+      throw (.invalidQuery query.name
+        s!"parameter {parameter.position} has an empty name")
+    if names.contains parameter.name then
+      throw (.invalidQuery query.name
+        s!"parameter name {parameter.name} is duplicated")
+    names := names.push parameter.name
+
+/-- Pure validation useful to manifest readers before a connection is opened. -/
+def validateConfig (config : Config) : Except Error Unit := do
+  if config.schemas.isEmpty then
+    throw (.invalidConfig "at least one generated schema is required")
+  if config.schemas.any isBlank then
+    throw (.invalidConfig "generated schema names must not be empty")
+  if hasDuplicates config.schemas then
+    throw (.invalidConfig "generated schema names contain duplicates")
+  if config.supportedServerMajors.isEmpty then
+    throw (.invalidConfig "supportedServerMajors must not be empty")
+  if hasDuplicates config.supportedServerMajors then
+    throw (.invalidConfig "supportedServerMajors contains duplicates")
+  if config.requiredExtensions.any isBlank then
+    throw (.invalidConfig "required extension names must not be empty")
+  if hasDuplicates config.requiredExtensions then
+    throw (.invalidConfig "required extension names contain duplicates")
+  if hasDuplicates (config.typeOverrides.map (·.key)) then
+    throw (.invalidConfig "type override keys contain duplicates")
+  for override in config.typeOverrides do
+    if isBlank override.leanType || isBlank override.codec then
+      throw (.invalidConfig s!"type override {override.key} has an empty Lean type or codec")
+  let mut queryNames : Array String := #[]
+  for query in config.queries do
+    if isBlank query.name then
+      throw (.invalidConfig "query names must not be empty")
+    if queryNames.contains query.name then
+      throw (.invalidConfig s!"query name {query.name} is duplicated")
+    if isBlank query.sql then
+      throw (.invalidQuery query.name "SQL source is empty")
+    validateParameterInput query
+    queryNames := queryNames.push query.name
+
+private structure CatalogType where
+  oid : UInt32
+  key : Pgx.TypeKey
+  base : Option Pgx.TypeRef
+  notNull : Bool
+  defaultExpr : Option String
+  deriving Inhabited
+
+private structure CatalogRelation where
+  oid : UInt32
+  ir : Pgx.RelationIR
+  attnums : Array UInt16 := #[]
+  attributeNotNull : Array Bool := #[]
+  deriving Inhabited
+
+private structure CatalogConstraint where
+  oid : UInt32
+  ir : Pgx.ConstraintIR
+  deriving Inhabited
+
+private structure CatalogIndex where
+  oid : UInt32
+  ir : Pgx.IndexIR
+  deriving Inhabited
+
+private structure CatalogSnapshot where
+  serverMajor : Nat
+  schemas : Array Pgx.SchemaIR
+  types : Array CatalogType
+  enums : Array Pgx.EnumIR
+  domains : Array Pgx.DomainIR
+  relations : Array CatalogRelation
+  constraints : Array Pgx.ConstraintIR
+  indexes : Array Pgx.IndexIR
+  extensions : Array (String × String)
+
+private def typeByOid? (types : Array CatalogType) (oid : UInt32) : Option CatalogType :=
+  types.find? (fun value => value.oid == oid)
+
+private def typeRefByOid (types : Array CatalogType) (context : String)
+    (oid : UInt32) (typmod : Option Int32 := none) : Except Error Pgx.TypeRef := do
+  let some value := typeByOid? types oid
+    | throw (.catalog s!"{context}: OID {oid} does not identify a catalog type")
+  pure { key := value.key, typmod }
+
+private def relationByKey? (relations : Array CatalogRelation)
+    (key : Pgx.RelationKey) : Option CatalogRelation :=
+  relations.find? (fun value => value.ir.key == key)
+
+private def relationOrigin? (relations : Array CatalogRelation)
+    (oid : UInt32) (attnum : UInt16) : Option (Pgx.ColumnKey × Pgx.RelationColumnIR) := do
+  if oid == 0 || attnum == 0 then none else
+  let relation ← relations.find? (fun value => value.oid == oid)
+  let index ← relation.attnums.findIdx? (· == attnum)
+  let column ← relation.ir.columns[index]?
+  pure ({ relation := relation.ir.key, name := column.name }, column)
+
+private def loadServerMajor (conn : Pg.Connection) : Async (Except Error Nat) := do
+  match ← currentSetting conn "server_version_num" with
+  | .error error => pure (.error error)
+  | .ok value =>
+    match parseNat "server_version_num" value with
+    | .error error => pure (.error error)
+    | .ok version => pure (.ok (version / 10000))
+
+private def loadSchemas (conn : Pg.Connection) (wanted : Array String) :
+    Async (Except Error (Array Pgx.SchemaIR)) := do
+  match ← queryOne conn "read pg_namespace"
+      "SELECT nspname FROM pg_catalog.pg_namespace ORDER BY nspname" with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    let mut found : Array String := #[]
+    for row in rows.rows do
+      match cell "read pg_namespace" row 0 with
+      | .error error => return .error error
+      | .ok name => if wanted.contains name then found := found.push name
+    for name in wanted do
+      unless found.contains name do
+        return .error (.catalog s!"configured schema {name} does not exist")
+    pure (.ok (found.map fun name => ({ name } : Pgx.SchemaIR)))
+
+private def typeCatalogSql : String :=
+  "SELECT t.oid::text, ns.nspname, t.typname, " ++ kindSql "t" ++
+  ", bns.nspname, bt.typname, CASE WHEN bt.oid IS NULL THEN NULL ELSE " ++
+  kindSql "bt" ++ " END, " ++
+  "CASE WHEN t.typtype = 'd' AND t.typtypmod <> -1 THEN t.typtypmod::text ELSE NULL END, " ++
+  "t.typnotnull::text, t.typdefault " ++
+  "FROM pg_catalog.pg_type AS t " ++
+  "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = t.typnamespace " ++
+  "LEFT JOIN pg_catalog.pg_type AS bt ON bt.oid = NULLIF(t.typbasetype, 0) " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS bns ON bns.oid = bt.typnamespace " ++
+  "ORDER BY t.oid"
+
+private def parseCatalogType (row : Array (Option ByteArray)) : Except Error CatalogType := do
+  let context := "read pg_type"
+  let oid ← parseUInt32 context (← cell context row 0)
+  let schema ← cell context row 1
+  let name ← cell context row 2
+  let kind ← parseTypeKind context (← cell context row 3)
+  let baseSchema ← cell? context row 4
+  let baseName ← cell? context row 5
+  let baseKind ← cell? context row 6
+  let baseTypmod ← match ← cell? context row 7 with
+    | none => pure none
+    | some value => some <$> parseInt32 context value
+  let base ← match baseSchema, baseName, baseKind with
+    | none, none, none =>
+      if baseTypmod.isNone then pure none
+      else throw (.catalog s!"{context}: base typmod exists without a base type")
+    | some schema, some name, some kind =>
+      pure (some {
+        key := { schema, name, kind := ← parseTypeKind context kind }
+        typmod := baseTypmod
+      })
+    | _, _, _ => throw (.catalog s!"{context}: incomplete base type identity")
+  let notNull ← parseBool context (← cell context row 8)
+  let defaultExpr ← cell? context row 9
+  pure { oid, key := { schema, name, kind }, base, notNull, defaultExpr }
+
+private def loadTypes (conn : Pg.Connection) :
+    Async (Except Error (Array CatalogType)) := do
+  match ← queryOne conn "read pg_type" typeCatalogSql with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    let mut values : Array CatalogType := #[]
+    for row in rows.rows do
+      match parseCatalogType row with
+      | .error error => return .error error
+      | .ok value =>
+        if values.any (fun found => found.oid == value.oid) then
+          return .error (.catalog s!"duplicate pg_type OID {value.oid}")
+        values := values.push value
+    pure (.ok values)
+
+private def loadEnums (conn : Pg.Connection) (schemas : Array String)
+    (types : Array CatalogType) : Async (Except Error (Array Pgx.EnumIR)) := do
+  let mut enums : Array Pgx.EnumIR := #[]
+  for ty in types do
+    if ty.key.kind == .enum && schemas.contains ty.key.schema then
+      enums := enums.push { key := ty.key, labels := #[] }
+  let sql :=
+    "SELECT t.oid::text, e.enumlabel " ++
+    "FROM pg_catalog.pg_type AS t " ++
+    "JOIN pg_catalog.pg_enum AS e ON e.enumtypid = t.oid " ++
+    "ORDER BY t.oid, e.enumsortorder"
+  match ← queryOne conn "read pg_enum" sql with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    for row in rows.rows do
+      let parsed : Except Error (UInt32 × String) := do
+        pure (← parseUInt32 "read pg_enum" (← cell "read pg_enum" row 0),
+          ← cell "read pg_enum" row 1)
+      match parsed with
+      | .error error => return .error error
+      | .ok (oid, label) =>
+        let some ty := typeByOid? types oid
+          | return .error (.catalog s!"pg_enum refers to missing type OID {oid}")
+        if schemas.contains ty.key.schema then
+          let some index := enums.findIdx? (fun value => value.key == ty.key)
+            | return .error (.catalog s!"pg_enum refers to non-enum type {ty.key}")
+          let value := enums[index]!
+          enums := enums.set! index { value with labels := value.labels.push label }
+    pure (.ok enums)
+
+private def loadDomains (conn : Pg.Connection) (schemas : Array String)
+    (types : Array CatalogType) : Async (Except Error (Array Pgx.DomainIR)) := do
+  let mut domains : Array Pgx.DomainIR := #[]
+  for ty in types do
+    if ty.key.kind == .domain && schemas.contains ty.key.schema then
+      let some base := ty.base
+        | return .error (.catalog s!"domain {ty.key} has no base type")
+      domains := domains.push {
+        key := ty.key
+        base
+        notNull := ty.notNull
+        defaultExpr := ty.defaultExpr
+      }
+  let sql :=
+    "SELECT t.oid::text, pg_catalog.pg_get_constraintdef(c.oid, true) " ++
+    "FROM pg_catalog.pg_type AS t " ++
+    "JOIN pg_catalog.pg_constraint AS c ON c.contypid = t.oid " ++
+    "WHERE c.contype = 'c' " ++
+    "ORDER BY t.oid, c.conname"
+  match ← queryOne conn "read domain constraints" sql with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    for row in rows.rows do
+      let parsed : Except Error (UInt32 × String) := do
+        pure (← parseUInt32 "read domain constraints"
+            (← cell "read domain constraints" row 0),
+          ← cell "read domain constraints" row 1)
+      match parsed with
+      | .error error => return .error error
+      | .ok (oid, definition) =>
+        let some ty := typeByOid? types oid
+          | return .error (.catalog s!"domain constraint refers to missing type OID {oid}")
+        if schemas.contains ty.key.schema then
+          let some index := domains.findIdx? (fun value => value.key == ty.key)
+            | return .error (.catalog s!"constraint refers to non-domain type {ty.key}")
+          let value := domains[index]!
+          domains := domains.set! index {
+            value with constraints := value.constraints.push definition
+          }
+    pure (.ok domains)
+
+private def relationCatalogSql : String :=
+  "SELECT c.oid::text, ns.nspname, c.relname, c.relkind::text " ++
+  "FROM pg_catalog.pg_class AS c " ++
+  "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = c.relnamespace " ++
+  "WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') " ++
+  "ORDER BY ns.nspname, c.relname"
+
+private def columnCatalogSql : String :=
+  "SELECT c.oid::text, a.attname, a.attnum::text, a.atttypid::text, " ++
+  "CASE WHEN a.atttypmod = -1 THEN NULL ELSE a.atttypmod::text END, " ++
+  "a.attnotnull::text, t.typnotnull::text, " ++
+  "(a.attidentity <> '')::text, (a.attgenerated <> '')::text, " ++
+  "pg_catalog.pg_get_expr(ad.adbin, ad.adrelid, true), " ++
+  "cns.nspname, coll.collname " ++
+  "FROM pg_catalog.pg_class AS c " ++
+  "JOIN pg_catalog.pg_attribute AS a ON a.attrelid = c.oid " ++
+  "JOIN pg_catalog.pg_type AS t ON t.oid = a.atttypid " ++
+  "LEFT JOIN pg_catalog.pg_attrdef AS ad " ++
+  "ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum " ++
+  "LEFT JOIN pg_catalog.pg_collation AS coll ON coll.oid = NULLIF(a.attcollation, 0) " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS cns ON cns.oid = coll.collnamespace " ++
+  "WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') " ++
+  "AND a.attnum > 0 AND NOT a.attisdropped " ++
+  "ORDER BY c.oid, a.attnum"
+
+private def loadRelations (conn : Pg.Connection) (schemas : Array String)
+    (types : Array CatalogType) :
+    Async (Except Error (Array CatalogRelation)) := do
+  match ← queryOne conn "read pg_class" relationCatalogSql with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    let mut relations : Array CatalogRelation := #[]
+    for row in rows.rows do
+      let parsed : Except Error (UInt32 × String × String × Pgx.RelationKind) := do
+        pure (← parseUInt32 "read pg_class" (← cell "read pg_class" row 0),
+          ← cell "read pg_class" row 1,
+          ← cell "read pg_class" row 2,
+          ← parseRelationKind "read pg_class" (← cell "read pg_class" row 3))
+      match parsed with
+      | .error error => return .error error
+      | .ok (oid, schema, name, kind) =>
+        if schemas.contains schema then
+          relations := relations.push {
+            oid
+            ir := { key := { schema, name }, kind, columns := #[] }
+          }
+    match ← queryOne conn "read pg_attribute" columnCatalogSql with
+    | .error error => pure (.error error)
+    | .ok columnRows =>
+      for row in columnRows.rows do
+        let parsed : Except Error
+            (UInt32 × UInt16 × Pgx.RelationColumnIR × Bool) := do
+          let relationOid ← parseUInt32 "read pg_attribute"
+            (← cell "read pg_attribute" row 0)
+          let name ← cell "read pg_attribute" row 1
+          let attnum ← parseUInt16 "read pg_attribute"
+            (← cell "read pg_attribute" row 2)
+          let typeOid ← parseUInt32 "read pg_attribute"
+            (← cell "read pg_attribute" row 3)
+          let typmod ← match ← cell? "read pg_attribute" row 4 with
+            | none => pure none
+            | some value => some <$> parseInt32 "read pg_attribute" value
+          let attributeNotNull ← parseBool "read pg_attribute"
+            (← cell "read pg_attribute" row 5)
+          let domainNotNull ← parseBool "read pg_attribute"
+            (← cell "read pg_attribute" row 6)
+          let identity ← parseBool "read pg_attribute"
+            (← cell "read pg_attribute" row 7)
+          let generated ← parseBool "read pg_attribute"
+            (← cell "read pg_attribute" row 8)
+          let defaultExpr ← cell? "read pg_attribute" row 9
+          let collationSchema ← cell? "read pg_attribute" row 10
+          let collationName ← cell? "read pg_attribute" row 11
+          let collation ← match collationSchema, collationName with
+            | none, none => pure none
+            | some schema, some name => pure (some { schema, name })
+            | _, _ => throw (.catalog "read pg_attribute: incomplete collation identity")
+          let ty ← typeRefByOid types "read pg_attribute" typeOid typmod
+          pure (relationOid, attnum, {
+            name
+            ordinal := attnum.toNat
+            ty
+            nullable := !(attributeNotNull || domainNotNull)
+            identity
+            generated
+            defaultExpr
+            collation
+          }, attributeNotNull)
+        match parsed with
+        | .error error => return .error error
+        | .ok (relationOid, attnum, column, attributeNotNull) =>
+          match relations.findIdx? (fun relation => relation.oid == relationOid) with
+          | none => pure () -- A relation outside the configured schemas.
+          | some index =>
+            let relation := relations[index]!
+            relations := relations.set! index {
+              relation with
+              ir := { relation.ir with columns := relation.ir.columns.push column }
+              attnums := relation.attnums.push attnum
+              attributeNotNull := relation.attributeNotNull.push attributeNotNull
+            }
+      pure (.ok relations)
+
+private def constraintCatalogSql : String :=
+  "SELECT con.oid::text, ns.nspname, c.relname, con.conname, con.contype::text, " ++
+  "rns.nspname, rc.relname, " ++
+  "CASE WHEN con.contype IN ('c', 'x') " ++
+  "THEN pg_catalog.pg_get_constraintdef(con.oid, true) ELSE NULL END, " ++
+  "con.convalidated::text " ++
+  "FROM pg_catalog.pg_constraint AS con " ++
+  "JOIN pg_catalog.pg_class AS c ON c.oid = con.conrelid " ++
+  "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = c.relnamespace " ++
+  "LEFT JOIN pg_catalog.pg_class AS rc ON rc.oid = NULLIF(con.confrelid, 0) " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS rns ON rns.oid = rc.relnamespace " ++
+  "WHERE con.conrelid <> 0 AND con.contype IN ('c', 'p', 'u', 'f', 'x') " ++
+  "ORDER BY con.oid"
+
+private def constraintColumnSql : String :=
+  "SELECT con.oid::text, false::text, key.ordinality::text, a.attname " ++
+  "FROM pg_catalog.pg_constraint AS con " ++
+  "CROSS JOIN LATERAL pg_catalog.unnest(con.conkey) " ++
+  "WITH ORDINALITY AS key(attnum, ordinality) " ++
+  "JOIN pg_catalog.pg_attribute AS a " ++
+  "ON a.attrelid = con.conrelid AND a.attnum = key.attnum " ++
+  "WHERE con.conrelid <> 0 AND con.contype IN ('c', 'p', 'u', 'f', 'x') " ++
+  "UNION ALL " ++
+  "SELECT con.oid::text, true::text, key.ordinality::text, a.attname " ++
+  "FROM pg_catalog.pg_constraint AS con " ++
+  "CROSS JOIN LATERAL pg_catalog.unnest(con.confkey) " ++
+  "WITH ORDINALITY AS key(attnum, ordinality) " ++
+  "JOIN pg_catalog.pg_attribute AS a " ++
+  "ON a.attrelid = con.confrelid AND a.attnum = key.attnum " ++
+  "WHERE con.conrelid <> 0 AND con.contype = 'f' " ++
+  "ORDER BY 1, 2, 3"
+
+private def loadConstraints (conn : Pg.Connection)
+    (relations : Array CatalogRelation) :
+    Async (Except Error (Array Pgx.ConstraintIR)) := do
+  match ← queryOne conn "read pg_constraint" constraintCatalogSql with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    let mut constraints : Array CatalogConstraint := #[]
+    for row in rows.rows do
+      let parsed : Except Error CatalogConstraint := do
+        let oid ← parseUInt32 "read pg_constraint"
+          (← cell "read pg_constraint" row 0)
+        let relation : Pgx.RelationKey := {
+          schema := ← cell "read pg_constraint" row 1
+          name := ← cell "read pg_constraint" row 2
+        }
+        let name ← cell "read pg_constraint" row 3
+        let kind ← parseConstraintKind "read pg_constraint"
+          (← cell "read pg_constraint" row 4)
+        let referencedSchema ← cell? "read pg_constraint" row 5
+        let referencedName ← cell? "read pg_constraint" row 6
+        let referencedRelation ← match referencedSchema, referencedName with
+          | none, none => pure none
+          | some schema, some name => pure (some { schema, name })
+          | _, _ => throw (.catalog
+              "read pg_constraint: incomplete referenced relation identity")
+        let expression ← cell? "read pg_constraint" row 7
+        let validated ← parseBool "read pg_constraint"
+          (← cell "read pg_constraint" row 8)
+        pure { oid, ir := {
+          relation, name, kind, referencedRelation, expression, validated
+        } }
+      match parsed with
+      | .error error => return .error error
+      | .ok value =>
+        if (relationByKey? relations value.ir.relation).isSome then
+          constraints := constraints.push value
+    match ← queryOne conn "read constraint columns" constraintColumnSql with
+    | .error error => pure (.error error)
+    | .ok columnRows =>
+      for row in columnRows.rows do
+        let parsed : Except Error (UInt32 × Bool × String) := do
+          pure (← parseUInt32 "read constraint columns"
+              (← cell "read constraint columns" row 0),
+            ← parseBool "read constraint columns"
+              (← cell "read constraint columns" row 1),
+            ← cell "read constraint columns" row 3)
+        match parsed with
+        | .error error => return .error error
+        | .ok (oid, referenced, name) =>
+          match constraints.findIdx? (fun value => value.oid == oid) with
+          | none => pure ()
+          | some index =>
+            let value := constraints[index]!
+            let ir := if referenced then
+              { value.ir with
+                referencedColumns := value.ir.referencedColumns.push name }
+            else
+              { value.ir with columns := value.ir.columns.push name }
+            constraints := constraints.set! index { value with ir }
+      -- PostgreSQL 17 does not expose relation NOT NULL constraints in
+      -- pg_constraint.  Normalize both majors from pg_attribute instead of
+      -- retaining the PostgreSQL-18-only catalog representation.
+      let mut result := constraints.map (·.ir)
+      for relation in relations do
+        for index in [:relation.ir.columns.size] do
+          if relation.attributeNotNull[index]! then
+            let column := relation.ir.columns[index]!
+            result := result.push {
+              relation := relation.ir.key
+              name := s!"<not-null:{column.name}>"
+              kind := .notNull
+              columns := #[column.name]
+            }
+      pure (.ok result)
+
+private def indexCatalogSql : String :=
+  "SELECT i.indexrelid::text, ns.nspname, c.relname, ic.relname, " ++
+  "i.indisunique::text, i.indisprimary::text, i.indisvalid::text, " ++
+  "pg_catalog.pg_get_expr(i.indpred, i.indrelid, true), " ++
+  "pg_catalog.pg_get_expr(i.indexprs, i.indrelid, true) " ++
+  "FROM pg_catalog.pg_index AS i " ++
+  "JOIN pg_catalog.pg_class AS c ON c.oid = i.indrelid " ++
+  "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = c.relnamespace " ++
+  "JOIN pg_catalog.pg_class AS ic ON ic.oid = i.indexrelid " ++
+  "ORDER BY i.indexrelid"
+
+private def indexColumnSql : String :=
+  "SELECT i.indexrelid::text, key.ordinality::text, a.attname " ++
+  "FROM pg_catalog.pg_index AS i " ++
+  "CROSS JOIN LATERAL pg_catalog.unnest(i.indkey) " ++
+  "WITH ORDINALITY AS key(attnum, ordinality) " ++
+  "JOIN pg_catalog.pg_attribute AS a " ++
+  "ON a.attrelid = i.indrelid AND a.attnum = key.attnum " ++
+  "WHERE key.attnum > 0 " ++
+  "ORDER BY i.indexrelid, key.ordinality"
+
+private def loadIndexes (conn : Pg.Connection)
+    (relations : Array CatalogRelation) :
+    Async (Except Error (Array Pgx.IndexIR)) := do
+  match ← queryOne conn "read pg_index" indexCatalogSql with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    let mut indexes : Array CatalogIndex := #[]
+    for row in rows.rows do
+      let parsed : Except Error CatalogIndex := do
+        let oid ← parseUInt32 "read pg_index" (← cell "read pg_index" row 0)
+        let relation : Pgx.RelationKey := {
+          schema := ← cell "read pg_index" row 1
+          name := ← cell "read pg_index" row 2
+        }
+        pure { oid, ir := {
+          relation
+          name := ← cell "read pg_index" row 3
+          unique := ← parseBool "read pg_index" (← cell "read pg_index" row 4)
+          primary := ← parseBool "read pg_index" (← cell "read pg_index" row 5)
+          valid := ← parseBool "read pg_index" (← cell "read pg_index" row 6)
+          predicate := ← cell? "read pg_index" row 7
+          expression := ← cell? "read pg_index" row 8
+        } }
+      match parsed with
+      | .error error => return .error error
+      | .ok value =>
+        if (relationByKey? relations value.ir.relation).isSome then
+          indexes := indexes.push value
+    match ← queryOne conn "read index columns" indexColumnSql with
+    | .error error => pure (.error error)
+    | .ok columnRows =>
+      for row in columnRows.rows do
+        let parsed : Except Error (UInt32 × String) := do
+          pure (← parseUInt32 "read index columns"
+              (← cell "read index columns" row 0),
+            ← cell "read index columns" row 2)
+        match parsed with
+        | .error error => return .error error
+        | .ok (oid, name) =>
+          match indexes.findIdx? (fun value => value.oid == oid) with
+          | none => pure ()
+          | some index =>
+            let value := indexes[index]!
+            indexes := indexes.set! index {
+              value with ir := { value.ir with columns := value.ir.columns.push name }
+            }
+      pure (.ok (indexes.map (·.ir)))
+
+private def loadExtensions (conn : Pg.Connection) (required : Array String) :
+    Async (Except Error (Array (String × String))) := do
+  let sql :=
+    "SELECT extname, extversion FROM pg_catalog.pg_extension ORDER BY extname"
+  match ← queryOne conn "read pg_extension" sql with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    let mut installed : Array (String × String) := #[]
+    for row in rows.rows do
+      let parsed : Except Error (String × String) := do
+        pure (← cell "read pg_extension" row 0, ← cell "read pg_extension" row 1)
+      match parsed with
+      | .error error => return .error error
+      | .ok value => installed := installed.push value
+    let mut result : Array (String × String) := #[]
+    for name in required do
+      let some value := installed.find? (fun value => value.1 == name)
+        | return .error (.catalog s!"required extension {name} is not installed")
+      result := result.push value
+    pure (.ok result)
+
+private partial def ensureTypeSupported (config : Config) (snapshot : CatalogSnapshot)
+    (context : String) (key : Pgx.TypeKey) (seen : Array Pgx.TypeKey := #[]) :
+    Except Error Unit := do
+  if config.typeOverrides.any (fun value => value.key == key) then
+    return
+  if (Pgx.builtinTypeMapping? key).isSome then
+    return
+  if snapshot.enums.any (fun value => value.key == key) then
+    return
+  if seen.contains key then
+    throw (.catalog s!"{context}: cyclic domain base chain at {key}")
+  match snapshot.domains.find? (fun value => value.key == key) with
+  | some domain =>
+    ensureTypeSupported config snapshot context domain.base.key (seen.push key)
+  | none => throw (.unsupportedType context key)
+
+private def validateCatalogTypes (config : Config) (snapshot : CatalogSnapshot) :
+    Except Error Unit := do
+  for domain in snapshot.domains do
+    ensureTypeSupported config snapshot s!"domain {domain.key}" domain.base.key
+  for relation in snapshot.relations do
+    for column in relation.ir.columns do
+      ensureTypeSupported config snapshot
+        s!"column {relation.ir.key}.{column.name}" column.ty.key
+
+private def closeStatement (conn : Pg.Connection) (name : String) :
+    Async (Except Error Unit) := do
+  match ← conn.run #[.closeStatement name, .sync] with
+  | .error error => pure (.error (.postgres s!"close prepared statement {name}" error))
+  | .ok events =>
+    for event in events do
+      match event with
+      | .errorResponse fields =>
+        return .error (.postgres s!"close prepared statement {name}" (.server fields))
+      | _ => pure ()
+    pure (.ok ())
+
+private def explainSql (statement : Pg.Statement) : String :=
+  let params := String.intercalate ", "
+    (List.replicate statement.paramTypes.size "NULL")
+  let invocation := if statement.paramTypes.isEmpty then ""
+    else "(" ++ params ++ ")"
+  "EXPLAIN (VERBOSE, FORMAT JSON) EXECUTE " ++
+    sqlIdentifier statement.name ++ invocation
+
+private def knownPlanNodeTypes : Array String := #[
+  "Aggregate", "Append", "BitmapAnd", "Bitmap Heap Scan", "Bitmap Index Scan",
+  "BitmapOr", "CTE Scan", "Custom Scan", "Delete", "Foreign Scan",
+  "Function Scan", "Gather", "Gather Merge", "Group", "Hash", "Hash Join",
+  "Incremental Sort", "Index Only Scan", "Index Scan", "Insert", "Limit",
+  "LockRows", "Materialize", "Memoize", "Merge", "Merge Append", "Merge Join",
+  "ModifyTable", "Named Tuplestore Scan", "Nested Loop", "ProjectSet",
+  "Recursive Union", "Result", "Sample Scan", "Seq Scan", "SetOp", "Sort",
+  "Subquery Scan", "Table Function Scan", "Tid Range Scan", "Tid Scan",
+  "Unique", "Update", "Values Scan", "WindowAgg", "WorkTable Scan"
+]
+
+private def combineAnalysis (left right : OuterJoinAnalysis) : OuterJoinAnalysis :=
+  match left, right with
+  | .outerJoin, _ | _, .outerJoin => .outerJoin
+  | .uncertain, _ | _, .uncertain => .uncertain
+  | .noOuterJoin, .noOuterJoin => .noOuterJoin
+
+private def classifyJoinType : Option Lean.Json → OuterJoinAnalysis
+  | none => .noOuterJoin
+  | some (.str kind) =>
+    if kind.startsWith "Left" || kind.startsWith "Right" || kind.startsWith "Full" then
+      .outerJoin
+    else if kind == "Inner" || kind == "Semi" || kind == "Anti" then
+      .noOuterJoin
+    else
+      .uncertain
+  | some _ => .uncertain
+
+private partial def analyzePlanNode : Lean.Json → OuterJoinAnalysis
+  | .obj fields =>
+    let join := classifyJoinType (fields.get? "Join Type")
+    if join == .outerJoin then
+      .outerJoin
+    else
+      let shape := match fields.get? "Node Type" with
+        | some (.str kind) =>
+          if knownPlanNodeTypes.contains kind then .noOuterJoin else .uncertain
+        | _ => .uncertain
+      let children := match fields.get? "Plans" with
+        | none => .noOuterJoin
+        | some (.arr plans) => plans.foldl
+            (fun result plan => combineAnalysis result (analyzePlanNode plan))
+            .noOuterJoin
+        | some _ => .uncertain
+      combineAnalysis join (combineAnalysis shape children)
+  | _ => .uncertain
+
+/-- Pure classifier for PostgreSQL's `EXPLAIN (VERBOSE, FORMAT JSON)` output.
+Malformed JSON, an unknown node/join kind, or an unexpected root shape is
+uncertain and therefore cannot justify a non-optional generated field. -/
+def analyzeOuterJoinPlanJson (json : String) : OuterJoinAnalysis :=
+  match Lean.Json.parse json with
+  | .error _ => .uncertain
+  | .ok (.arr plans) =>
+    if plans.size != 1 then .uncertain
+    else match plans[0]! with
+      | .obj root => match root.get? "Plan" with
+        | some plan => analyzePlanNode plan
+        | none => .uncertain
+      | _ => .uncertain
+  | .ok _ => .uncertain
+
+private def inspectExplainRows (rows : Pg.Rows) : OuterJoinAnalysis :=
+  if rows.rows.size != 1 || rows.columns.size != 1 then
+    .uncertain
+  else match rows.rows[0]? with
+    | none => .uncertain
+    | some row => match row[0]? with
+      | none | some none => .uncertain
+      | some (some bytes) => match String.fromUTF8? bytes with
+        | none => .uncertain
+        | some json => analyzeOuterJoinPlanJson json
+
+/-- Inspect a prepared statement under a forced generic plan.  A server-side
+EXPLAIN failure or an unrecognized JSON shape is deliberately reported as
+`uncertain`; failure to restore a setting changed by this function is a hard
+probe error. -/
+def analyzeOuterJoins (conn : Pg.Connection) (statement : Pg.Statement) :
+    Async (Except Error OuterJoinAnalysis) := do
+  let previous ← match ← currentSetting conn "plan_cache_mode" with
+    | .ok value => pure value
+    | .error _ => return .ok .uncertain
+  match ← setConfig conn "plan_cache_mode" "force_generic_plan" with
+  | .error _ => return .ok .uncertain
+  | .ok () => pure ()
+  let analysis ← match ← queryOne conn
+      s!"inspect query plan for {statement.name}" (explainSql statement) with
+    | .ok rows => pure (inspectExplainRows rows)
+    | .error _ => pure .uncertain
+  match ← setConfig conn "plan_cache_mode" previous with
+  | .error error => pure (.error error)
+  | .ok () => pure (.ok analysis)
+
+private def orderedParameters (query : QueryInput) : Array ParameterInput :=
+  query.parameters.toList.mergeSort
+    (fun left right => left.position < right.position) |>.toArray
+
+private def queryHash (sql : String) : String :=
+  Pg.Crypto.toHexLower (Pg.Crypto.sha256 sql.toUTF8)
+
+private def statementName (query : QueryInput) : String :=
+  "_lean_pgx_probe_" ++ (queryHash (query.name ++ "\x00" ++ query.sql)).take 32
+
+private def analyzePrepared (conn : Pg.Connection) (config : Config)
+    (snapshot : CatalogSnapshot) (query : QueryInput) (statement : Pg.Statement) :
+    Async (Except Error Pgx.QueryIR) := do
+  let metadata := orderedParameters query
+  unless metadata.size == statement.paramTypes.size do
+    return .error (.invalidQuery query.name
+      s!"manifest declares {metadata.size} parameters but PostgreSQL inferred \
+        {statement.paramTypes.size}")
+  let mut params : Array Pgx.ParamIR := #[]
+  for index in [:statement.paramTypes.size] do
+    let input := metadata[index]!
+    let typeOid := statement.paramTypes[index]!
+    let ty ← match typeRefByOid snapshot.types
+        s!"parameter {input.position} of query {query.name}" typeOid with
+      | .ok value => pure value
+      | .error error => return .error error
+    match ensureTypeSupported config snapshot
+        s!"parameter {input.position} of query {query.name}" ty.key with
+    | .error error => return .error error
+    | .ok () => pure ()
+    params := params.push {
+      position := input.position
+      name := input.name
+      ty
+      nullable := input.nullable
+    }
+  match query.cardinality with
+  | .execute =>
+    unless statement.columns.isEmpty do
+      return .error (.invalidQuery query.name
+        "execute cardinality cannot be used with a statement that returns columns")
+  | .exactlyOne | .zeroOrOne | .many =>
+    if statement.columns.isEmpty then
+      return .error (.invalidQuery query.name
+        "a row-returning cardinality requires at least one result column")
+  let mut names : Array String := #[]
+  let mut directColumns : Array Pgx.QueryColumnIR := #[]
+  for column in statement.columns do
+    if isBlank column.name then
+      return .error (.invalidQuery query.name "result column name is empty")
+    if names.contains column.name then
+      return .error (.invalidQuery query.name
+        s!"result column name {column.name} is duplicated")
+    names := names.push column.name
+    let typmod := if column.typeMod == -1 then none else some column.typeMod
+    let ty ← match typeRefByOid snapshot.types
+        s!"result column {column.name} of query {query.name}" column.typeOid typmod with
+      | .ok value => pure value
+      | .error error => return .error error
+    match ensureTypeSupported config snapshot
+        s!"result column {column.name} of query {query.name}" ty.key with
+    | .error error => return .error error
+    | .ok () => pure ()
+    let originInfo := relationOrigin? snapshot.relations column.tableOid column.attnum
+    let origin := originInfo.map (·.1)
+    let sourceColumn := originInfo.map (·.2)
+    directColumns := directColumns.push {
+      name := column.name
+      ty
+      nullable := sourceColumn.map (·.nullable) |>.getD true
+      origin
+      collation := sourceColumn.bind (·.collation)
+    }
+  let columns ← if directColumns.isEmpty then
+      pure directColumns
+    else
+      match ← analyzeOuterJoins conn statement with
+      | .error error => return .error error
+      | .ok .noOuterJoin => pure directColumns
+      | .ok .outerJoin | .ok .uncertain =>
+        pure (directColumns.map fun column => { column with nullable := true })
+  pure (.ok {
+    name := query.name
+    sql := query.sql
+    sqlHash := queryHash query.sql
+    params
+    columns
+    cardinality := query.cardinality
+  })
+
+private def analyzeQuery (conn : Pg.Connection) (config : Config)
+    (snapshot : CatalogSnapshot) (query : QueryInput) :
+    Async (Except Error Pgx.QueryIR) := do
+  let name := statementName query
+  match ← Pg.Connection.prepare conn name query.sql #[] with
+  | .error error => pure (.error (.postgres s!"Parse/Describe query {query.name}" error))
+  | .ok statement =>
+    let result ← analyzePrepared conn config snapshot query statement
+    let closed ← closeStatement conn name
+    match result, closed with
+    | .error error, _ => pure (.error error)
+    | .ok _, .error error => pure (.error error)
+    | .ok query, .ok () => pure (.ok query)
+
+private def loadSnapshot (conn : Pg.Connection) (config : Config) :
+    Async (Except Error CatalogSnapshot) := do
+  let serverMajor ← match ← loadServerMajor conn with
+    | .error error => return .error error
+    | .ok value => pure value
+  unless config.supportedServerMajors.contains serverMajor do
+    return .error (.catalog s!"PostgreSQL major {serverMajor} is not in the configured \
+      supported set {repr config.supportedServerMajors}")
+  let schemas ← match ← loadSchemas conn config.schemas with
+    | .error error => return .error error
+    | .ok value => pure value
+  let types ← match ← loadTypes conn with
+    | .error error => return .error error
+    | .ok value => pure value
+  let enums ← match ← loadEnums conn config.schemas types with
+    | .error error => return .error error
+    | .ok value => pure value
+  let domains ← match ← loadDomains conn config.schemas types with
+    | .error error => return .error error
+    | .ok value => pure value
+  let relations ← match ← loadRelations conn config.schemas types with
+    | .error error => return .error error
+    | .ok value => pure value
+  let constraints ← match ← loadConstraints conn relations with
+    | .error error => return .error error
+    | .ok value => pure value
+  let indexes ← match ← loadIndexes conn relations with
+    | .error error => return .error error
+    | .ok value => pure value
+  let extensions ← match ← loadExtensions conn config.requiredExtensions with
+    | .error error => return .error error
+    | .ok value => pure value
+  pure (.ok {
+    serverMajor, schemas, types, enums, domains, relations, constraints,
+    indexes, extensions
+  })
+
+/-- Probe a migrated live server and return a fully symbolic, normalized
+Milestone-1 contract.  PostgreSQL's extended-protocol `Parse` is the sole SQL
+statement parser, so every `QueryInput.sql` is necessarily one statement. -/
+def probeDatabase (conn : Pg.Connection) (config : Config) :
+    Async (Except Error Pgx.DatabaseIR) := do
+  match validateConfig config with
+  | .error error => return .error error
+  | .ok () => pure ()
+  match ← configureSession conn config.session with
+  | .error error => return .error error
+  | .ok () => pure ()
+  let snapshot ← match ← loadSnapshot conn config with
+    | .error error => return .error error
+    | .ok value => pure value
+  match validateCatalogTypes config snapshot with
+  | .error error => return .error error
+  | .ok () => pure ()
+  let mut queries : Array Pgx.QueryIR := #[]
+  for query in config.queries do
+    match ← analyzeQuery conn config snapshot query with
+    | .error error => return .error error
+    | .ok value => queries := queries.push value
+  let database : Pgx.DatabaseIR := {
+    serverMajor := snapshot.serverMajor
+    session := config.session
+    schemas := snapshot.schemas
+    enums := snapshot.enums
+    domains := snapshot.domains
+    relations := snapshot.relations.map (·.ir)
+    constraints := snapshot.constraints
+    indexes := snapshot.indexes
+    queries
+    requiredExtensions := snapshot.extensions
+    typeOverrides := config.typeOverrides
+  }
+  pure (.ok database.normalize)
+
+end Pgx.Codegen.Probe

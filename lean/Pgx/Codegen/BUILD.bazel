@@ -1,0 +1,59 @@
+"""PostgreSQL probe and pure Lean code-generation tools."""
+
+load("@rules_lean//lean:defs.bzl", "lean_binary", "lean_library")
+
+package(default_visibility = ["//visibility:public"])
+
+lean_library(
+    name = "identifier",
+    srcs = ["Identifier.lean"],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
+    name = "manifest",
+    srcs = ["Manifest.lean"],
+    deps = ["//lean/Pgx/IR:json"],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
+    name = "probe",
+    srcs = ["Probe.lean"],
+    deps = [
+        "//lean/Pgx:type_mapping",
+        "@pg_lean//:pg_lean",
+    ],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
+    name = "emit",
+    srcs = ["Emit.lean"],
+    deps = [
+        ":identifier",
+        "//lean/Pgx:pg_typed",
+        "//lean/Pgx:type_mapping",
+    ],
+    strip_module_prefix = "lean",
+)
+
+lean_binary(
+    name = "pgx_codegen",
+    srcs = ["Main.lean"],
+    deps = [
+        ":emit",
+        ":manifest",
+        ":probe",
+        "//lean/Pgx/IR:json",
+        "@pg_lean//:pg_lean",
+    ],
+    strip_module_prefix = "lean",
+)
+
+lean_binary(
+    name = "pgx_compare",
+    srcs = ["Compare.lean"],
+    deps = ["//lean/Pgx/IR:json"],
+    strip_module_prefix = "lean",
+)
