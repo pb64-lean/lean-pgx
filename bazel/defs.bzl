@@ -21,6 +21,7 @@ LeanPgGenInfo = provider(
     fields = {
         "lean_srcs": "Generated Lean source files.",
         "schema_ir": "Canonical symbolic schema/query IR snapshot.",
+        "contract_hash": "Canonical-major semantic contract fingerprint.",
         "compatibility_hash": "Major-independent contract fingerprint.",
         "module_prefix": "Root Lean module name.",
         "query_names": "Generated query module names.",
@@ -40,12 +41,17 @@ _PgCompatSnapshotInfo = provider(
 )
 
 def _pascal_case(value):
-    normalized = value.replace("-", "_").replace(".", "_")
-    parts = []
-    for part in normalized.split("_"):
-        if part:
-            parts.append(part[0].upper() + part[1:])
-    return "".join(parts)
+    result = []
+    capitalize = True
+    alphanumeric = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    for i in range(len(value)):
+        char = value[i]
+        if char in alphanumeric:
+            result.append(char.upper() if capitalize else char)
+            capitalize = False
+        else:
+            capitalize = True
+    return "".join(result)
 
 def _query_lean_name(src):
     if not src.basename.endswith(".sql"):
@@ -54,6 +60,8 @@ def _query_lean_name(src):
     result = _pascal_case(stem)
     if not result:
         fail("query filename does not produce a Lean module name: %s" % src.path)
+    if result[0] in "0123456789":
+        fail("query filename produces a Lean module beginning with a digit: %s" % src.path)
     return result
 
 def _pg_query_set_impl(ctx):
@@ -243,11 +251,14 @@ def _lean_pg_generate_impl(ctx):
     ]
     root_out = ctx.actions.declare_file(module_path + ".lean")
     ir_out = ctx.actions.declare_file(ctx.attr.output_basename + ".pgir.json")
+    contract_out = ctx.actions.declare_file(
+        ctx.attr.output_basename + ".contract.sha256",
+    )
     compatibility_out = ctx.actions.declare_file(
         ctx.attr.output_basename + ".compatibility.sha256",
     )
     lean_srcs = [types_out, schema_out, constraints_out] + query_outs + [root_out]
-    outputs = lean_srcs + [ir_out, compatibility_out]
+    outputs = lean_srcs + [ir_out, contract_out, compatibility_out]
 
     args = ctx.actions.args()
     _add_common_generator_args(args, ctx, query_info)
@@ -261,6 +272,8 @@ def _lean_pg_generate_impl(ctx):
     args.add(root_out)
     args.add("--ir-out")
     args.add(ir_out)
+    args.add("--contract-out")
+    args.add(contract_out)
     args.add("--compatibility-out")
     args.add(compatibility_out)
     for i in range(len(query_outs)):
@@ -305,11 +318,13 @@ def _lean_pg_generate_impl(ctx):
         OutputGroupInfo(
             lean_srcs = depset(lean_srcs),
             schema_ir = depset([ir_out]),
+            contract_hash = depset([contract_out]),
             compatibility_hash = depset([compatibility_out]),
         ),
         LeanPgGenInfo(
             lean_srcs = depset(lean_srcs),
             schema_ir = ir_out,
+            contract_hash = contract_out,
             compatibility_hash = compatibility_out,
             module_prefix = ctx.attr.module_prefix,
             query_names = query_info.lean_names,
@@ -352,6 +367,7 @@ _lean_pg_generate = rule(
 def _pg_compat_snapshot_impl(ctx):
     database = ctx.attr.database[LeanPgGenInfo]
     ir_out = ctx.actions.declare_file(ctx.label.name + ".pgir.json")
+    contract_out = ctx.actions.declare_file(ctx.label.name + ".contract.sha256")
     compatibility_out = ctx.actions.declare_file(
         ctx.label.name + ".compatibility.sha256",
     )
@@ -380,6 +396,8 @@ def _pg_compat_snapshot_impl(ctx):
         args.add(database.query_srcs[i])
     args.add("--ir-out")
     args.add(ir_out)
+    args.add("--contract-out")
+    args.add(contract_out)
     args.add("--compatibility-out")
     args.add(compatibility_out)
 
@@ -402,7 +420,7 @@ def _pg_compat_snapshot_impl(ctx):
         inputs = depset(
             direct = database.migrations + database.query_srcs + [database.manifest],
         ),
-        outputs = [ir_out, compatibility_out],
+        outputs = [ir_out, contract_out, compatibility_out],
         tools = depset(
             direct = postgres_files + [ctx.executable._generator],
         ),
@@ -416,7 +434,7 @@ def _pg_compat_snapshot_impl(ctx):
         progress_message = "Probing %s with PostgreSQL %s" % (ctx.attr.database.label, ctx.attr.major),
     )
     return [
-        DefaultInfo(files = depset([ir_out, compatibility_out])),
+        DefaultInfo(files = depset([ir_out, contract_out, compatibility_out])),
         _PgCompatSnapshotInfo(schema_ir = ir_out, major = ctx.attr.major),
     ]
 
@@ -477,6 +495,81 @@ _pg_compat_compare_test = rule(
             executable = True,
             cfg = "target",
         ),
+    },
+)
+
+def _pg_live_test_impl(ctx):
+    database = ctx.attr.database[LeanPgGenInfo]
+    stamp = ctx.actions.declare_file(ctx.label.name + ".live-ok")
+    script = ctx.actions.declare_file(ctx.label.name + ".sh")
+    args = ctx.actions.args()
+    for migration in database.migrations:
+        args.add("--migration")
+        args.add(migration)
+    args.add_all(ctx.attr.runner_args)
+
+    postgres_files = ctx.files.postgres
+    initdb = _find_postgres_tool(postgres_files, "initdb")
+    postgres = _find_postgres_tool(postgres_files, "postgres")
+    pg_isready = _find_postgres_tool(postgres_files, "pg_isready")
+    pg_ctl = _find_postgres_tool(postgres_files, "pg_ctl")
+    command = _SERVER_LIFECYCLE + '\nprintf "ok\\n" > "$PGX_STAMP"\n'
+    ctx.actions.run_shell(
+        command = command,
+        arguments = [
+            initdb.path,
+            postgres.path,
+            pg_isready.path,
+            pg_ctl.path,
+            ctx.executable.runner.path,
+            args,
+        ],
+        env = {"PGX_STAMP": stamp.path},
+        inputs = depset(
+            direct = database.migrations + ctx.files.data,
+        ),
+        outputs = [stamp],
+        tools = depset(
+            direct = postgres_files + [ctx.executable.runner],
+        ),
+        use_default_shell_env = True,
+        execution_requirements = {
+            "local": "1",
+            "no-remote": "1",
+            "no-sandbox": "1",
+        },
+        mnemonic = "LeanPgLiveTest",
+        progress_message = "Running checked PostgreSQL acceptance test %s" % ctx.label,
+    )
+    ctx.actions.write(
+        script,
+        "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n",
+        is_executable = True,
+    )
+    return [DefaultInfo(
+        executable = script,
+        runfiles = ctx.runfiles(files = [stamp]),
+    )]
+
+_pg_live_test = rule(
+    implementation = _pg_live_test_impl,
+    test = True,
+    attrs = {
+        "database": attr.label(
+            mandatory = True,
+            providers = [LeanPgGenInfo],
+        ),
+        "runner": attr.label(
+            mandatory = True,
+            executable = True,
+            cfg = "exec",
+        ),
+        "postgres": attr.label(
+            default = "@postgresql_18//:toolchain",
+            allow_files = True,
+        ),
+        "runner_args": attr.string_list(),
+        "data": attr.label_list(allow_files = True),
     },
 )
 
@@ -562,6 +655,27 @@ def pg_compat_test(
     _pg_compat_compare_test(
         name = name,
         snapshots = snapshots,
+        visibility = visibility,
+        **kwargs
+    )
+
+def pg_live_test(
+        name,
+        database,
+        runner,
+        postgres = "@postgresql_18//:toolchain",
+        args = None,
+        data = None,
+        visibility = None,
+        **kwargs):
+    """Runs a Lean acceptance executable against a fresh migrated cluster."""
+    _pg_live_test(
+        name = name,
+        database = _generation_label(database),
+        runner = runner,
+        postgres = postgres,
+        runner_args = args or [],
+        data = data or [],
         visibility = visibility,
         **kwargs
     )

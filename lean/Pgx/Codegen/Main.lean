@@ -32,6 +32,7 @@ private structure Options where
   constraintsOut : Option String := none
   rootOut : Option String := none
   irOut : Option String := none
+  contractOut : Option String := none
   compatibilityOut : Option String := none
   queryOuts : Array (String × String) := #[]
 
@@ -106,6 +107,10 @@ private def parseArgs : List String → Options → Except String Options
       }
   | "--ir-out" :: value :: rest, options => do
       parseArgs rest { options with irOut := ← setStringOption "--ir-out" value options.irOut }
+  | "--contract-out" :: value :: rest, options => do
+      parseArgs rest {
+        options with contractOut := ← setStringOption "--contract-out" value options.contractOut
+      }
   | "--compatibility-out" :: value :: rest, options => do
       let output ← setStringOption "--compatibility-out" value options.compatibilityOut
       parseArgs rest {
@@ -126,6 +131,9 @@ private def hasDuplicates [BEq α] (values : Array α) : Bool := Id.run do
     seen := seen.push value
   return false
 
+private def sortedNats (values : Array Nat) : Array Nat :=
+  values.toList.mergeSort (· < ·) |>.toArray
+
 private def validateOptions (options : Options) : Except String Unit := do
   let _ ← required "--url" options.url
   let _ ← required "--module-prefix" options.modulePrefix
@@ -133,6 +141,7 @@ private def validateOptions (options : Options) : Except String Unit := do
   if canonicalMajor == 0 then throw "--canonical-major must be positive"
   let _ ← required "--manifest" options.manifest
   let _ ← required "--ir-out" options.irOut
+  let _ ← required "--contract-out" options.contractOut
   let _ ← required "--compatibility-out" options.compatibilityOut
   if options.serverMajors.isEmpty then throw "at least one --server-major is required"
   if hasDuplicates options.serverMajors then throw "--server-major values contain duplicates"
@@ -177,8 +186,9 @@ private def loadInputs (options : Options) : IO (Except String LoadedInput) := d
   match Pgx.Codegen.Manifest.validateQueryFiles manifest options.queryFiles with
   | .error error => return .error error
   | .ok () => pure ()
-  unless manifest.supportedServerMajors == options.serverMajors do
-    return .error s!"manifest supportedServerMajors {repr manifest.supportedServerMajors} does not match build rule {repr options.serverMajors}"
+  let buildMajors := sortedNats options.serverMajors
+  unless manifest.supportedServerMajors == buildMajors do
+    return .error s!"manifest supportedServerMajors {repr manifest.supportedServerMajors} does not match build rule {repr buildMajors}"
   let mut queries : Array Probe.QueryInput := #[]
   for index in [0:options.queryFiles.size] do
     let path := options.queryFiles[index]!
@@ -208,17 +218,12 @@ private def execSql (conn : Pg.Connection) (context sql : String) :
 
 private def replayMigrations (conn : Pg.Connection) (paths : Array String) :
     Async (Except String Unit) := do
-  match ← execSql conn "begin migration transaction" "BEGIN" with
-  | .error error => return .error error
-  | .ok () => pure ()
   for path in paths do
     let sql ← IO.FS.readFile path
     match ← execSql conn s!"migration {path}" sql with
     | .ok () => pure ()
-    | .error error =>
-        let _ ← execSql conn "rollback failed migration" "ROLLBACK"
-        return .error error
-  execSql conn "commit migration transaction" "COMMIT"
+    | .error error => return .error error
+  pure (.ok ())
 
 private def probe (options : Options) (loaded : LoadedInput) :
     Async (Except String Pgx.DatabaseIR) := do
@@ -277,6 +282,9 @@ private def writeOutputs (options : Options) (database : Pgx.DatabaseIR)
   let compatibilityOut ← match required "--compatibility-out" options.compatibilityOut with
     | .ok value => pure value
     | .error error => return .error error
+  let contractOut ← match required "--contract-out" options.contractOut with
+    | .ok value => pure value
+    | .error error => return .error error
   writeText typesOut sources.types.contents
   writeText schemaOut sources.schema.contents
   writeText constraintsOut sources.constraints.contents
@@ -287,6 +295,7 @@ private def writeOutputs (options : Options) (database : Pgx.DatabaseIR)
       | return .error s!"emitter produced no query module for declared output {name}"
     writeText path source.contents
   writeText irOut database.renderSnapshot
+  writeText contractOut (database.contractHash ++ "\n")
   writeText compatibilityOut (database.compatibilityHash ++ "\n")
   pure (.ok ())
 
@@ -298,7 +307,11 @@ private def writeProbeOutputs (options : Options) (database : Pgx.DatabaseIR) :
   let compatibilityOut ← match required "--compatibility-out" options.compatibilityOut with
     | .ok value => pure value
     | .error error => return .error error
+  let contractOut ← match required "--contract-out" options.contractOut with
+    | .ok value => pure value
+    | .error error => return .error error
   writeText irOut database.renderSnapshot
+  writeText contractOut (database.contractHash ++ "\n")
   writeText compatibilityOut (database.compatibilityHash ++ "\n")
   pure (.ok ())
 

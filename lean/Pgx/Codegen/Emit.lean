@@ -522,7 +522,8 @@ private def emitDomain (plan : NamingPlan) (db : Pgx.DatabaseIR)
     s!"  {typeDescExpr db value.key}",
     "",
     s!"private def encodeBase (resolved : Pgx.Typed.ResolvedType) (value : {base.leanType}) :",
-    "    Except Pgx.Typed.Error Pgx.Typed.EncodedValue := do"
+    "    Except Pgx.Typed.Error Pgx.Typed.EncodedValue := do",
+    "  let _ := resolved"
   ]
   lines := lines ++ rawEncodeBody base
   lines := lines ++ [
@@ -726,7 +727,9 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
     "",
     "private def encodeParams",
     s!"    (catalog : Pgx.Typed.ResolvedCatalog {plan.modulePrefix}.database)",
-    "    (params : Params) : Except Pgx.Typed.Error Pgx.Typed.EncodedParams := do"
+    "    (params : Params) : Except Pgx.Typed.Error Pgx.Typed.EncodedParams := do",
+    "  let _ := catalog",
+    "  let _ := params"
   ]
   let mut encodedNames : Array String := #[]
   for i in [0:query.params.size] do
@@ -743,6 +746,7 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
     s!"    (catalog : Pgx.Typed.ResolvedCatalog {plan.modulePrefix}.database)",
     "    (columns : Array Pg.Protocol.ColumnDesc)",
     "    (values : Array (Option ByteArray)) : Except Pgx.Typed.Error Row := do",
+    "  let _ := catalog",
     s!"  unless columns.size == {query.columns.size} do",
     s!"    throw (.queryDrift \"generated decoder expected {query.columns.size} column descriptors\")",
     s!"  unless values.size == {query.columns.size} do",

@@ -1,6 +1,13 @@
 """End-to-end Milestone-1 checked-query fixture."""
 
-load("//bazel:defs.bzl", "lean_pg_library", "pg_compat_test", "pg_query_set")
+load(
+    "//bazel:defs.bzl",
+    "lean_pg_library",
+    "pg_compat_test",
+    "pg_live_test",
+    "pg_query_set",
+)
+load("@rules_lean//lean:defs.bzl", "lean_binary", "lean_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -35,4 +42,25 @@ pg_compat_test(
         "@postgresql_17//:toolchain",
         "@postgresql_18//:toolchain",
     ],
+)
+
+lean_test(
+    name = "consumer_test",
+    srcs = ["Consumer.lean"],
+    deps = [":app_db"],
+)
+
+lean_binary(
+    name = "runtime_test_bin",
+    srcs = ["RuntimeTest.lean"],
+    deps = [
+        ":app_db",
+        "@pg_lean//:pg_lean",
+    ],
+)
+
+pg_live_test(
+    name = "runtime_test",
+    database = ":app_db",
+    runner = ":runtime_test_bin",
 )
