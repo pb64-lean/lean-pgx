@@ -1,0 +1,67 @@
+{
+  "supportedServerMajors": [17, 18],
+  "create_user.sql": {
+    "leanName": "CreateUser",
+    "cardinality": "execute",
+    "parameters": [
+      {
+        "position": 1,
+        "name": "organizationId",
+        "nullable": false
+      },
+      {
+        "position": 2,
+        "name": "email",
+        "nullable": false
+      },
+      {
+        "position": 3,
+        "name": "status",
+        "nullable": false
+      },
+      {
+        "position": 4,
+        "name": "displayName",
+        "nullable": true
+      }
+    ]
+  },
+  "get_user_by_id.sql": {
+    "leanName": "GetUserById",
+    "cardinality": "exactlyOne",
+    "parameters": [
+      {
+        "position": 1,
+        "name": "id",
+        "nullable": false
+      }
+    ]
+  },
+  "find_user_by_email.sql": {
+    "leanName": "FindUserByEmail",
+    "cardinality": "zeroOrOne",
+    "parameters": [
+      {
+        "position": 1,
+        "name": "email",
+        "nullable": false
+      }
+    ]
+  },
+  "list_users.sql": {
+    "leanName": "ListUsers",
+    "cardinality": "many",
+    "parameters": [
+      {
+        "position": 1,
+        "name": "status",
+        "nullable": true
+      }
+    ]
+  },
+  "list_users_with_profile.sql": {
+    "leanName": "ListUsersWithProfile",
+    "cardinality": "many",
+    "parameters": []
+  }
+}

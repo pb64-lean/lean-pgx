@@ -1,0 +1,38 @@
+"""End-to-end Milestone-1 checked-query fixture."""
+
+load("//bazel:defs.bzl", "lean_pg_library", "pg_compat_test", "pg_query_set")
+
+package(default_visibility = ["//visibility:public"])
+
+pg_query_set(
+    name = "queries",
+    srcs = [
+        "queries/create_user.sql",
+        "queries/find_user_by_email.sql",
+        "queries/get_user_by_id.sql",
+        "queries/list_users.sql",
+        "queries/list_users_with_profile.sql",
+    ],
+    manifest = "queries/queries.json",
+)
+
+lean_pg_library(
+    name = "app_db",
+    module_prefix = "AppDb",
+    migrations = [
+        "migrations/0001_schema_and_types.sql",
+        "migrations/0002_tables.sql",
+        "migrations/0003_indexes.sql",
+    ],
+    queries = ":queries",
+    schemas = ["app"],
+)
+
+pg_compat_test(
+    name = "pg17_pg18_test",
+    database = ":app_db",
+    postgres = [
+        "@postgresql_17//:toolchain",
+        "@postgresql_18//:toolchain",
+    ],
+)
