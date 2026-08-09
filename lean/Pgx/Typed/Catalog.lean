@@ -102,6 +102,29 @@ private def parseRelationKind (context : String) : String → Except Error Pgx.R
   | "f" => pure .foreignTable
   | value => throw (drift s!"{context}: unknown PostgreSQL relation kind {value}")
 
+private def parseRoutineKind (context : String) : String → Except Error Pgx.RoutineKind
+  | "f" => pure .function
+  | "p" => pure .procedure
+  | "a" => pure .aggregate
+  | "w" => pure .window
+  | value => throw (drift s!"{context}: unknown PostgreSQL routine kind {value}")
+
+private def parseRoutineArgMode (context : String) : String →
+    Except Error Pgx.RoutineArgMode
+  | "i" => pure .input
+  | "o" => pure .output
+  | "b" => pure .inputOutput
+  | "v" => pure .variadic
+  | "t" => pure .table
+  | value => throw (drift s!"{context}: unknown PostgreSQL routine argument mode {value}")
+
+private def parseViewCheckOption (context : String) : String →
+    Except Error Pgx.ViewCheckOption
+  | "none" => pure .none
+  | "local" => pure .local
+  | "cascaded" => pure .cascaded
+  | value => throw (drift s!"{context}: unknown view check option {value}")
+
 private def setConfig (conn : Pg.Connection) (name value : String) :
     Async (Except Error Unit) := do
   let sql := s!"SELECT pg_catalog.set_config({sqlLiteral name}, {sqlLiteral value}, false)"
@@ -485,6 +508,305 @@ private def loadRelations (conn : Pg.Connection) :
           }
       pure (.ok relations)
 
+private def liveTypeRefByOid (types : Array LiveType) (context : String)
+    (oid : UInt32) : Except Error Pgx.TypeRef := do
+  let candidates := types.filter (fun value => value.oid == oid)
+  let some ty := candidates[0]?
+    | throw (drift s!"{context}: PostgreSQL type OID {oid} is missing")
+  unless candidates.size == 1 do
+    throw (drift s!"{context}: PostgreSQL type OID {oid} is ambiguous")
+  pure { key := ty.key }
+
+private def viewCatalogSql : String :=
+  "SELECT c.oid::text, ns.nspname, c.relname, c.relkind::text, " ++
+  "pg_catalog.pg_get_viewdef(c.oid, true), " ++
+  "COALESCE((SELECT option_value FROM pg_catalog.pg_options_to_table(c.reloptions) " ++
+  "WHERE option_name = 'check_option'), 'none'), " ++
+  "COALESCE((SELECT option_value FROM pg_catalog.pg_options_to_table(c.reloptions) " ++
+  "WHERE option_name = 'security_barrier'), 'false'), " ++
+  "COALESCE((SELECT option_value FROM pg_catalog.pg_options_to_table(c.reloptions) " ++
+  "WHERE option_name = 'security_invoker'), 'false') " ++
+  "FROM pg_catalog.pg_class AS c " ++
+  "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = c.relnamespace " ++
+  "WHERE c.relkind IN ('v', 'm') ORDER BY ns.nspname, c.relname"
+
+private def loadViews (conn : Pg.Connection) (schemas : Array String) :
+    Async (Except Error (Array Pgx.ViewIR)) := do
+  match ← queryOne conn "read view metadata" viewCatalogSql with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    let mut views : Array Pgx.ViewIR := #[]
+    for row in rows.rows do
+      let parsed : Except Error (String × Pgx.ViewIR) := do
+        let _ ← parseUInt32 "read view metadata" (← cell "read view metadata" row 0)
+        let schema ← cell "read view metadata" row 1
+        let name ← cell "read view metadata" row 2
+        let kind ← cell "read view metadata" row 3
+        unless kind == "v" || kind == "m" do
+          throw (drift s!"read view metadata: unknown relation kind {kind}")
+        let definition ← cell "read view metadata" row 4
+        let rawCheckOption ← cell "read view metadata" row 5
+        let rawBarrier ← cell "read view metadata" row 6
+        let rawInvoker ← cell "read view metadata" row 7
+        let materialized := kind == "m"
+        let checkOption ← if materialized then pure .none else
+          parseViewCheckOption "read view metadata" rawCheckOption
+        let securityBarrier ← if materialized then pure false else
+          parseBool "read view metadata" rawBarrier
+        let securityInvoker ← if materialized then pure false else
+          parseBool "read view metadata" rawInvoker
+        pure (schema, {
+          relation := { schema, name }
+          definition
+          checkOption
+          securityBarrier
+          securityInvoker
+        })
+      match parsed with
+      | .error error => return .error error
+      | .ok (schema, view) =>
+        if schemas.contains schema then views := views.push view
+    pure (.ok views)
+
+private structure LiveRoutine where
+  oid : UInt32
+  returnTypeOid : UInt32
+  inputCount : Nat
+  defaultCount : Nat
+  ir : Pgx.RoutineIR
+  deriving Inhabited
+
+private def routineCatalogSql : String :=
+  "SELECT p.oid::text, ns.nspname, p.proname, p.prokind::text, " ++
+  "p.proretset::text, p.prorettype::text, p.pronargs::text, " ++
+  "p.pronargdefaults::text, p.proisstrict::text, p.provolatile::text, " ++
+  "p.proparallel::text, p.prosecdef::text " ++
+  "FROM pg_catalog.pg_proc AS p " ++
+  "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = p.pronamespace " ++
+  "ORDER BY p.oid"
+
+private def routineArgCatalogSql : String :=
+  "SELECT p.oid::text, args.ordinality::text, " ++
+  "NULLIF(p.proargnames[args.ordinality], ''), " ++
+  "COALESCE(p.proargmodes[args.ordinality], 'i')::text, args.type_oid::text " ++
+  "FROM pg_catalog.pg_proc AS p " ++
+  "CROSS JOIN LATERAL pg_catalog.unnest(" ++
+  "COALESCE(p.proallargtypes, p.proargtypes::oid[])) " ++
+  "WITH ORDINALITY AS args(type_oid, ordinality) " ++
+  "ORDER BY p.oid, args.ordinality"
+
+private def isRoutineOutput : Pgx.RoutineArgMode → Bool
+  | .output | .inputOutput | .table => true
+  | .input | .variadic => false
+
+private def loadRoutines (conn : Pg.Connection) (schemas : Array String)
+    (types : Array LiveType) : Async (Except Error (Array Pgx.RoutineIR)) := do
+  let mut routines : Array LiveRoutine := #[]
+  match ← queryOne conn "read pg_proc" routineCatalogSql with
+  | .error error => return .error error
+  | .ok rows =>
+    for row in rows.rows do
+      let parsed : Except Error LiveRoutine := do
+        let oid ← parseUInt32 "read pg_proc" (← cell "read pg_proc" row 0)
+        let schema ← cell "read pg_proc" row 1
+        let name ← cell "read pg_proc" row 2
+        let kind ← parseRoutineKind "read pg_proc" (← cell "read pg_proc" row 3)
+        let returnsSet ← parseBool "read pg_proc" (← cell "read pg_proc" row 4)
+        let returnTypeOid ← parseUInt32 "read pg_proc" (← cell "read pg_proc" row 5)
+        let inputCount ← parseNat "read pg_proc" (← cell "read pg_proc" row 6)
+        let defaultCount ← parseNat "read pg_proc" (← cell "read pg_proc" row 7)
+        let strict ← parseBool "read pg_proc" (← cell "read pg_proc" row 8)
+        let volatility ← cell "read pg_proc" row 9
+        let parallel ← cell "read pg_proc" row 10
+        let securityDefiner ← parseBool "read pg_proc" (← cell "read pg_proc" row 11)
+        pure {
+          oid, returnTypeOid, inputCount, defaultCount
+          ir := {
+            key := { schema, name }
+            kind, args := #[], returnsSet
+            strict, volatility, parallel, securityDefiner
+          }
+        }
+      match parsed with
+      | .error error => return .error error
+      | .ok value => routines := routines.push value
+  match ← queryOne conn "read pg_proc arguments" routineArgCatalogSql with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    for row in rows.rows do
+      let parsed : Except Error (UInt32 × Nat × Pgx.RoutineArgIR) := do
+        let oid ← parseUInt32 "read pg_proc arguments"
+          (← cell "read pg_proc arguments" row 0)
+        let ordinal ← parseNat "read pg_proc arguments"
+          (← cell "read pg_proc arguments" row 1)
+        let name ← cell? "read pg_proc arguments" row 2
+        let mode ← parseRoutineArgMode "read pg_proc arguments"
+          (← cell "read pg_proc arguments" row 3)
+        let typeOid ← parseUInt32 "read pg_proc arguments"
+          (← cell "read pg_proc arguments" row 4)
+        pure (oid, ordinal, {
+          name, mode
+          ty := ← liveTypeRefByOid types "read pg_proc arguments" typeOid
+        })
+      match parsed with
+      | .error error => return .error error
+      | .ok (oid, ordinal, arg) =>
+        match routines.findIdx? (fun value => value.oid == oid) with
+        | none => pure ()
+        | some index =>
+          let value := routines[index]!
+          unless ordinal == value.ir.args.size + 1 do
+            return .error (drift s!"routine {value.ir.key.schema}.{value.ir.key.name} \
+              has non-dense argument ordinal {ordinal}")
+          routines := routines.set! index {
+            value with ir := { value.ir with args := value.ir.args.push arg }
+          }
+    for index in [0:routines.size] do
+      let value := routines[index]!
+      let inputArgs := value.ir.args.filter (fun arg => arg.mode.isInput)
+      unless inputArgs.size == value.inputCount do
+        return .error (drift s!"routine {value.ir.key.schema}.{value.ir.key.name} \
+          reports {value.inputCount} input arguments but exposes {inputArgs.size}")
+      unless value.defaultCount ≤ value.inputCount do
+        return .error (drift s!"routine {value.ir.key.schema}.{value.ir.key.name} \
+          has more defaults than input arguments")
+      let firstDefault := value.inputCount - value.defaultCount
+      let mut inputPosition := 0
+      let mut outputPosition := 0
+      let mut args : Array Pgx.RoutineArgIR := #[]
+      let mut results : Array Pgx.RoutineResultColumnIR := #[]
+      for arg in value.ir.args do
+        let hasDefault := arg.mode.isInput && firstDefault < inputPosition + 1
+        if arg.mode.isInput then inputPosition := inputPosition + 1
+        let arg := { arg with hasDefault }
+        args := args.push arg
+        if isRoutineOutput arg.mode then
+          outputPosition := outputPosition + 1
+          results := results.push {
+            name := arg.name.getD s!"column{outputPosition}"
+            ordinal := outputPosition
+            ty := arg.ty
+          }
+      let returnTypeResult : Except Error (Option Pgx.TypeRef) :=
+        if value.ir.kind == .procedure then pure none else
+          some <$> liveTypeRefByOid types
+            s!"routine {value.ir.key.schema}.{value.ir.key.name}" value.returnTypeOid
+      let returnType ← match returnTypeResult with
+        | .ok result => pure result
+        | .error error => return .error error
+      let dynamicRecord := match returnType with
+        | some ref => ref.key.kind == .pseudo && ref.key.name == "record" && results.isEmpty
+        | none => false
+      let ir := {
+        value.ir with
+          key := { value.ir.key with inputTypes := inputArgs.map (fun arg => arg.ty) }
+          args
+          returnType
+          resultColumns := results
+          dynamicRecord
+      }
+      routines := routines.set! index { value with ir }
+    pure (.ok (routines.filter (fun value =>
+      schemas.contains value.ir.key.schema) |>.map (fun value => value.ir)))
+
+private def extensionCatalogSql : String :=
+  "SELECT extname, extversion FROM pg_catalog.pg_extension ORDER BY extname"
+
+private def loadExtensions (conn : Pg.Connection) :
+    Async (Except Error (Array (String × String))) := do
+  match ← queryOne conn "read pg_extension" extensionCatalogSql with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    let mut extensions : Array (String × String) := #[]
+    for row in rows.rows do
+      let parsed : Except Error (String × String) := do
+        pure (← cell "read pg_extension" row 0, ← cell "read pg_extension" row 1)
+      match parsed with
+      | .error error => return .error error
+      | .ok value => extensions := extensions.push value
+    pure (.ok extensions)
+
+private def metadataSchemas (db : DatabaseDesc) : Array String := Id.run do
+  let mut schemas : Array String := #[]
+  for relation in db.relations do
+    unless schemas.contains relation.key.schema do
+      schemas := schemas.push relation.key.schema
+  for view in db.views do
+    unless schemas.contains view.relation.schema do
+      schemas := schemas.push view.relation.schema
+  for routine in db.routines do
+    unless schemas.contains routine.key.schema do
+      schemas := schemas.push routine.key.schema
+  return schemas
+
+/-- Compare live semantic view metadata as an unordered, duplicate-free set. -/
+def validateViewMetadata (expected actual : Array Pgx.ViewIR) : Except Error Unit := do
+  unless actual.size == expected.size do
+    throw (drift s!"view metadata count drift: expected {expected.size}, received {actual.size}")
+  for want in expected do
+    let candidates := actual.filter (fun value => value.relation == want.relation)
+    let some found := candidates[0]?
+      | throw (drift s!"required view metadata is missing: {want.relation}")
+    unless candidates.size == 1 do
+      throw (drift s!"view metadata identity is ambiguous: {want.relation}")
+    unless found == want do
+      throw (drift s!"view metadata drift for {want.relation}: expected \
+        {repr want}, received {repr found}")
+
+/-- Compare live routine metadata by PostgreSQL overload identity. -/
+def validateRoutineMetadata (expected actual : Array Pgx.RoutineIR) : Except Error Unit := do
+  unless actual.size == expected.size do
+    throw (drift s!"routine metadata count drift: expected {expected.size}, received {actual.size}")
+  for want in expected do
+    let candidates := actual.filter (fun value => value.key == want.key)
+    let some found := candidates[0]?
+      | throw (drift s!"required routine metadata is missing: {want.key}")
+    unless candidates.size == 1 do
+      throw (drift s!"routine metadata identity is ambiguous: {want.key}")
+    unless found == want do
+      throw (drift s!"routine metadata drift for {want.key}: expected \
+        {repr want}, received {repr found}")
+
+/-- Validate installed versions and the internal provenance of generated
+extension codec packages.  Installed extensions outside the required set do
+not affect the contract. -/
+def validateExtensionMetadata (db : DatabaseDesc)
+    (installed : Array (String × String)) : Except Error Unit := do
+  let mut requiredNames : Array String := #[]
+  for required in db.requiredExtensions do
+    if requiredNames.contains required.1 then
+      throw (drift s!"required extension metadata duplicates {required.1}")
+    requiredNames := requiredNames.push required.1
+    let candidates := installed.filter (fun value => value.1 == required.1)
+    let some found := candidates[0]?
+      | throw (drift s!"required extension {required.1} is not installed")
+    unless candidates.size == 1 do
+      throw (drift s!"installed extension identity is ambiguous: {required.1}")
+    unless found.2 == required.2 do
+      throw (drift s!"extension version drift for {required.1}: expected \
+        {required.2}, received {found.2}")
+  let mut packageExtensions : Array String := #[]
+  let mut packageTypes : Array Pgx.TypeKey := #[]
+  for package in db.extensionCodecPackages do
+    if packageExtensions.contains package.extension then
+      throw (drift s!"extension codec package metadata duplicates {package.extension}")
+    packageExtensions := packageExtensions.push package.extension
+    let candidates := db.requiredExtensions.filter (fun value => value.1 == package.extension)
+    let some required := candidates[0]?
+      | throw (drift s!"extension codec package {package.extension} is not required")
+    unless candidates.size == 1 && package.version == required.2 do
+      throw (drift s!"extension codec package provenance drift for {package.extension}")
+    if package.importModule.isEmpty then
+      throw (drift s!"extension codec package {package.extension} has no import module")
+    if package.types.isEmpty then
+      throw (drift s!"extension codec package {package.extension} has no type keys")
+    for key in package.types do
+      if packageTypes.contains key then
+        throw (drift s!"extension codec package type metadata duplicates {key}")
+      packageTypes := packageTypes.push key
+      unless db.types.any (fun value => value.key == key) do
+        throw (drift s!"extension codec package {package.extension} refers to missing type {key}")
+
 private def checkTypes (db : DatabaseDesc) (live : Array LiveType) :
     Except Error (Array ResolvedType) := do
   let mut resolved : Array ResolvedType := #[]
@@ -664,7 +986,8 @@ def CheckedConnection.completePrepare (conn : CheckedConnection db) (key : Strin
   | some completion => discard <| completion.resolve result
 
 /-- Install the generated session contract and compare every relevant type,
-relation, and column before constructing a checked capability. -/
+relation, column, view, routine, and required extension before constructing a
+checked capability. -/
 def attach (db : DatabaseDesc) (conn : Pg.Connection) :
     Async (Except Error (CheckedConnection db)) := do
   match ← validateServerMajor db conn with
@@ -679,12 +1002,31 @@ def attach (db : DatabaseDesc) (conn : Pg.Connection) :
   let liveRelations ← match ← loadRelations conn with
     | .error error => return .error error
     | .ok values => pure values
+  let schemas := metadataSchemas db
+  let liveViews ← match ← loadViews conn schemas with
+    | .error error => return .error error
+    | .ok values => pure values
+  let liveRoutines ← match ← loadRoutines conn schemas liveTypes with
+    | .error error => return .error error
+    | .ok values => pure values
+  let installedExtensions ← match ← loadExtensions conn with
+    | .error error => return .error error
+    | .ok values => pure values
   let resolvedTypes ← match checkTypes db liveTypes with
     | .error error => return .error error
     | .ok values => pure values
   let resolvedRelations ← match checkRelations db liveRelations with
     | .error error => return .error error
     | .ok values => pure values
+  match validateViewMetadata db.views liveViews with
+  | .error error => return .error error
+  | .ok () => pure ()
+  match validateRoutineMetadata db.routines liveRoutines with
+  | .error error => return .error error
+  | .ok () => pure ()
+  match validateExtensionMetadata db installedExtensions with
+  | .error error => return .error error
+  | .ok () => pure ()
   let catalog ← match ResolvedCatalog.create db resolvedTypes resolvedRelations with
     | .error error => return .error error
     | .ok value => pure value

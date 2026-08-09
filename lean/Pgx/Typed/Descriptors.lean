@@ -73,6 +73,10 @@ structure DatabaseDesc where
   session : Pgx.SessionContract
   types : Array StaticTypeDesc
   relations : Array StaticRelationDesc
+  views : Array Pgx.ViewIR := #[]
+  routines : Array Pgx.RoutineIR := #[]
+  requiredExtensions : Array (String × String) := #[]
+  extensionCodecPackages : Array Pgx.ExtensionCodecPackageIR := #[]
   schemaHash : String
   contractHash : String
   deriving Repr, BEq, Inhabited

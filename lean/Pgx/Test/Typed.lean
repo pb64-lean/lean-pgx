@@ -1,4 +1,4 @@
-import Pgx.Typed.Descriptors
+import Pgx.Typed.Catalog
 
 open Pgx.Typed
 
@@ -15,6 +15,27 @@ private def usersKey : Pgx.RelationKey := { schema := "app", name := "users" }
 
 private def int4Desc : StaticTypeDesc := { key := int4Key }
 private def textDesc : StaticTypeDesc := { key := textKey }
+
+private def activeUsersKey : Pgx.RelationKey :=
+  { schema := "app", name := "active_users" }
+
+private def activeUsersView : Pgx.ViewIR := {
+  relation := activeUsersKey
+  definition := "SELECT id FROM app.users WHERE active"
+  checkOption := .local
+  securityBarrier := true
+}
+
+private def lookupRoutine : Pgx.RoutineIR := {
+  key := { schema := "app", name := "lookup_user", inputTypes := #[int4] }
+  kind := .function
+  args := #[{ name := some "id", mode := .input, ty := int4 }]
+  returnsSet := false
+  returnType := some text
+  strict := true
+  volatility := "s"
+  parallel := "s"
+}
 
 private def resolveTestType : TypeResolver
   | key =>
@@ -144,8 +165,47 @@ private def resolvedCodecTests : IO Unit := do
   assert! okEq (optional.decode resolveTestType
     { expected := int4Desc, oid := 23 } 1 none) none
 
+private def semanticMetadataTests : IO Unit := do
+  assert! (validateViewMetadata #[activeUsersView] #[activeUsersView]).isOk
+  assert! isError (validateViewMetadata #[activeUsersView]
+    #[{ activeUsersView with definition := "SELECT id FROM app.users" }])
+  assert! isError (validateViewMetadata #[activeUsersView]
+    #[activeUsersView, activeUsersView])
+
+  assert! (validateRoutineMetadata #[lookupRoutine] #[lookupRoutine]).isOk
+  assert! isError (validateRoutineMetadata #[lookupRoutine]
+    #[{ lookupRoutine with strict := false }])
+  assert! isError (validateRoutineMetadata #[lookupRoutine] #[])
+
+  let extensionKey : Pgx.TypeKey :=
+    { schema := "ext", name := "citext", kind := .base }
+  let extensionDb : DatabaseDesc := {
+    database with
+    types := database.types.push { key := extensionKey }
+    requiredExtensions := #[("citext", "1.6")]
+    extensionCodecPackages := #[{
+      extension := "citext"
+      version := "1.6"
+      importModule := "Pg.Types.Citext"
+      types := #[extensionKey]
+    }]
+  }
+  assert! (validateExtensionMetadata extensionDb
+    #[("citext", "1.6"), ("plpgsql", "1.0")]).isOk
+  assert! isError (validateExtensionMetadata extensionDb #[("citext", "1.5")])
+  assert! isError (validateExtensionMetadata extensionDb #[])
+  assert! isError (validateExtensionMetadata {
+    extensionDb with
+    extensionCodecPackages := extensionDb.extensionCodecPackages.map fun package =>
+      { package with version := "1.5" }
+  } #[("citext", "1.6")])
+  assert! isError (validateExtensionMetadata {
+    extensionDb with types := database.types
+  } #[("citext", "1.6")])
+
 def main : IO UInt32 := do
   resolvedCodecTests
+  semanticMetadataTests
   let catalog ← match catalogResult with
     | .ok value => pure value
     | .error error => throw (IO.userError (toString error))

@@ -12,7 +12,7 @@ lean_test(
 lean_test(
     name = "typed_test",
     srcs = ["Typed.lean"],
-    deps = ["//lean/Pgx/Typed:descriptors"],
+    deps = ["//lean/Pgx/Typed:catalog"],
     strip_module_prefix = "lean",
 )
 
