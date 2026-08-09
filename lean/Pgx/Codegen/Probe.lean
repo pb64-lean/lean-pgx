@@ -229,6 +229,22 @@ private def parseRelationKind (context : String) : String → Except Error Pgx.R
   | "f" => pure .foreignTable
   | value => throw (.catalog s!"{context}: unknown relation kind {value}")
 
+private def parseRoutineKind (context : String) : String → Except Error Pgx.RoutineKind
+  | "f" => pure .function
+  | "p" => pure .procedure
+  | "a" => pure .aggregate
+  | "w" => pure .window
+  | value => throw (.catalog s!"{context}: unknown routine kind {value}")
+
+private def parseRoutineArgMode (context : String) : String →
+    Except Error Pgx.RoutineArgMode
+  | "i" => pure .input
+  | "o" => pure .output
+  | "b" => pure .inputOutput
+  | "v" => pure .variadic
+  | "t" => pure .table
+  | value => throw (.catalog s!"{context}: unknown routine argument mode {value}")
+
 private def parseConstraintKind (adapter : Adapter) (context value : String) :
     Except Error Pgx.ConstraintKind :=
   match adapter.constraintKind? value with
@@ -390,6 +406,9 @@ private structure CatalogType where
   oid : UInt32
   key : Pgx.TypeKey
   base : Option Pgx.TypeRef
+  elementOid : Option UInt32
+  delimiter : String
+  relationOid : Option UInt32
   notNull : Bool
   defaultExpr : Option String
   deriving Inhabited
@@ -411,13 +430,27 @@ private structure CatalogIndex where
   ir : Pgx.IndexIR
   deriving Inhabited
 
+private structure CatalogRoutine where
+  oid : UInt32
+  returnTypeOid : UInt32
+  inputCount : Nat
+  defaultCount : Nat
+  ir : Pgx.RoutineIR
+  deriving Inhabited
+
 private structure CatalogSnapshot where
   serverMajor : Nat
   schemas : Array Pgx.SchemaIR
   types : Array CatalogType
   enums : Array Pgx.EnumIR
+  arrays : Array Pgx.ArrayIR
   domains : Array Pgx.DomainIR
+  composites : Array Pgx.CompositeIR
+  ranges : Array Pgx.RangeIR
+  multiranges : Array Pgx.MultirangeIR
   relations : Array CatalogRelation
+  views : Array Pgx.ViewIR
+  routines : Array Pgx.RoutineIR
   constraints : Array Pgx.ConstraintIR
   indexes : Array Pgx.IndexIR
   extensions : Array (String × String)
@@ -500,7 +533,8 @@ private def typeCatalogSql : String :=
   ", bns.nspname, bt.typname, CASE WHEN bt.oid IS NULL THEN NULL ELSE " ++
   kindSql "bt" ++ " END, " ++
   "CASE WHEN t.typtype = 'd' AND t.typtypmod <> -1 THEN t.typtypmod::text ELSE NULL END, " ++
-  "t.typnotnull::text, t.typdefault " ++
+  "t.typnotnull::text, t.typdefault, NULLIF(t.typelem, 0)::text, " ++
+  "t.typdelim::text, NULLIF(t.typrelid, 0)::text " ++
   "FROM pg_catalog.pg_type AS t " ++
   "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = t.typnamespace " ++
   "LEFT JOIN pg_catalog.pg_type AS bt ON bt.oid = NULLIF(t.typbasetype, 0) " ++
@@ -531,7 +565,17 @@ private def parseCatalogType (row : Array (Option ByteArray)) : Except Error Cat
     | _, _, _ => throw (.catalog s!"{context}: incomplete base type identity")
   let notNull ← parseBool context (← cell context row 8)
   let defaultExpr ← cell? context row 9
-  pure { oid, key := { schema, name, kind }, base, notNull, defaultExpr }
+  let elementOid ← match ← cell? context row 10 with
+    | none => pure none
+    | some value => some <$> parseUInt32 context value
+  let delimiter ← cell context row 11
+  let relationOid ← match ← cell? context row 12 with
+    | none => pure none
+    | some value => some <$> parseUInt32 context value
+  pure {
+    oid, key := { schema, name, kind }, base, elementOid, delimiter,
+    relationOid, notNull, defaultExpr
+  }
 
 private def loadTypes (conn : Pg.Connection) :
     Async (Except Error (Array CatalogType)) := do
@@ -547,6 +591,294 @@ private def loadTypes (conn : Pg.Connection) :
           return .error (.catalog s!"duplicate pg_type OID {value.oid}")
         values := values.push value
     pure (.ok values)
+
+private def loadArrays (schemas : Array String) (types : Array CatalogType) :
+    Except Error (Array Pgx.ArrayIR) := do
+  let mut arrays : Array Pgx.ArrayIR := #[]
+  for ty in types do
+    if ty.key.kind == .array then
+      let some elementOid := ty.elementOid
+        | throw (.catalog s!"array type {ty.key} has no element type")
+      let element ← typeRefByOid types s!"array {ty.key}" elementOid
+      if schemas.contains ty.key.schema || (Pgx.builtinTypeMapping? element.key).isSome then
+        arrays := arrays.push { key := ty.key, element, delimiter := ty.delimiter }
+  pure arrays
+
+private def compositeCatalogSql : String :=
+  "SELECT t.oid::text, a.attname, a.attnum::text, a.atttypid::text, " ++
+  "CASE WHEN a.atttypmod = -1 THEN NULL ELSE a.atttypmod::text END, " ++
+  "cns.nspname, coll.collname " ++
+  "FROM pg_catalog.pg_type AS t " ++
+  "JOIN pg_catalog.pg_class AS c ON c.oid = t.typrelid AND c.reltype = t.oid " ++
+  "JOIN pg_catalog.pg_attribute AS a ON a.attrelid = c.oid " ++
+  "LEFT JOIN pg_catalog.pg_collation AS coll ON coll.oid = NULLIF(a.attcollation, 0) " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS cns ON cns.oid = coll.collnamespace " ++
+  "WHERE t.typtype = 'c' AND t.typisdefined " ++
+  "AND a.attnum > 0 AND NOT a.attisdropped " ++
+  "ORDER BY t.oid, a.attnum"
+
+private def loadComposites (conn : Pg.Connection) (schemas : Array String)
+    (types : Array CatalogType) : Async (Except Error (Array Pgx.CompositeIR)) := do
+  let mut composites : Array Pgx.CompositeIR := #[]
+  for ty in types do
+    if ty.key.kind == .composite && schemas.contains ty.key.schema then
+      let some _ := ty.relationOid
+        | return .error (.catalog s!"composite type {ty.key} has no backing relation")
+      composites := composites.push { key := ty.key, fields := #[] }
+  match ← queryOne conn "read composite pg_attribute" compositeCatalogSql with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    for row in rows.rows do
+      let parsed : Except Error (UInt32 × Pgx.CompositeFieldIR) := do
+        let typeOid ← parseUInt32 "read composite pg_attribute"
+          (← cell "read composite pg_attribute" row 0)
+        let name ← cell "read composite pg_attribute" row 1
+        let ordinal ← parseNat "read composite pg_attribute"
+          (← cell "read composite pg_attribute" row 2)
+        let fieldTypeOid ← parseUInt32 "read composite pg_attribute"
+          (← cell "read composite pg_attribute" row 3)
+        let typmod ← match ← cell? "read composite pg_attribute" row 4 with
+          | none => pure none
+          | some value => some <$> parseInt32 "read composite pg_attribute" value
+        let collationSchema ← cell? "read composite pg_attribute" row 5
+        let collationName ← cell? "read composite pg_attribute" row 6
+        let collation ← match collationSchema, collationName with
+          | none, none => pure none
+          | some schema, some name => pure (some { schema, name })
+          | _, _ => throw (.catalog
+              "read composite pg_attribute: incomplete collation identity")
+        pure (typeOid, {
+          name, ordinal
+          ty := ← typeRefByOid types "read composite pg_attribute" fieldTypeOid typmod
+          collation
+        })
+      match parsed with
+      | .error error => return .error error
+      | .ok (typeOid, field) =>
+        let some ty := typeByOid? types typeOid
+          | return .error (.catalog s!"composite field refers to missing type OID {typeOid}")
+        if schemas.contains ty.key.schema then
+          let some index := composites.findIdx? (fun value => value.key == ty.key)
+            | return .error (.catalog s!"composite field refers to non-composite {ty.key}")
+          let value := composites[index]!
+          composites := composites.set! index { value with fields := value.fields.push field }
+    pure (.ok composites)
+
+private def routineCatalogSql : String :=
+  "SELECT p.oid::text, ns.nspname, p.proname, p.prokind::text, " ++
+  "p.proretset::text, p.prorettype::text, p.pronargs::text, " ++
+  "p.pronargdefaults::text, p.proisstrict::text, p.provolatile::text, " ++
+  "p.proparallel::text, p.prosecdef::text " ++
+  "FROM pg_catalog.pg_proc AS p " ++
+  "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = p.pronamespace " ++
+  "ORDER BY p.oid"
+
+private def routineArgCatalogSql : String :=
+  "SELECT p.oid::text, args.ordinality::text, " ++
+  "NULLIF(p.proargnames[args.ordinality], ''), " ++
+  "COALESCE(p.proargmodes[args.ordinality], 'i')::text, args.type_oid::text " ++
+  "FROM pg_catalog.pg_proc AS p " ++
+  "CROSS JOIN LATERAL pg_catalog.unnest(" ++
+  "COALESCE(p.proallargtypes, p.proargtypes::oid[])) " ++
+  "WITH ORDINALITY AS args(type_oid, ordinality) " ++
+  "ORDER BY p.oid, args.ordinality"
+
+private def isRoutineOutput : Pgx.RoutineArgMode → Bool
+  | .output | .inputOutput | .table => true
+  | .input | .variadic => false
+
+private def loadRoutines (conn : Pg.Connection) (_schemas : Array String)
+    (types : Array CatalogType) : Async (Except Error (Array CatalogRoutine)) := do
+  let mut routines : Array CatalogRoutine := #[]
+  match ← queryOne conn "read pg_proc" routineCatalogSql with
+  | .error error => return .error error
+  | .ok rows =>
+    for row in rows.rows do
+      let parsed : Except Error CatalogRoutine := do
+        let oid ← parseUInt32 "read pg_proc" (← cell "read pg_proc" row 0)
+        let schema ← cell "read pg_proc" row 1
+        let name ← cell "read pg_proc" row 2
+        let kind ← parseRoutineKind "read pg_proc" (← cell "read pg_proc" row 3)
+        let returnsSet ← parseBool "read pg_proc" (← cell "read pg_proc" row 4)
+        let returnTypeOid ← parseUInt32 "read pg_proc" (← cell "read pg_proc" row 5)
+        let inputCount ← parseNat "read pg_proc" (← cell "read pg_proc" row 6)
+        let defaultCount ← parseNat "read pg_proc" (← cell "read pg_proc" row 7)
+        let strict ← parseBool "read pg_proc" (← cell "read pg_proc" row 8)
+        let volatility ← cell "read pg_proc" row 9
+        let parallel ← cell "read pg_proc" row 10
+        let securityDefiner ← parseBool "read pg_proc" (← cell "read pg_proc" row 11)
+        pure {
+          oid, returnTypeOid, inputCount, defaultCount
+          ir := {
+            key := { schema, name }
+            kind, args := #[], returnsSet
+            strict, volatility, parallel, securityDefiner
+          }
+        }
+      match parsed with
+      | .error error => return .error error
+      | .ok value => routines := routines.push value
+  match ← queryOne conn "read pg_proc arguments" routineArgCatalogSql with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    for row in rows.rows do
+      let parsed : Except Error (UInt32 × Nat × Pgx.RoutineArgIR) := do
+        let oid ← parseUInt32 "read pg_proc arguments"
+          (← cell "read pg_proc arguments" row 0)
+        let ordinal ← parseNat "read pg_proc arguments"
+          (← cell "read pg_proc arguments" row 1)
+        let name ← cell? "read pg_proc arguments" row 2
+        let mode ← parseRoutineArgMode "read pg_proc arguments"
+          (← cell "read pg_proc arguments" row 3)
+        let typeOid ← parseUInt32 "read pg_proc arguments"
+          (← cell "read pg_proc arguments" row 4)
+        pure (oid, ordinal, {
+          name, mode
+          ty := ← typeRefByOid types "read pg_proc arguments" typeOid
+        })
+      match parsed with
+      | .error error => return .error error
+      | .ok (oid, ordinal, arg) =>
+        match routines.findIdx? (fun value => value.oid == oid) with
+        | none => pure ()
+        | some index =>
+          let value := routines[index]!
+          unless ordinal == value.ir.args.size + 1 do
+            return .error (.catalog s!"routine {value.ir.key.schema}.{value.ir.key.name} \
+              has non-dense argument ordinal {ordinal}")
+          routines := routines.set! index {
+            value with ir := { value.ir with args := value.ir.args.push arg }
+          }
+    for index in [0:routines.size] do
+      let value := routines[index]!
+      let inputArgs := value.ir.args.filter (fun arg => arg.mode.isInput)
+      unless inputArgs.size == value.inputCount do
+        return .error (.catalog s!"routine {value.ir.key.schema}.{value.ir.key.name} \
+          reports {value.inputCount} input arguments but exposes {inputArgs.size}")
+      unless value.defaultCount ≤ value.inputCount do
+        return .error (.catalog s!"routine {value.ir.key.schema}.{value.ir.key.name} \
+          has more defaults than input arguments")
+      let firstDefault := value.inputCount - value.defaultCount
+      let mut inputPosition := 0
+      let mut outputPosition := 0
+      let mut args : Array Pgx.RoutineArgIR := #[]
+      let mut results : Array Pgx.RoutineResultColumnIR := #[]
+      for arg in value.ir.args do
+        let hasDefault := arg.mode.isInput && firstDefault < inputPosition + 1
+        if arg.mode.isInput then inputPosition := inputPosition + 1
+        let arg := { arg with hasDefault }
+        args := args.push arg
+        if isRoutineOutput arg.mode then
+          outputPosition := outputPosition + 1
+          results := results.push {
+            name := arg.name.getD s!"column{outputPosition}"
+            ordinal := outputPosition
+            ty := arg.ty
+          }
+      let returnTypeResult : Except Error (Option Pgx.TypeRef) :=
+        if value.ir.kind == .procedure then pure none else
+          some <$> typeRefByOid types
+            s!"routine {value.ir.key.schema}.{value.ir.key.name}" value.returnTypeOid
+      let returnType ← match returnTypeResult with
+        | .ok result => pure result
+        | .error error => return .error error
+      let dynamicRecord := match returnType with
+        | some ref => ref.key.kind == .pseudo && ref.key.name == "record" && results.isEmpty
+        | none => false
+      let ir := {
+        value.ir with
+          key := { value.ir.key with inputTypes := inputArgs.map (fun arg => arg.ty) }
+          args
+          returnType
+          resultColumns := results
+          dynamicRecord
+      }
+      routines := routines.set! index { value with ir }
+    pure (.ok routines)
+
+private def routineKeyByOid? (routines : Array CatalogRoutine) (oid : UInt32) :
+    Option Pgx.RoutineKey :=
+  routines.find? (fun value => value.oid == oid) |>.map (fun value => value.ir.key)
+
+private def rangeCatalogSql : String :=
+  "SELECT r.rngtypid::text, r.rngsubtype::text, r.rngmultitypid::text, " ++
+  "cns.nspname, coll.collname, opns.nspname, opc.opcname, " ++
+  "NULLIF(r.rngcanonical, 0)::text, NULLIF(r.rngsubdiff, 0)::text " ++
+  "FROM pg_catalog.pg_range AS r " ++
+  "LEFT JOIN pg_catalog.pg_collation AS coll ON coll.oid = NULLIF(r.rngcollation, 0) " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS cns ON cns.oid = coll.collnamespace " ++
+  "JOIN pg_catalog.pg_opclass AS opc ON opc.oid = r.rngsubopc " ++
+  "JOIN pg_catalog.pg_namespace AS opns ON opns.oid = opc.opcnamespace " ++
+  "ORDER BY r.rngtypid"
+
+private def loadRanges (conn : Pg.Connection) (schemas : Array String)
+    (types : Array CatalogType) (routines : Array CatalogRoutine) :
+    Async (Except Error (Array Pgx.RangeIR × Array Pgx.MultirangeIR)) := do
+  match ← queryOne conn "read pg_range" rangeCatalogSql with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    let mut ranges : Array Pgx.RangeIR := #[]
+    let mut multiranges : Array Pgx.MultirangeIR := #[]
+    for row in rows.rows do
+      let parsed : Except Error (CatalogType × CatalogType × CatalogType ×
+          Option Pgx.CollationKey × Pgx.QualifiedName × Option UInt32 × Option UInt32) := do
+        let rangeOid ← parseUInt32 "read pg_range" (← cell "read pg_range" row 0)
+        let subtypeOid ← parseUInt32 "read pg_range" (← cell "read pg_range" row 1)
+        let multirangeOid ← parseUInt32 "read pg_range" (← cell "read pg_range" row 2)
+        let some rangeType := typeByOid? types rangeOid
+          | throw (.catalog s!"pg_range refers to missing range OID {rangeOid}")
+        let some subtype := typeByOid? types subtypeOid
+          | throw (.catalog s!"pg_range refers to missing subtype OID {subtypeOid}")
+        let some multirange := typeByOid? types multirangeOid
+          | throw (.catalog s!"pg_range refers to missing multirange OID {multirangeOid}")
+        let collationSchema ← cell? "read pg_range" row 3
+        let collationName ← cell? "read pg_range" row 4
+        let collation ← match collationSchema, collationName with
+          | none, none => pure none
+          | some schema, some name => pure (some { schema, name })
+          | _, _ => throw (.catalog "read pg_range: incomplete collation identity")
+        let opclass := {
+          schema := ← cell "read pg_range" row 5
+          name := ← cell "read pg_range" row 6
+        }
+        let canonical ← match ← cell? "read pg_range" row 7 with
+          | none => pure none
+          | some value => some <$> parseUInt32 "read pg_range" value
+        let subtypeDiff ← match ← cell? "read pg_range" row 8 with
+          | none => pure none
+          | some value => some <$> parseUInt32 "read pg_range" value
+        pure (rangeType, subtype, multirange, collation, opclass, canonical, subtypeDiff)
+      match parsed with
+      | .error error => return .error error
+      | .ok (rangeType, subtype, multirange, collation, opclass,
+          canonicalOid, subtypeDiffOid) =>
+        if schemas.contains rangeType.key.schema ||
+            (Pgx.builtinTypeMapping? subtype.key).isSome then
+          let canonical ← match canonicalOid with
+            | none => pure none
+            | some oid =>
+              let some key := routineKeyByOid? routines oid
+                | return .error (.catalog s!"range {rangeType.key} canonical routine OID \
+                    {oid} is not visible in the configured schemas")
+              pure (some key)
+          let subtypeDiff ← match subtypeDiffOid with
+            | none => pure none
+            | some oid =>
+              let some key := routineKeyByOid? routines oid
+                | return .error (.catalog s!"range {rangeType.key} subtype-diff routine OID \
+                    {oid} is not visible in the configured schemas")
+              pure (some key)
+          ranges := ranges.push {
+            key := rangeType.key
+            subtype := { key := subtype.key }
+            multirange := multirange.key
+            collation
+            subtypeOpclass := opclass
+            canonical
+            subtypeDiff
+          }
+          multiranges := multiranges.push { key := multirange.key, range := rangeType.key }
+    pure (.ok (ranges, multiranges))
 
 private def loadEnums (conn : Pg.Connection) (schemas : Array String)
     (types : Array CatalogType) : Async (Except Error (Array Pgx.EnumIR)) := do
@@ -760,6 +1092,65 @@ private def loadRelations (conn : Pg.Connection) (schemas : Array String)
             }
       pure (.ok relations)
 
+private def viewCatalogSql : String :=
+  "SELECT c.oid::text, ns.nspname, c.relname, c.relkind::text, " ++
+  "pg_catalog.pg_get_viewdef(c.oid, true), " ++
+  "COALESCE((SELECT option_value FROM pg_catalog.pg_options_to_table(c.reloptions) " ++
+  "WHERE option_name = 'check_option'), 'none'), " ++
+  "COALESCE((SELECT option_value FROM pg_catalog.pg_options_to_table(c.reloptions) " ++
+  "WHERE option_name = 'security_barrier'), 'false'), " ++
+  "COALESCE((SELECT option_value FROM pg_catalog.pg_options_to_table(c.reloptions) " ++
+  "WHERE option_name = 'security_invoker'), 'false') " ++
+  "FROM pg_catalog.pg_class AS c " ++
+  "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = c.relnamespace " ++
+  "WHERE c.relkind IN ('v', 'm') ORDER BY ns.nspname, c.relname"
+
+private def parseViewCheckOption (context : String) : String →
+    Except Error Pgx.ViewCheckOption
+  | "none" => pure .none
+  | "local" => pure .local
+  | "cascaded" => pure .cascaded
+  | value => throw (.catalog s!"{context}: unknown view check option {value}")
+
+private def loadViews (conn : Pg.Connection) (schemas : Array String)
+    (relations : Array CatalogRelation) : Async (Except Error (Array Pgx.ViewIR)) := do
+  match ← queryOne conn "read view metadata" viewCatalogSql with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    let mut views : Array Pgx.ViewIR := #[]
+    for row in rows.rows do
+      let parsed : Except Error (String × String × String × Pgx.ViewIR) := do
+        let _ ← parseUInt32 "read view metadata" (← cell "read view metadata" row 0)
+        let schema ← cell "read view metadata" row 1
+        let name ← cell "read view metadata" row 2
+        let kind ← cell "read view metadata" row 3
+        let definition ← cell "read view metadata" row 4
+        let rawCheckOption ← cell "read view metadata" row 5
+        let rawBarrier ← cell "read view metadata" row 6
+        let rawInvoker ← cell "read view metadata" row 7
+        let materialized := kind == "m"
+        let checkOption ← if materialized then pure .none else
+          parseViewCheckOption "read view metadata" rawCheckOption
+        let securityBarrier ← if materialized then pure false else
+          parseBool "read view metadata" rawBarrier
+        let securityInvoker ← if materialized then pure false else
+          parseBool "read view metadata" rawInvoker
+        pure (schema, name, kind, {
+          relation := { schema, name }
+          definition
+          checkOption
+          securityBarrier
+          securityInvoker
+        })
+      match parsed with
+      | .error error => return .error error
+      | .ok (schema, name, _, view) =>
+        if schemas.contains schema then
+          unless relations.any (fun value => value.ir.key == ({ schema, name } : Pgx.RelationKey)) do
+            return .error (.catalog s!"view metadata refers to missing relation {schema}.{name}")
+          views := views.push view
+    pure (.ok views)
+
 private def loadConstraints (conn : Pg.Connection)
     (adapter : Adapter)
     (relations : Array CatalogRelation)
@@ -954,16 +1345,49 @@ private partial def ensureTypeSupported (config : Config) (snapshot : CatalogSna
   if snapshot.enums.any (fun value => value.key == key) then
     return
   if seen.contains key then
-    throw (.catalog s!"{context}: cyclic domain base chain at {key}")
+    throw (.catalog s!"{context}: cyclic generated type dependency at {key}")
   match snapshot.domains.find? (fun value => value.key == key) with
   | some domain =>
     ensureTypeSupported config snapshot context domain.base.key (seen.push key)
-  | none => throw (.unsupportedType context key)
+  | none =>
+    match snapshot.arrays.find? (fun value => value.key == key) with
+    | some array =>
+      unless array.delimiter == "," do
+        throw (.unsupportedType
+          s!"{context}: array delimiter {repr array.delimiter} is unsupported" key)
+      ensureTypeSupported config snapshot context array.element.key (seen.push key)
+    | none =>
+      match snapshot.composites.find? (fun value => value.key == key) with
+      | some composite =>
+        for field in composite.fields do
+          ensureTypeSupported config snapshot
+            s!"{context}, composite field {composite.key}.{field.name}"
+            field.ty.key (seen.push key)
+      | none =>
+        match snapshot.ranges.find? (fun value => value.key == key) with
+        | some range =>
+          ensureTypeSupported config snapshot context range.subtype.key (seen.push key)
+        | none =>
+          match snapshot.multiranges.find? (fun value => value.key == key) with
+          | some multirange =>
+            ensureTypeSupported config snapshot context multirange.range (seen.push key)
+          | none => throw (.unsupportedType context key)
 
 private def validateCatalogTypes (config : Config) (snapshot : CatalogSnapshot) :
     Except Error Unit := do
   for domain in snapshot.domains do
     ensureTypeSupported config snapshot s!"domain {domain.key}" domain.base.key
+  for array in snapshot.arrays do
+    if config.schemas.contains array.key.schema then
+      ensureTypeSupported config snapshot s!"array {array.key}" array.key
+  for composite in snapshot.composites do
+    ensureTypeSupported config snapshot s!"composite {composite.key}" composite.key
+  for range in snapshot.ranges do
+    if config.schemas.contains range.key.schema then
+      ensureTypeSupported config snapshot s!"range {range.key}" range.key
+  for multirange in snapshot.multiranges do
+    if config.schemas.contains multirange.key.schema then
+      ensureTypeSupported config snapshot s!"multirange {multirange.key}" multirange.key
   for relation in snapshot.relations do
     for column in relation.ir.columns do
       ensureTypeSupported config snapshot
@@ -1253,13 +1677,29 @@ private def loadSnapshot (conn : Pg.Connection) (config : Config) :
   let types ← match ← loadTypes conn with
     | .error error => return .error error
     | .ok value => pure value
+  let arrays ← match loadArrays config.schemas types with
+    | .error error => return .error error
+    | .ok value => pure value
   let enums ← match ← loadEnums conn config.schemas types with
     | .error error => return .error error
     | .ok value => pure value
   let domains ← match ← loadDomains conn config.schemas types enums with
     | .error error => return .error error
     | .ok value => pure value
+  let composites ← match ← loadComposites conn config.schemas types with
+    | .error error => return .error error
+    | .ok value => pure value
+  let catalogRoutines ← match ← loadRoutines conn config.schemas types with
+    | .error error => return .error error
+    | .ok value => pure value
+  let (ranges, multiranges) ← match
+      ← loadRanges conn config.schemas types catalogRoutines with
+    | .error error => return .error error
+    | .ok value => pure value
   let relations ← match ← loadRelations conn config.schemas types with
+    | .error error => return .error error
+    | .ok value => pure value
+  let views ← match ← loadViews conn config.schemas relations with
     | .error error => return .error error
     | .ok value => pure value
   let constraints ← match ← loadConstraints conn adapter relations enums domains with
@@ -1272,8 +1712,11 @@ private def loadSnapshot (conn : Pg.Connection) (config : Config) :
     | .error error => return .error error
     | .ok value => pure value
   pure (.ok {
-    serverMajor, schemas, types, enums, domains, relations, constraints,
-    indexes, extensions
+    serverMajor, schemas, types, enums, arrays, domains, composites, ranges,
+    multiranges, relations, views
+    routines := catalogRoutines.filter (fun value =>
+      config.schemas.contains value.ir.key.schema) |>.map (fun value => value.ir)
+    constraints, indexes, extensions
   })
 
 /-- Probe a migrated live server and return a fully symbolic, normalized
@@ -1304,8 +1747,14 @@ def probeDatabase (conn : Pg.Connection) (config : Config) :
     session := config.session
     schemas := snapshot.schemas
     enums := snapshot.enums
+    arrays := snapshot.arrays
     domains := snapshot.domains
+    composites := snapshot.composites
+    ranges := snapshot.ranges
+    multiranges := snapshot.multiranges
     relations := snapshot.relations.map (·.ir)
+    views := snapshot.views
+    routines := snapshot.routines
     constraints := snapshot.constraints
     indexes := snapshot.indexes
     queries

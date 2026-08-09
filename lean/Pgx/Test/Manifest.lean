@@ -24,6 +24,22 @@ private def status : TypeRef := {
   key := { schema := "app", name := "status", kind := .enum }
 }
 
+private def statusArrayKey : TypeKey := {
+  schema := "app", name := "_status", kind := .array
+}
+
+private def profileKey : TypeKey := {
+  schema := "app", name := "profile", kind := .composite
+}
+
+private def int4RangeKey : TypeKey := {
+  schema := "pg_catalog", name := "int4range", kind := .range
+}
+
+private def int4MultirangeKey : TypeKey := {
+  schema := "pg_catalog", name := "int4multirange", kind := .multirange
+}
+
 private def relationKey : RelationKey := { schema := "app", name := "users" }
 
 private def positiveId : TypeRef := {
@@ -69,6 +85,7 @@ private def sampleDatabase : DatabaseIR := {
     key := status.key
     labels := #["active", "disabled"]
   }]
+  arrays := #[{ key := statusArrayKey, element := status }]
   domains := #[{
     key := { schema := "app", name := "positive_id", kind := .domain }
     base := int4
@@ -81,6 +98,25 @@ private def sampleDatabase : DatabaseIR := {
       expression := valuePositive
     }]
   }]
+  composites := #[{
+    key := profileKey
+    fields := #[
+      { name := "name", ordinal := 1, ty := { int4 with key := {
+          schema := "pg_catalog", name := "text", kind := .base } } },
+      { name := "status", ordinal := 2, ty := status, collation := some collation }
+    ]
+  }]
+  ranges := #[{
+    key := int4RangeKey
+    subtype := int4
+    multirange := int4MultirangeKey
+    subtypeOpclass := { schema := "pg_catalog", name := "int4_ops" }
+    canonical := some {
+      schema := "pg_catalog", name := "int4range_canonical"
+      inputTypes := #[{ key := int4RangeKey }]
+    }
+  }]
+  multiranges := #[{ key := int4MultirangeKey, range := int4RangeKey }]
   relations := #[{
     key := relationKey
     kind := .table
@@ -93,6 +129,26 @@ private def sampleDatabase : DatabaseIR := {
       defaultExpr := some "nextval('users_id_seq')"
       collation := some collation
     }]
+  }]
+  views := #[{
+    relation := { schema := "app", name := "active_users" }
+    definition := " SELECT users.id FROM app.users WHERE users.id > 0;"
+    checkOption := .local
+    securityBarrier := true
+  }]
+  routines := #[{
+    key := { schema := "app", name := "list_users", inputTypes := #[int4] }
+    kind := .function
+    args := #[
+      { name := some "minimum_id", mode := .input, ty := int4, hasDefault := true },
+      { name := some "id", mode := .table, ty := int4 }
+    ]
+    returnsSet := true
+    returnType := some { key := { schema := "pg_catalog", name := "record", kind := .pseudo } }
+    resultColumns := #[{ name := "id", ordinal := 1, ty := int4 }]
+    strict := true
+    volatility := "s"
+    parallel := "s"
   }]
   constraints := #[{
     relation := relationKey
@@ -145,6 +201,12 @@ private def sampleDatabase : DatabaseIR := {
     codec := "vectorCodec"
     importModule := some "Ext.Vector"
   }]
+  extensionCodecPackages := #[{
+    extension := "citext"
+    version := "1.6"
+    importModule := "Ext.Vector"
+    types := #[{ schema := "ext", name := "vector", kind := .base }]
+  }]
 }
 
 private def validManifest : String :=
@@ -177,6 +239,10 @@ def main : IO UInt32 := do
     .multirange, .composite, .pseudo])
   assert! roundTrips (#[(.table : RelationKind), .partitionedTable, .view,
     .materializedView, .foreignTable])
+  assert! roundTrips (#[(.none : ViewCheckOption), .local, .cascaded])
+  assert! roundTrips (#[(.function : RoutineKind), .procedure, .aggregate, .window])
+  assert! roundTrips (#[(.input : RoutineArgMode), .output, .inputOutput,
+    .variadic, .table])
   assert! roundTrips (#[(.check : ConstraintKind), .notNull, .primaryKey,
     .unique, .foreignKey, .exclusion])
   assert! roundTrips (#[(.execute : Cardinality), .exactlyOne, .zeroOrOne, .many])
@@ -189,12 +255,21 @@ def main : IO UInt32 := do
   assert! roundTrips collation
   assert! roundTrips sampleDatabase.schemas[0]!
   assert! roundTrips sampleDatabase.enums[0]!
+  assert! roundTrips sampleDatabase.arrays[0]!
   assert! roundTrips int4Scalar
   assert! roundTrips idPositive
   assert! roundTrips sampleDatabase.domains[0]!.localConstraints[0]!
   assert! roundTrips sampleDatabase.domains[0]!
+  assert! roundTrips sampleDatabase.composites[0]!.fields[0]!
+  assert! roundTrips sampleDatabase.composites[0]!
+  assert! roundTrips sampleDatabase.ranges[0]!
+  assert! roundTrips sampleDatabase.multiranges[0]!
   assert! roundTrips sampleDatabase.relations[0]!.columns[0]!
   assert! roundTrips sampleDatabase.relations[0]!
+  assert! roundTrips sampleDatabase.views[0]!
+  assert! roundTrips sampleDatabase.routines[0]!.args[0]!
+  assert! roundTrips sampleDatabase.routines[0]!.resultColumns[0]!
+  assert! roundTrips sampleDatabase.routines[0]!
   assert! roundTrips sampleDatabase.constraints[0]!
   assert! roundTrips sampleDatabase.constraints[1]!
   assert! roundTrips sampleDatabase.indexes[0]!
@@ -204,6 +279,7 @@ def main : IO UInt32 := do
   assert! roundTrips sampleDatabase.queries[0]!
   assert! roundTrips sampleDatabase.session
   assert! roundTrips sampleDatabase.typeOverrides[0]!
+  assert! roundTrips sampleDatabase.extensionCodecPackages[0]!
   let legacyOverrideJson ← match Json.parse
       ("{\"key\":{\"schema\":\"ext\",\"name\":\"legacy\",\"kind\":\"base\"}," ++
         "\"leanType\":\"Legacy\",\"codec\":\"legacyCodec\"}") with
@@ -223,6 +299,8 @@ def main : IO UInt32 := do
   assert! snapshot.contains "\"nullWidened\""
   assert! snapshot.contains "\"rowPreservedRelations\""
   assert! snapshot.contains "\"localConstraints\""
+  assert! snapshot.contains "\"composites\""
+  assert! snapshot.contains "\"routines\""
   assert! match DatabaseIR.parseSnapshot snapshot with
     | .ok decoded => decoded == sampleDatabase.normalize
     | .error _ => false
@@ -240,7 +318,7 @@ def main : IO UInt32 := do
   }
   assert! reversed.renderSnapshot == sampleDatabase.renderSnapshot
   assert! isError (DatabaseIR.parseSnapshot
-    (snapshot.replace "\"formatVersion\": 2" "\"formatVersion\": 99"))
+    (snapshot.replace "\"formatVersion\": 3" "\"formatVersion\": 99"))
 
   let manifest ← match Pgx.Codegen.Manifest.parse validManifest with
     | .ok manifest => pure manifest

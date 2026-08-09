@@ -170,6 +170,115 @@ instance : FromJson EnumIR where
       labels := ← requiredField json "labels"
     }
 
+instance : ToJson ArrayIR where
+  toJson value := Json.mkObj [
+    ("key", toJson value.key),
+    ("element", toJson value.element),
+    ("delimiter", toJson value.delimiter)
+  ]
+
+instance : FromJson ArrayIR where
+  fromJson? json := do
+    pure {
+      key := ← requiredField json "key"
+      element := ← requiredField json "element"
+      delimiter := ← optionalField json "delimiter" ","
+    }
+
+instance : ToJson CompositeFieldIR where
+  toJson value := Json.mkObj [
+    ("name", toJson value.name),
+    ("ordinal", toJson value.ordinal),
+    ("type", toJson value.ty),
+    ("collation", toJson value.collation)
+  ]
+
+instance : FromJson CompositeFieldIR where
+  fromJson? json := do
+    pure {
+      name := ← requiredField json "name"
+      ordinal := ← requiredField json "ordinal"
+      ty := ← requiredField json "type"
+      collation := ← optionalField json "collation" none
+    }
+
+instance : ToJson CompositeIR where
+  toJson value := Json.mkObj [
+    ("key", toJson value.key),
+    ("fields", toJson value.fields)
+  ]
+
+instance : FromJson CompositeIR where
+  fromJson? json := do
+    pure {
+      key := ← requiredField json "key"
+      fields := ← requiredField json "fields"
+    }
+
+instance : ToJson RoutineKey where
+  toJson value := Json.mkObj [
+    ("schema", toJson value.schema),
+    ("name", toJson value.name),
+    ("inputTypes", toJson value.inputTypes)
+  ]
+
+instance : FromJson RoutineKey where
+  fromJson? json := do
+    pure {
+      schema := ← requiredField json "schema"
+      name := ← requiredField json "name"
+      inputTypes := ← optionalField json "inputTypes" #[]
+    }
+
+instance : ToJson QualifiedName where
+  toJson value := Json.mkObj [
+    ("schema", toJson value.schema),
+    ("name", toJson value.name)
+  ]
+
+instance : FromJson QualifiedName where
+  fromJson? json := do
+    pure {
+      schema := ← requiredField json "schema"
+      name := ← requiredField json "name"
+    }
+
+instance : ToJson RangeIR where
+  toJson value := Json.mkObj [
+    ("key", toJson value.key),
+    ("subtype", toJson value.subtype),
+    ("multirange", toJson value.multirange),
+    ("collation", toJson value.collation),
+    ("subtypeOpclass", toJson value.subtypeOpclass),
+    ("canonical", toJson value.canonical),
+    ("subtypeDiff", toJson value.subtypeDiff)
+  ]
+
+instance : FromJson RangeIR where
+  fromJson? json := do
+    pure {
+      key := ← requiredField json "key"
+      subtype := ← requiredField json "subtype"
+      multirange := ← requiredField json "multirange"
+      collation := ← optionalField json "collation" none
+      subtypeOpclass := ← requiredField json "subtypeOpclass"
+      canonical := ← optionalField json "canonical" none
+      subtypeDiff := ← optionalField json "subtypeDiff" none
+    }
+
+instance : ToJson MultirangeIR where
+  toJson value := Json.mkObj [
+    ("key", toJson value.key),
+    ("range", toJson value.range)
+  ]
+
+instance : FromJson MultirangeIR where
+  fromJson? json := do
+    pure {
+      key := ← requiredField json "key"
+      range := ← requiredField json "range"
+    }
+
 instance : ToJson Constraint.ScalarKind where
   toJson value := match value with
     | .boolean => Json.mkObj [("tag", "boolean")]
@@ -515,6 +624,123 @@ instance : FromJson RelationIR where
       columns := ← requiredField json "columns"
     }
 
+instance : ToJson ViewCheckOption where
+  toJson value := Json.str value.tag
+
+instance : FromJson ViewCheckOption where
+  fromJson? := tagFromJson "view check option" fun
+    | "none" => some .none
+    | "local" => some .local
+    | "cascaded" => some .cascaded
+    | _ => none
+
+instance : ToJson ViewIR where
+  toJson value := Json.mkObj [
+    ("relation", toJson value.relation),
+    ("definition", toJson value.definition),
+    ("checkOption", toJson value.checkOption),
+    ("securityBarrier", toJson value.securityBarrier),
+    ("securityInvoker", toJson value.securityInvoker)
+  ]
+
+instance : FromJson ViewIR where
+  fromJson? json := do
+    pure {
+      relation := ← requiredField json "relation"
+      definition := ← requiredField json "definition"
+      checkOption := ← optionalField json "checkOption" .none
+      securityBarrier := ← optionalField json "securityBarrier" false
+      securityInvoker := ← optionalField json "securityInvoker" false
+    }
+
+instance : ToJson RoutineKind where
+  toJson value := Json.str value.tag
+
+instance : FromJson RoutineKind where
+  fromJson? := tagFromJson "routine kind" fun
+    | "function" => some .function
+    | "procedure" => some .procedure
+    | "aggregate" => some .aggregate
+    | "window" => some .window
+    | _ => none
+
+instance : ToJson RoutineArgMode where
+  toJson value := Json.str value.tag
+
+instance : FromJson RoutineArgMode where
+  fromJson? := tagFromJson "routine argument mode" fun
+    | "in" => some .input
+    | "out" => some .output
+    | "inout" => some .inputOutput
+    | "variadic" => some .variadic
+    | "table" => some .table
+    | _ => none
+
+instance : ToJson RoutineArgIR where
+  toJson value := Json.mkObj [
+    ("name", toJson value.name),
+    ("mode", toJson value.mode),
+    ("type", toJson value.ty),
+    ("hasDefault", toJson value.hasDefault)
+  ]
+
+instance : FromJson RoutineArgIR where
+  fromJson? json := do
+    pure {
+      name := ← optionalField json "name" none
+      mode := ← requiredField json "mode"
+      ty := ← requiredField json "type"
+      hasDefault := ← optionalField json "hasDefault" false
+    }
+
+instance : ToJson RoutineResultColumnIR where
+  toJson value := Json.mkObj [
+    ("name", toJson value.name),
+    ("ordinal", toJson value.ordinal),
+    ("type", toJson value.ty),
+    ("nullable", toJson value.nullable)
+  ]
+
+instance : FromJson RoutineResultColumnIR where
+  fromJson? json := do
+    pure {
+      name := ← requiredField json "name"
+      ordinal := ← requiredField json "ordinal"
+      ty := ← requiredField json "type"
+      nullable := ← optionalField json "nullable" true
+    }
+
+instance : ToJson RoutineIR where
+  toJson value := Json.mkObj [
+    ("key", toJson value.key),
+    ("kind", toJson value.kind),
+    ("args", toJson value.args),
+    ("returnsSet", toJson value.returnsSet),
+    ("returnType", toJson value.returnType),
+    ("resultColumns", toJson value.resultColumns),
+    ("dynamicRecord", toJson value.dynamicRecord),
+    ("strict", toJson value.strict),
+    ("volatility", toJson value.volatility),
+    ("parallel", toJson value.parallel),
+    ("securityDefiner", toJson value.securityDefiner)
+  ]
+
+instance : FromJson RoutineIR where
+  fromJson? json := do
+    pure {
+      key := ← requiredField json "key"
+      kind := ← requiredField json "kind"
+      args := ← requiredField json "args"
+      returnsSet := ← requiredField json "returnsSet"
+      returnType := ← optionalField json "returnType" none
+      resultColumns := ← optionalField json "resultColumns" #[]
+      dynamicRecord := ← optionalField json "dynamicRecord" false
+      strict := ← optionalField json "strict" false
+      volatility := ← requiredField json "volatility"
+      parallel := ← requiredField json "parallel"
+      securityDefiner := ← optionalField json "securityDefiner" false
+    }
+
 instance : ToJson ConstraintKind where
   toJson value := Json.str value.tag
 
@@ -713,6 +939,23 @@ instance : FromJson TypeOverrideIR where
       importModule := ← optionalField json "importModule" none
     }
 
+instance : ToJson ExtensionCodecPackageIR where
+  toJson value := Json.mkObj [
+    ("extension", toJson value.extension),
+    ("version", toJson value.version),
+    ("importModule", toJson value.importModule),
+    ("types", toJson value.types)
+  ]
+
+instance : FromJson ExtensionCodecPackageIR where
+  fromJson? json := do
+    pure {
+      extension := ← requiredField json "extension"
+      version := ← requiredField json "version"
+      importModule := ← requiredField json "importModule"
+      types := ← requiredField json "types"
+    }
+
 private def extensionToJson (value : String × String) : Json :=
   Json.mkObj [
     ("name", toJson value.1),
@@ -742,13 +985,20 @@ private def databaseToJson (value : DatabaseIR) : Json :=
     ("session", toJson value.session),
     ("schemas", toJson value.schemas),
     ("enums", toJson value.enums),
+    ("arrays", toJson value.arrays),
     ("domains", toJson value.domains),
+    ("composites", toJson value.composites),
+    ("ranges", toJson value.ranges),
+    ("multiranges", toJson value.multiranges),
     ("relations", toJson value.relations),
+    ("views", toJson value.views),
+    ("routines", toJson value.routines),
     ("constraints", toJson value.constraints),
     ("indexes", toJson value.indexes),
     ("queries", toJson value.queries),
     ("requiredExtensions", extensionsToJson value.requiredExtensions),
-    ("typeOverrides", toJson value.typeOverrides)
+    ("typeOverrides", toJson value.typeOverrides),
+    ("extensionCodecPackages", toJson value.extensionCodecPackages)
   ])
 
 instance : ToJson DatabaseIR where
@@ -772,13 +1022,20 @@ instance : FromJson DatabaseIR where
       session := ← requiredField json "session"
       schemas := ← requiredField json "schemas"
       enums := ← requiredField json "enums"
+      arrays := ← optionalField json "arrays" #[]
       domains := ← requiredField json "domains"
+      composites := ← optionalField json "composites" #[]
+      ranges := ← optionalField json "ranges" #[]
+      multiranges := ← optionalField json "multiranges" #[]
       relations := ← requiredField json "relations"
+      views := ← optionalField json "views" #[]
+      routines := ← optionalField json "routines" #[]
       constraints := ← requiredField json "constraints"
       indexes := ← requiredField json "indexes"
       queries := ← requiredField json "queries"
       requiredExtensions
       typeOverrides := ← optionalField json "typeOverrides" #[]
+      extensionCodecPackages := ← optionalField json "extensionCodecPackages" #[]
     }
 
 namespace DatabaseIR
@@ -798,7 +1055,8 @@ def renderSnapshotCompact (database : DatabaseIR) : String :=
 /-- Decode a snapshot JSON value and reject unsupported format versions. -/
 def parseSnapshotJson (json : Json) : Except String DatabaseIR := do
   let database : DatabaseIR ← fromJson? json
-  if database.formatVersion == 1 || database.formatVersion == 2 then
+  if database.formatVersion == 1 || database.formatVersion == 2 ||
+      database.formatVersion == 3 then
     pure database.normalize
   else
     throw s!"unsupported Pgx IR format version {database.formatVersion}"

@@ -12,8 +12,8 @@ structure BuiltinTypeMapping where
 private def builtin (name leanType : String) : BuiltinTypeMapping :=
   { key := { schema := "pg_catalog", name, kind := .base }, leanType }
 
-/-- Milestone-1 scalar surface backed by pg-lean codecs.  Arrays, composites,
-ranges, and pseudo-types remain hard generation errors. -/
+/-- Built-in scalar surface backed by pg-lean codecs.  Symbolic container and
+composite mappings are resolved from their generated IR records. -/
 def builtinTypeMappings : Array BuiltinTypeMapping := #[
   builtin "bool" "Bool",
   builtin "bytea" "ByteArray",
@@ -48,6 +48,18 @@ def DatabaseIR.enum? (db : DatabaseIR) (key : TypeKey) : Option EnumIR :=
 def DatabaseIR.domain? (db : DatabaseIR) (key : TypeKey) : Option DomainIR :=
   db.domains.find? (fun value => value.key == key)
 
+def DatabaseIR.array? (db : DatabaseIR) (key : TypeKey) : Option ArrayIR :=
+  db.arrays.find? (fun value => value.key == key)
+
+def DatabaseIR.composite? (db : DatabaseIR) (key : TypeKey) : Option CompositeIR :=
+  db.composites.find? (fun value => value.key == key)
+
+def DatabaseIR.range? (db : DatabaseIR) (key : TypeKey) : Option RangeIR :=
+  db.ranges.find? (fun value => value.key == key)
+
+def DatabaseIR.multirange? (db : DatabaseIR) (key : TypeKey) : Option MultirangeIR :=
+  db.multiranges.find? (fun value => value.key == key)
+
 def DatabaseIR.typeOverride? (db : DatabaseIR) (key : TypeKey) : Option TypeOverrideIR :=
   db.typeOverrides.find? (fun value => value.key == key)
 
@@ -55,6 +67,10 @@ inductive TypeSupport where
   | builtin (mapping : BuiltinTypeMapping)
   | enum (value : EnumIR)
   | domain (value : DomainIR)
+  | array (value : ArrayIR)
+  | composite (value : CompositeIR)
+  | range (value : RangeIR)
+  | multirange (value : MultirangeIR)
   | override (value : TypeOverrideIR)
   deriving Repr
 
@@ -67,6 +83,18 @@ def DatabaseIR.typeSupport? (db : DatabaseIR) (key : TypeKey) : Option TypeSuppo
     | none =>
       match db.enum? key with
       | some value => some (.enum value)
-      | none => db.domain? key |>.map .domain
+      | none =>
+        match db.domain? key with
+        | some value => some (.domain value)
+        | none =>
+          match db.array? key with
+          | some value => some (.array value)
+          | none =>
+            match db.composite? key with
+            | some value => some (.composite value)
+            | none =>
+              match db.range? key with
+              | some value => some (.range value)
+              | none => db.multirange? key |>.map .multirange
 
 end Pgx

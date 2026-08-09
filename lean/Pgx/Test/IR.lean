@@ -14,6 +14,12 @@ private def status : TypeRef :=
 private def positiveId : TypeRef :=
   { key := { schema := "app", name := "positive_id", kind := .domain } }
 
+private def statusArrayKey : TypeKey :=
+  { schema := "app", name := "_status", kind := .array }
+
+private def summaryKey : TypeKey :=
+  { schema := "app", name := "user_summary", kind := .composite }
+
 private def int4Scalar : Constraint.ScalarType := {
   declared := int4
   base := .int32
@@ -43,11 +49,19 @@ private def sample : DatabaseIR := {
     key := { schema := "app", name := "status", kind := .enum }
     labels := #["active", "disabled"]
   }]
+  arrays := #[{ key := statusArrayKey, element := status }]
   domains := #[{
     key := { schema := "app", name := "positive_id", kind := .domain }
     base := int4
     notNull := true
     constraints := #["VALUE > 0", "VALUE < 2147483647"]
+  }]
+  composites := #[{
+    key := summaryKey
+    fields := #[
+      { name := "id", ordinal := 1, ty := int4 },
+      { name := "status", ordinal := 2, ty := status }
+    ]
   }]
   relations := #[{
     key := { schema := "app", name := "users" }
@@ -56,6 +70,25 @@ private def sample : DatabaseIR := {
       { name := "id", ordinal := 1, ty := positiveId, nullable := false },
       { name := "status", ordinal := 2, ty := status, nullable := false }
     ]
+  }]
+  views := #[{
+    relation := { schema := "app", name := "active_users" }
+    definition := " SELECT users.id FROM app.users WHERE users.status = 'active';"
+    securityInvoker := true
+  }]
+  routines := #[{
+    key := { schema := "app", name := "find_users", inputTypes := #[int4] }
+    kind := .function
+    args := #[
+      { name := some "minimum_id", mode := .input, ty := int4 },
+      { name := some "id", mode := .table, ty := int4 }
+    ]
+    returnsSet := true
+    returnType := some { key := {
+      schema := "pg_catalog", name := "record", kind := .pseudo } }
+    resultColumns := #[{ name := "id", ordinal := 1, ty := int4 }]
+    volatility := "s"
+    parallel := "s"
   }]
   constraints := #[{
     relation := { schema := "app", name := "users" }
@@ -175,10 +208,17 @@ private def shuffled (db : DatabaseIR) : DatabaseIR := {
   serverFeatures := db.serverFeatures.reverse
   schemas := db.schemas.reverse
   enums := db.enums.reverse
+  arrays := db.arrays.reverse
   domains := db.domains.reverse.map fun domain =>
     { domain with constraints := domain.constraints.reverse }
+  composites := db.composites.reverse.map fun composite =>
+    { composite with fields := composite.fields.reverse }
+  ranges := db.ranges.reverse
+  multiranges := db.multiranges.reverse
   relations := db.relations.reverse.map fun relation =>
     { relation with columns := relation.columns.reverse }
+  views := db.views.reverse
+  routines := db.routines.reverse
   constraints := db.constraints.reverse
   indexes := db.indexes.reverse
   queries := db.queries.reverse.map fun query =>
@@ -188,6 +228,8 @@ private def shuffled (db : DatabaseIR) : DatabaseIR := {
       localConstraints := query.localConstraints.reverse }
   requiredExtensions := db.requiredExtensions.reverse
   typeOverrides := db.typeOverrides.reverse
+  extensionCodecPackages := db.extensionCodecPackages.reverse.map fun package =>
+    { package with types := package.types.reverse }
 }
 
 def main : IO UInt32 := do
@@ -197,6 +239,7 @@ def main : IO UInt32 := do
   assert! sample.normalize.supportedServerMajors == #[17, 18]
   assert! (builtinTypeMapping? int4.key).map (·.leanType) == some "Int32"
   assert! (sample.typeSupport? sample.enums[0]!.key).isSome
+  assert! (sample.typeSupport? statusArrayKey).isSome
   let changedQueries := sample.queries.map fun (q : QueryIR) =>
     { q with columns := q.columns.map (fun (c : QueryColumnIR) =>
         { c with nullable := true }) }
@@ -264,6 +307,22 @@ def main : IO UInt32 := do
   }
   assert! shuffledFixture.contractHash != changedOverrideImport.contractHash
   assert! shuffledFixture.compatibilityHash != changedOverrideImport.compatibilityHash
+  let changedComposite : DatabaseIR := {
+    sample with composites := sample.composites.map fun value =>
+      { value with fields := value.fields.map fun field =>
+          if field.name == "id" then { field with ty := text } else field }
+  }
+  assert! sample.contractHash != changedComposite.contractHash
+  let changedView : DatabaseIR := {
+    sample with views := sample.views.map fun value =>
+      { value with securityBarrier := !value.securityBarrier }
+  }
+  assert! sample.contractHash != changedView.contractHash
+  let changedRoutine : DatabaseIR := {
+    sample with routines := sample.routines.map fun value =>
+      { value with returnsSet := !value.returnsSet }
+  }
+  assert! sample.contractHash != changedRoutine.contractHash
   let oidText := reprStr sample
   assert! !(oidText.contains "tableOid")
   return 0

@@ -22,6 +22,69 @@ structure EnumIR where
   labels : Array String
   deriving Repr, BEq, Inhabited
 
+/-- A physical PostgreSQL array type and the symbolic type of each element.
+Only the ordinary comma-delimited, one-dimensional value surface is emitted;
+the delimiter is nevertheless retained so unsupported extension array shapes
+cannot be mistaken for ordinary arrays. -/
+structure ArrayIR where
+  key : TypeKey
+  element : TypeRef
+  delimiter : String := ","
+  deriving Repr, BEq, Inhabited
+
+structure CompositeFieldIR where
+  name : String
+  ordinal : Nat
+  ty : TypeRef
+  collation : Option CollationKey := none
+  deriving Repr, BEq, Inhabited
+
+/-- Named composite metadata.  Fields are deliberately not marked NOT NULL:
+PostgreSQL table constraints do not constrain values of the table's row type
+when that composite is used outside the table. -/
+structure CompositeIR where
+  key : TypeKey
+  fields : Array CompositeFieldIR
+  deriving Repr, BEq, Inhabited
+
+structure RoutineKey where
+  schema : String
+  name : String
+  /-- PostgreSQL's input argument vector is the overload identity. -/
+  inputTypes : Array TypeRef := #[]
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+namespace RoutineKey
+
+def display (key : RoutineKey) : String :=
+  let args := String.intercalate ", "
+    (key.inputTypes.toList.map (fun ty => ty.key.display))
+  s!"{key.schema}.{key.name}({args})"
+
+end RoutineKey
+
+instance : ToString RoutineKey := ⟨RoutineKey.display⟩
+
+structure QualifiedName where
+  schema : String
+  name : String
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+structure RangeIR where
+  key : TypeKey
+  subtype : TypeRef
+  multirange : TypeKey
+  collation : Option CollationKey := none
+  subtypeOpclass : QualifiedName
+  canonical : Option RoutineKey := none
+  subtypeDiff : Option RoutineKey := none
+  deriving Repr, BEq, Inhabited
+
+structure MultirangeIR where
+  key : TypeKey
+  range : TypeKey
+  deriving Repr, BEq, Inhabited
+
 /-- One locally recheckable domain constraint.  The normalized PostgreSQL
 source is retained for diagnostics; `expression` is the typed, authoritative
 form used to emit a proposition and its proof-producing validator. -/
@@ -78,6 +141,103 @@ structure RelationIR where
   key : RelationKey
   kind : RelationKind
   columns : Array RelationColumnIR
+  deriving Repr, BEq, Inhabited
+
+inductive ViewCheckOption where
+  | none
+  | local
+  | cascaded
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+namespace ViewCheckOption
+
+def tag : ViewCheckOption → String
+  | .none => "none"
+  | .local => "local"
+  | .cascaded => "cascaded"
+
+end ViewCheckOption
+
+/-- Semantic metadata beyond the relation-shaped columns of a view.  Mutable
+materialized-view population state is intentionally absent. -/
+structure ViewIR where
+  relation : RelationKey
+  definition : String
+  checkOption : ViewCheckOption := .none
+  securityBarrier : Bool := false
+  securityInvoker : Bool := false
+  deriving Repr, BEq, Inhabited
+
+inductive RoutineKind where
+  | function
+  | procedure
+  | aggregate
+  | window
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+namespace RoutineKind
+
+def tag : RoutineKind → String
+  | .function => "function"
+  | .procedure => "procedure"
+  | .aggregate => "aggregate"
+  | .window => "window"
+
+end RoutineKind
+
+inductive RoutineArgMode where
+  | input
+  | output
+  | inputOutput
+  | variadic
+  | table
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+namespace RoutineArgMode
+
+def tag : RoutineArgMode → String
+  | .input => "in"
+  | .output => "out"
+  | .inputOutput => "inout"
+  | .variadic => "variadic"
+  | .table => "table"
+
+def isInput : RoutineArgMode → Bool
+  | .input | .inputOutput | .variadic => true
+  | .output | .table => false
+
+end RoutineArgMode
+
+structure RoutineArgIR where
+  name : Option String := none
+  mode : RoutineArgMode
+  ty : TypeRef
+  hasDefault : Bool := false
+  deriving Repr, BEq, Inhabited
+
+structure RoutineResultColumnIR where
+  name : String
+  ordinal : Nat
+  ty : TypeRef
+  /-- OUT/TABLE declarations carry no NOT NULL contract. -/
+  nullable : Bool := true
+  deriving Repr, BEq, Inhabited
+
+/-- Catalog metadata for callable schema routines.  Literal SQL remains the
+authority for an invocation; this metadata exposes stable overload and
+table-valued result shapes without inventing cardinality or nullability. -/
+structure RoutineIR where
+  key : RoutineKey
+  kind : RoutineKind
+  args : Array RoutineArgIR
+  returnsSet : Bool
+  returnType : Option TypeRef := none
+  resultColumns : Array RoutineResultColumnIR := #[]
+  dynamicRecord : Bool := false
+  strict : Bool := false
+  volatility : String
+  parallel : String
+  securityDefiner : Bool := false
   deriving Repr, BEq, Inhabited
 
 inductive ConstraintKind where
@@ -210,10 +370,20 @@ structure TypeOverrideIR where
   importModule : Option String := none
   deriving Repr, BEq, Inhabited
 
+/-- Provenance for a reusable extension codec package.  Concrete Lean types
+and codec declarations remain in `typeOverrides`; this record binds that set
+to a required installed extension version and one import module. -/
+structure ExtensionCodecPackageIR where
+  extension : String
+  version : String
+  importModule : String
+  types : Array TypeKey
+  deriving Repr, BEq, Inhabited
+
 structure DatabaseIR where
-  /-- Version 2 makes executable local-constraint expressions and explicit
-  query refinement plans part of the canonical contract. -/
-  formatVersion : Nat := 2
+  /-- Version 3 adds symbolic component types, semantic view/routine metadata,
+  and extension-codec package provenance. -/
+  formatVersion : Nat := 3
   serverMajor : Nat
   /-- Server majors which passed the generated contract's compatibility
   checks.  Empty is retained only for snapshots written before this field was
@@ -223,13 +393,20 @@ structure DatabaseIR where
   session : SessionContract
   schemas : Array SchemaIR
   enums : Array EnumIR
+  arrays : Array ArrayIR := #[]
   domains : Array DomainIR
+  composites : Array CompositeIR := #[]
+  ranges : Array RangeIR := #[]
+  multiranges : Array MultirangeIR := #[]
   relations : Array RelationIR
+  views : Array ViewIR := #[]
+  routines : Array RoutineIR := #[]
   constraints : Array ConstraintIR
   indexes : Array IndexIR
   queries : Array QueryIR
   requiredExtensions : Array (String × String) := #[]
   typeOverrides : Array TypeOverrideIR := #[]
+  extensionCodecPackages : Array ExtensionCodecPackageIR := #[]
   deriving Repr, BEq, Inhabited
 
 /-! ## Deterministic semantic fingerprint -/
@@ -255,6 +432,15 @@ private def typeRefAtom (ref : TypeRef) : String :=
 private def relationKeyAtom (key : RelationKey) : String :=
   atom key.schema ++ atom key.name
 
+private def collationKeyAtom (key : CollationKey) : String :=
+  atom key.schema ++ atom key.name
+
+private def routineKeyAtom (key : RoutineKey) : String :=
+  atom key.schema ++ atom key.name ++ arrayAtom typeRefAtom key.inputTypes
+
+private def qualifiedNameAtom (key : QualifiedName) : String :=
+  atom key.schema ++ atom key.name
+
 private def schemaAtom (schema : SchemaIR) : String :=
   atom schema.name
 
@@ -270,6 +456,25 @@ private def relationAtom (relation : RelationIR) : String :=
 
 private def enumAtom (value : EnumIR) : String :=
   typeKeyAtom value.key ++ arrayAtom id value.labels
+
+private def pgArrayAtom (value : ArrayIR) : String :=
+  typeKeyAtom value.key ++ typeRefAtom value.element ++ atom value.delimiter
+
+private def compositeFieldAtom (value : CompositeFieldIR) : String :=
+  atom value.name ++ atom (toString value.ordinal) ++ typeRefAtom value.ty ++
+    optionAtom collationKeyAtom value.collation
+
+private def compositeAtom (value : CompositeIR) : String :=
+  typeKeyAtom value.key ++ arrayAtom compositeFieldAtom value.fields
+
+private def rangeAtom (value : RangeIR) : String :=
+  typeKeyAtom value.key ++ typeRefAtom value.subtype ++
+    typeKeyAtom value.multirange ++ optionAtom collationKeyAtom value.collation ++
+    qualifiedNameAtom value.subtypeOpclass ++ optionAtom routineKeyAtom value.canonical ++
+    optionAtom routineKeyAtom value.subtypeDiff
+
+private def multirangeAtom (value : MultirangeIR) : String :=
+  typeKeyAtom value.key ++ typeKeyAtom value.range
 
 private def scalarKindAtom : Pgx.Constraint.ScalarKind → String
   | .boolean => "boolean"
@@ -357,6 +562,27 @@ private def domainAtom (value : DomainIR) : String :=
     optionAtom atom value.defaultExpr ++ arrayAtom id value.constraints ++
     arrayAtom domainConstraintAtom value.localConstraints
 
+private def viewAtom (value : ViewIR) : String :=
+  relationKeyAtom value.relation ++ atom value.definition ++
+    atom value.checkOption.tag ++ boolAtom value.securityBarrier ++
+    boolAtom value.securityInvoker
+
+private def routineArgAtom (value : RoutineArgIR) : String :=
+  optionAtom atom value.name ++ atom value.mode.tag ++ typeRefAtom value.ty ++
+    boolAtom value.hasDefault
+
+private def routineResultColumnAtom (value : RoutineResultColumnIR) : String :=
+  atom value.name ++ atom (toString value.ordinal) ++ typeRefAtom value.ty ++
+    boolAtom value.nullable
+
+private def routineAtom (value : RoutineIR) : String :=
+  routineKeyAtom value.key ++ atom value.kind.tag ++
+    arrayAtom routineArgAtom value.args ++ boolAtom value.returnsSet ++
+    optionAtom typeRefAtom value.returnType ++
+    arrayAtom routineResultColumnAtom value.resultColumns ++
+    boolAtom value.dynamicRecord ++ boolAtom value.strict ++
+    atom value.volatility ++ atom value.parallel ++ boolAtom value.securityDefiner
+
 private def constraintAtom (value : ConstraintIR) : String :=
   relationKeyAtom value.relation ++ atom value.name ++ atom value.kind.tag ++
     arrayAtom id value.columns ++ optionAtom relationKeyAtom value.referencedRelation ++
@@ -372,6 +598,10 @@ private def indexAtom (value : IndexIR) : String :=
 private def overrideAtom (value : TypeOverrideIR) : String :=
   typeKeyAtom value.key ++ atom value.leanType ++ atom value.codec ++
     optionAtom atom value.importModule
+
+private def extensionCodecPackageAtom (value : ExtensionCodecPackageIR) : String :=
+  atom value.extension ++ atom value.version ++ atom value.importModule ++
+    arrayAtom typeKeyAtom value.types
 
 private def queryColumnAtom (column : QueryColumnIR) : String :=
   atom column.name ++ typeRefAtom column.ty ++
@@ -435,27 +665,45 @@ private def normalizeQuery (query : QueryIR) : QueryIR :=
     rowPreservedRelations := sortByAtom relationKeyAtom query.rowPreservedRelations
     localConstraints := sortByAtom queryConstraintAtom query.localConstraints }
 
+private def normalizeComposite (value : CompositeIR) : CompositeIR :=
+  { value with fields := value.fields.toList.mergeSort (fun left right =>
+      if left.ordinal == right.ordinal then
+        compare (compositeFieldAtom left) (compositeFieldAtom right) == Ordering.lt
+      else left.ordinal < right.ordinal) |>.toArray }
+
+private def normalizePackage (value : ExtensionCodecPackageIR) : ExtensionCodecPackageIR :=
+  { value with types := sortByAtom typeKeyAtom value.types }
+
 /-- Put every unordered IR collection in a stable order before serialization.
 Arrays whose order is part of PostgreSQL semantics (including enum labels,
 query result columns, constraint/index columns, and `search_path`) are
 deliberately preserved. -/
 def DatabaseIR.normalize (db : DatabaseIR) : DatabaseIR :=
   let domains := db.domains.map normalizeDomain
+  let composites := db.composites.map normalizeComposite
   let relations := db.relations.map normalizeRelation
   let queries := db.queries.map normalizeQuery
+  let packages := db.extensionCodecPackages.map normalizePackage
   { db with
     supportedServerMajors := sortNats db.supportedServerMajors
     serverFeatures := sortByAtom id db.serverFeatures
     schemas := sortByAtom schemaAtom db.schemas
     enums := sortByAtom enumAtom db.enums
+    arrays := sortByAtom pgArrayAtom db.arrays
     domains := sortByAtom domainAtom domains
+    composites := sortByAtom compositeAtom composites
+    ranges := sortByAtom rangeAtom db.ranges
+    multiranges := sortByAtom multirangeAtom db.multiranges
     relations := sortByAtom relationAtom relations
+    views := sortByAtom viewAtom db.views
+    routines := sortByAtom routineAtom db.routines
     constraints := sortByAtom constraintAtom db.constraints
     indexes := sortByAtom indexAtom db.indexes
     queries := sortByAtom queryAtom queries
     requiredExtensions := sortByAtom (fun value => atom value.1 ++ atom value.2)
       db.requiredExtensions
-    typeOverrides := sortByAtom overrideAtom db.typeOverrides }
+    typeOverrides := sortByAtom overrideAtom db.typeOverrides
+    extensionCodecPackages := sortByAtom extensionCodecPackageAtom packages }
 
 private def databaseMaterial (includeServerMajor : Bool) (db : DatabaseIR) : String :=
   atom (toString db.formatVersion) ++
@@ -464,12 +712,17 @@ private def databaseMaterial (includeServerMajor : Bool) (db : DatabaseIR) : Str
     arrayAtom id db.serverFeatures ++ arrayAtom id db.session.searchPath ++ atom db.session.timezone ++
     atom db.session.encoding ++ boolAtom db.session.standardConformingStrings ++
     arrayAtom schemaAtom db.schemas ++ arrayAtom enumAtom db.enums ++
-    arrayAtom domainAtom db.domains ++ arrayAtom relationAtom db.relations ++
+    arrayAtom pgArrayAtom db.arrays ++ arrayAtom domainAtom db.domains ++
+    arrayAtom compositeAtom db.composites ++ arrayAtom rangeAtom db.ranges ++
+    arrayAtom multirangeAtom db.multiranges ++
+    arrayAtom relationAtom db.relations ++ arrayAtom viewAtom db.views ++
+    arrayAtom routineAtom db.routines ++
     arrayAtom constraintAtom db.constraints ++
     arrayAtom indexAtom (db.indexes.filter fun value => value.unique || value.primary) ++
     arrayAtom queryAtom db.queries ++ arrayAtom (fun value =>
       atom value.1 ++ atom value.2) db.requiredExtensions ++
-    arrayAtom overrideAtom db.typeOverrides
+    arrayAtom overrideAtom db.typeOverrides ++
+    arrayAtom extensionCodecPackageAtom db.extensionCodecPackages
 
 /-- Canonical material for the type-relevant contract.  Physical OIDs, ACLs,
 owners, and performance-only index details cannot influence it. -/
