@@ -38,6 +38,7 @@ private def usersKey : RelationKey := { schema := "app", name := "users" }
 driver without duplicating this fairly complete fixture. -/
 def fixture : DatabaseIR := {
   serverMajor := 18
+  supportedServerMajors := #[18]
   serverFeatures := #["generated-columns", "identity-columns"]
   session := {
     searchPath := #["app", "pg_catalog"]
@@ -167,6 +168,7 @@ def fixture : DatabaseIR := {
 
 private def shuffled : DatabaseIR := {
   fixture with
+  supportedServerMajors := fixture.supportedServerMajors.reverse
   serverFeatures := fixture.serverFeatures.reverse
   schemas := fixture.schemas.reverse
   enums := fixture.enums.reverse
@@ -238,6 +240,10 @@ def main : IO UInt32 := do
   let reordered ← match emitDatabase "app_db" shuffled with
     | .ok value => pure value
     | .error error => throw (IO.userError (toString error))
+  let legacySources ← match emitDatabase "app_db"
+      { fixture with supportedServerMajors := #[] } with
+    | .ok value => pure value
+    | .error error => throw (IO.userError (toString error))
 
   -- Fixed output layout and a compact full-file golden for the root module.
   assert! sources.modulePrefix == "AppDb"
@@ -272,6 +278,9 @@ def main : IO UInt32 := do
   assert! sources.types.contents.contains "structure AppEmailAddress where"
   assert! sources.types.contents.contains "def codec : Pgx.Typed.ResolvedCodec AppEmailAddress"
   assert! sources.schema.contents.contains "def database : Pgx.Typed.DatabaseDesc"
+  assert! sources.schema.contents.contains "serverMajors := #[18]"
+  assert! !(sources.schema.contents.contains "serverMajors := #[17, 18]")
+  assert! legacySources.schema.contents.contains "serverMajors := #[18]"
   assert! sources.schema.contents.contains "def attach (conn : Pg.Connection)"
   assert! sources.constraints.contents.contains "def indexes : Array Pgx.IndexIR"
   assert! sources.queries.any (fun source =>

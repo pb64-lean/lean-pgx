@@ -427,9 +427,14 @@ private def extensionsFromJson (json : Json) : Except String (Array (String × S
   values.mapM extensionFromJson
 
 private def databaseToJson (value : DatabaseIR) : Json :=
-  Json.mkObj [
+  let versionFields := [
     ("formatVersion", toJson value.formatVersion),
-    ("serverMajor", toJson value.serverMajor),
+    ("serverMajor", toJson value.serverMajor)
+  ]
+  let versionFields :=
+    if value.supportedServerMajors.isEmpty then versionFields
+    else versionFields ++ [("supportedServerMajors", toJson value.supportedServerMajors)]
+  Json.mkObj (versionFields ++ [
     ("serverFeatures", toJson value.serverFeatures),
     ("session", toJson value.session),
     ("schemas", toJson value.schemas),
@@ -441,7 +446,7 @@ private def databaseToJson (value : DatabaseIR) : Json :=
     ("queries", toJson value.queries),
     ("requiredExtensions", extensionsToJson value.requiredExtensions),
     ("typeOverrides", toJson value.typeOverrides)
-  ]
+  ])
 
 instance : ToJson DatabaseIR where
   toJson value := databaseToJson value.normalize
@@ -459,6 +464,7 @@ instance : FromJson DatabaseIR where
     pure {
       formatVersion := ← optionalField json "formatVersion" 1
       serverMajor := ← requiredField json "serverMajor"
+      supportedServerMajors := ← optionalField json "supportedServerMajors" #[]
       serverFeatures := ← optionalField json "serverFeatures" #[]
       session := ← requiredField json "session"
       schemas := ← requiredField json "schemas"

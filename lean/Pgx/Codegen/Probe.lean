@@ -42,6 +42,14 @@ structure Config where
   typeOverrides : Array Pgx.TypeOverrideIR := #[]
   deriving Repr, BEq, Inhabited
 
+namespace Config
+
+/-- Canonical server-major set copied into the generated database contract. -/
+def normalizedSupportedServerMajors (config : Config) : Array Nat :=
+  config.supportedServerMajors.toList.mergeSort (· < ·) |>.toArray
+
+end Config
+
 inductive Error where
   | invalidConfig (message : String)
   | postgres (context : String) (error : Pg.Error)
@@ -1133,6 +1141,7 @@ def probeDatabase (conn : Pg.Connection) (config : Config) :
     | .ok value => queries := queries.push value
   let database : Pgx.DatabaseIR := {
     serverMajor := snapshot.serverMajor
+    supportedServerMajors := config.normalizedSupportedServerMajors
     session := config.session
     schemas := snapshot.schemas
     enums := snapshot.enums

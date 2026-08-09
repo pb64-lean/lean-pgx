@@ -239,6 +239,10 @@ structure TypeOverrideIR where
 structure DatabaseIR where
   formatVersion : Nat := 1
   serverMajor : Nat
+  /-- Server majors which passed the generated contract's compatibility
+  checks.  Empty is retained only for snapshots written before this field was
+  introduced. -/
+  supportedServerMajors : Array Nat := #[]
   serverFeatures : Array String := #[]
   session : SessionContract
   schemas : Array SchemaIR
@@ -326,6 +330,9 @@ private def sortByAtom (f : α → String) (values : Array α) : Array α :=
   (values.toList.mergeSort fun left right =>
     compare (f left) (f right) == Ordering.lt).toArray
 
+private def sortNats (values : Array Nat) : Array Nat :=
+  values.toList.mergeSort (· < ·) |>.toArray
+
 private def relationColumnLess
     (left right : RelationColumnIR) : Bool :=
   match compare left.ordinal right.ordinal with
@@ -365,6 +372,7 @@ def DatabaseIR.normalize (db : DatabaseIR) : DatabaseIR :=
   let relations := db.relations.map normalizeRelation
   let queries := db.queries.map normalizeQuery
   { db with
+    supportedServerMajors := sortNats db.supportedServerMajors
     serverFeatures := sortByAtom id db.serverFeatures
     schemas := sortByAtom schemaAtom db.schemas
     enums := sortByAtom enumAtom db.enums
@@ -380,6 +388,7 @@ def DatabaseIR.normalize (db : DatabaseIR) : DatabaseIR :=
 private def databaseMaterial (includeServerMajor : Bool) (db : DatabaseIR) : String :=
   atom (toString db.formatVersion) ++
     (if includeServerMajor then atom (toString db.serverMajor) else "") ++
+    arrayAtom (fun value => toString value) db.supportedServerMajors ++
     arrayAtom id db.serverFeatures ++ arrayAtom id db.session.searchPath ++ atom db.session.timezone ++
     atom db.session.encoding ++ boolAtom db.session.standardConformingStrings ++
     arrayAtom schemaAtom db.schemas ++ arrayAtom enumAtom db.enums ++

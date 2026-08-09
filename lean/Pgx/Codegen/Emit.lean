@@ -611,8 +611,10 @@ private def emitRelation (plan : NamingPlan) (db : Pgx.DatabaseIR)
   ]
   pure lines
 
-private def serverMajorsExpr (major : Nat) : String :=
-  if major == 17 || major == 18 then "#[17, 18]" else s!"#[{major}]"
+private def serverMajorsExpr (db : Pgx.DatabaseIR) : String :=
+  let majors := if db.supportedServerMajors.isEmpty then #[db.serverMajor]
+    else db.supportedServerMajors
+  arrayExpr (majors.map (fun major => toString major))
 
 private def emitSchema (plan : NamingPlan) (db : Pgx.DatabaseIR) :
     Except CodegenError String := do
@@ -630,7 +632,7 @@ private def emitSchema (plan : NamingPlan) (db : Pgx.DatabaseIR) :
     "",
     "def database : Pgx.Typed.DatabaseDesc := {",
     s!"  canonicalMajor := {db.serverMajor}",
-    s!"  serverMajors := {serverMajorsExpr db.serverMajor}",
+    s!"  serverMajors := {serverMajorsExpr db}",
     s!"  session := {sessionExpr db.session}",
     s!"  types := {plan.modulePrefix}.Types.staticTypes",
     s!"  relations := {arrayExpr relationDescriptors}",

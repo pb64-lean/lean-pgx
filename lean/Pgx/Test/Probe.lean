@@ -7,6 +7,7 @@ open Pgx.Codegen.Probe
 private def validConfig : Config := {
   schemas := #["app"]
   session := { searchPath := #["app", "pg_catalog"] }
+  supportedServerMajors := #[18, 17]
   queries := #[{
     name := "GetUser"
     sql := "SELECT id FROM app.users WHERE id = $1"
@@ -35,6 +36,7 @@ private def fullPlan : String :=
 
 def main : IO UInt32 := do
   assert! (validateConfig validConfig).isOk
+  assert! validConfig.normalizedSupportedServerMajors == #[17, 18]
   assert! isError (validateConfig { validConfig with schemas := #["app", "app"] })
   assert! isError (validateConfig { validConfig with schemas := #[""] })
   let sparse := validConfig.queries.map fun query => {

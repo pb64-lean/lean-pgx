@@ -13,6 +13,7 @@ private def status : TypeRef :=
 
 private def sample : DatabaseIR := {
   serverMajor := 18
+  supportedServerMajors := #[18, 17]
   serverFeatures := #["identity-columns", "generated-columns"]
   session := { searchPath := #["app", "pg_catalog"] }
   schemas := #[{ name := "app" }]
@@ -140,6 +141,7 @@ private def shuffledFixture : DatabaseIR := {
 
 private def shuffled (db : DatabaseIR) : DatabaseIR := {
   db with
+  supportedServerMajors := db.supportedServerMajors.reverse
   serverFeatures := db.serverFeatures.reverse
   schemas := db.schemas.reverse
   enums := db.enums.reverse
@@ -159,6 +161,7 @@ def main : IO UInt32 := do
   assert! sample.contractHash.length == 64
   assert! sample.compatibilityHash.length == 64
   assert! sample.contractHash == sample.contractHash
+  assert! sample.normalize.supportedServerMajors == #[17, 18]
   assert! (builtinTypeMapping? int4.key).map (·.leanType) == some "Int32"
   assert! (sample.typeSupport? sample.enums[0]!.key).isSome
   let changedQueries := sample.queries.map fun (q : QueryIR) =>
@@ -173,6 +176,11 @@ def main : IO UInt32 := do
   let previousMajor : DatabaseIR := { sample with serverMajor := 17 }
   assert! sample.contractHash != previousMajor.contractHash
   assert! sample.compatibilityHash == previousMajor.compatibilityHash
+  let changedSupportedMajors : DatabaseIR := {
+    sample with supportedServerMajors := #[18]
+  }
+  assert! sample.contractHash != changedSupportedMajors.contractHash
+  assert! sample.compatibilityHash != changedSupportedMajors.compatibilityHash
   let withEmptySchema : DatabaseIR := {
     sample with schemas := sample.schemas.push { name := "empty" }
   }

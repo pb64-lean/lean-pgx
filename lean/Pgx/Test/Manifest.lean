@@ -30,6 +30,7 @@ private def collation : CollationKey := { schema := "pg_catalog", name := "defau
 
 private def sampleDatabase : DatabaseIR := {
   serverMajor := 18
+  supportedServerMajors := #[18, 17]
   serverFeatures := #["generated-columns", "identity-columns"]
   session := {
     searchPath := #["app", "pg_catalog"]
@@ -171,8 +172,18 @@ def main : IO UInt32 := do
 
   let snapshot := sampleDatabase.renderSnapshot
   assert! snapshot == sampleDatabase.renderSnapshot
+  assert! snapshot.contains "\"supportedServerMajors\""
   assert! match DatabaseIR.parseSnapshot snapshot with
     | .ok decoded => decoded == sampleDatabase.normalize
+    | .error _ => false
+  let legacyDatabase : DatabaseIR := {
+    sampleDatabase with supportedServerMajors := #[]
+  }
+  let legacySnapshot := legacyDatabase.renderSnapshot
+  assert! !(legacySnapshot.contains "\"supportedServerMajors\"")
+  assert! match DatabaseIR.parseSnapshot legacySnapshot with
+    | .ok decoded => decoded.supportedServerMajors.isEmpty &&
+        decoded == legacyDatabase.normalize
     | .error _ => false
   let reversed : DatabaseIR := {
     sampleDatabase with serverFeatures := sampleDatabase.serverFeatures.reverse

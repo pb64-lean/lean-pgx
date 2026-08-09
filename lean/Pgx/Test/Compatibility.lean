@@ -8,6 +8,7 @@ private def int4 : TypeRef := {
 
 private def database (serverMajor : Nat) : DatabaseIR := {
   serverMajor
+  supportedServerMajors := #[17, 18]
   session := { searchPath := #["app", "pg_catalog"] }
   schemas := #[{ name := "app" }]
   enums := #[]
