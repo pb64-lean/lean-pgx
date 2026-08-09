@@ -46,9 +46,9 @@ register_toolchains(
     dev_dependency = True,
 )
 
-# Pinned PostgreSQL distributions used only by code-generation actions and
-# cross-major compatibility tests.  Generated libraries have no PostgreSQL
-# server runtime dependency.
+# Pinned PostgreSQL distributions and TCP/Unix bridge used only by
+# code-generation actions and cross-major compatibility tests. Generated
+# libraries have no PostgreSQL server runtime dependency.
 bazel_dep(name = "rules_nixpkgs_core", version = "0.13.0")
 
 postgres_nix = use_extension(
@@ -75,6 +75,28 @@ filegroup(
 )
 """
 
+_SOCAT_BUILD = """\
+filegroup(
+    name = "toolchain",
+    srcs = ["bin/socat", "bin/socat1"],
+    visibility = ["//visibility:public"],
+)
+"""
+
+_COREUTILS_BUILD = """\
+filegroup(
+    name = "toolchain",
+    srcs = [
+        "bin/coreutils",
+        "bin/mkdir",
+        "bin/mktemp",
+        "bin/rm",
+        "bin/sleep",
+    ],
+    visibility = ["//visibility:public"],
+)
+"""
+
 postgres_pkg.attr(
     name = "postgresql_17",
     attr = "postgresql_17",
@@ -87,4 +109,22 @@ postgres_pkg.attr(
     build_file_content = _POSTGRES_BUILD,
     repo = "@postgres_nixpkgs",
 )
-use_repo(postgres_pkg, "postgresql_17", "postgresql_18")
+postgres_pkg.attr(
+    name = "socat",
+    attr = "socat",
+    build_file_content = _SOCAT_BUILD,
+    repo = "@postgres_nixpkgs",
+)
+postgres_pkg.attr(
+    name = "coreutils",
+    attr = "coreutils",
+    build_file_content = _COREUTILS_BUILD,
+    repo = "@postgres_nixpkgs",
+)
+use_repo(
+    postgres_pkg,
+    "coreutils",
+    "postgresql_17",
+    "postgresql_18",
+    "socat",
+)

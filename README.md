@@ -21,8 +21,9 @@ Milestone 1 includes:
 ## Bazel usage
 
 The build expects `rules_lean`, `pg-lean`, and `tls13-lean` as sibling
-checkouts. The local module pins PostgreSQL through Nix; the ordinary build
-does not use a developer or production database.
+checkouts. The local module pins PostgreSQL, `socat`, and the action lifecycle
+utilities through one Nix revision; the ordinary build does not use a
+developer or production database.
 
 ```starlark
 load(
@@ -93,11 +94,14 @@ app_db.contract.sha256
 app_db.compatibility.sha256
 ```
 
-The action initializes a private cluster, binds only a loopback port, replays
-the declared migrations in order, probes the declared schemas and queries,
-writes those outputs, and stops the server. The PostgreSQL client dependency
-currently exposes TCP connections, so the private action uses loopback rather
-than a Unix-domain socket.
+The action initializes a private cluster, makes PostgreSQL listen only on an
+action-private Unix-domain socket, replays the declared migrations in order,
+probes the declared schemas and queries, writes those outputs, and stops the
+server. The PostgreSQL client dependency currently exposes TCP connections,
+so a pinned `socat` process bridges a random loopback port to that private
+socket for the duration of the action. Bazel blocks external networking, all
+server/bridge/lifecycle tools are declared inputs, and cleanup stops both
+processes and removes the private cluster.
 
 ## Generated runtime API
 

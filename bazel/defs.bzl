@@ -117,14 +117,18 @@ def _module_path(module_prefix):
         fail("module_prefix must not be empty")
     return module_prefix.replace(".", "/")
 
-def _find_postgres_tool(files, basename):
+def _find_distribution_tool(files, basename, distribution):
     matches = [f for f in files if f.basename == basename and f.dirname.endswith("/bin")]
     if len(matches) != 1:
-        fail("PostgreSQL distribution must contain exactly one bin/%s (found %s)" % (
+        fail("%s distribution must contain exactly one bin/%s (found %s)" % (
+            distribution,
             basename,
             len(matches),
         ))
     return matches[0]
+
+def _find_postgres_tool(files, basename):
+    return _find_distribution_tool(files, basename, "PostgreSQL")
 
 def _add_common_generator_args(args, ctx, query_info):
     args.add("--module-prefix")
@@ -149,6 +153,8 @@ def _add_common_generator_args(args, ctx, query_info):
         args.add(query_info.srcs[i])
 
 _SERVER_LIFECYCLE = r"""set -euo pipefail
+export LC_ALL=C
+export TZ=UTC
 pgx_absolute() {
   case "$1" in
     /*) printf '%s\n' "$1" ;;
@@ -159,11 +165,25 @@ INITDB="$(pgx_absolute "$1")"
 POSTGRES="$(pgx_absolute "$2")"
 PG_ISREADY="$(pgx_absolute "$3")"
 PG_CTL="$(pgx_absolute "$4")"
-GENERATOR="$(pgx_absolute "$5")"
-shift 5
+SOCAT="$(pgx_absolute "$5")"
+MKTEMP="$(pgx_absolute "$6")"
+MKDIR="$(pgx_absolute "$7")"
+RM="$(pgx_absolute "$8")"
+SLEEP="$(pgx_absolute "$9")"
+GENERATOR="$(pgx_absolute "${10}")"
+shift 10
 
-PGX_TMP_ROOT="${TEST_TMPDIR:-${TMPDIR:-/tmp}}"
-PGX_WORK="$(mktemp -d "$PGX_TMP_ROOT/lean-pgx.XXXXXX")"
+pgx_print_log() {
+  PGX_PRINT_FILE="$1"
+  PGX_PRINT_COUNT=0
+  while [ "$PGX_PRINT_COUNT" -lt 240 ] && IFS= read -r PGX_PRINT_LINE; do
+    printf '%s\n' "$PGX_PRINT_LINE" >&2
+    PGX_PRINT_COUNT=$((PGX_PRINT_COUNT + 1))
+  done < "$PGX_PRINT_FILE"
+}
+
+PGX_TMP_ROOT="$(pgx_absolute "${TEST_TMPDIR:-${TMPDIR:-/tmp}}")"
+PGX_WORK="$("$MKTEMP" -d "$PGX_TMP_ROOT/lean-pgx.XXXXXX")"
 case "$PGX_WORK" in
   "$PGX_TMP_ROOT"/lean-pgx.*) ;;
   *) echo "refusing unexpected temporary path: $PGX_WORK" >&2; exit 1 ;;
@@ -171,66 +191,114 @@ esac
 PGX_DATA="$PGX_WORK/data"
 PGX_SOCKET="$PGX_WORK/socket"
 PGX_LOG="$PGX_WORK/postgres.log"
-mkdir -p "$PGX_SOCKET"
-PGX_PID=""
+PGX_SOCAT_LOG="$PGX_WORK/socat.log"
+PGX_POSTGRES_PID=""
+PGX_SOCAT_PID=""
 
 cleanup() {
   PGX_STATUS=$?
-  if [ -n "$PGX_PID" ] && kill -0 "$PGX_PID" 2>/dev/null; then
-    "$PG_CTL" -D "$PGX_DATA" -m fast -w stop >/dev/null 2>&1 || {
-      kill "$PGX_PID" 2>/dev/null || true
-      wait "$PGX_PID" 2>/dev/null || true
-    }
+  trap - EXIT INT TERM
+  if [ -n "$PGX_SOCAT_PID" ]; then
+    if kill -0 "$PGX_SOCAT_PID" 2>/dev/null; then
+      kill "$PGX_SOCAT_PID" 2>/dev/null || true
+    fi
+    wait "$PGX_SOCAT_PID" 2>/dev/null || true
+  fi
+  if [ -n "$PGX_POSTGRES_PID" ]; then
+    if kill -0 "$PGX_POSTGRES_PID" 2>/dev/null; then
+      if ! "$PG_CTL" -D "$PGX_DATA" -m fast -w stop >/dev/null 2>&1; then
+        kill "$PGX_POSTGRES_PID" 2>/dev/null || true
+      fi
+    fi
+    wait "$PGX_POSTGRES_PID" 2>/dev/null || true
   fi
   if [ "$PGX_STATUS" -ne 0 ] && [ -f "$PGX_LOG" ]; then
     echo "PostgreSQL action log:" >&2
-    sed -n '1,240p' "$PGX_LOG" >&2
+    pgx_print_log "$PGX_LOG"
+  fi
+  if [ "$PGX_STATUS" -ne 0 ] && [ -s "$PGX_SOCAT_LOG" ]; then
+    echo "socat action log:" >&2
+    pgx_print_log "$PGX_SOCAT_LOG"
   fi
   case "$PGX_WORK" in
-    "$PGX_TMP_ROOT"/lean-pgx.*) rm -rf -- "$PGX_WORK" ;;
+    "$PGX_TMP_ROOT"/lean-pgx.*) "$RM" -rf -- "$PGX_WORK" ;;
   esac
-  return "$PGX_STATUS"
+  exit "$PGX_STATUS"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+"$MKDIR" -p "$PGX_SOCKET"
 
 TZ=UTC "$INITDB" -D "$PGX_DATA" --no-locale --encoding=UTF8 \
   --auth=trust --username=postgres >"$PGX_LOG" 2>&1
 
-PGX_READY=""
-for PGX_ATTEMPT in $(seq 0 24); do
-  PGX_PORT=$((20000 + (($$ + PGX_ATTEMPT * 997) % 30000)))
-  if (exec 9<>"/dev/tcp/127.0.0.1/$PGX_PORT") 2>/dev/null; then
-    exec 9>&-
-    exec 9<&-
-    continue
+PGX_DB_PORT=5432
+TZ=UTC "$POSTGRES" -D "$PGX_DATA" \
+  -c listen_addresses= -c unix_socket_directories="$PGX_SOCKET" \
+  -p "$PGX_DB_PORT" -c timezone=UTC -c max_connections=16 \
+  >>"$PGX_LOG" 2>&1 &
+PGX_POSTGRES_PID=$!
+
+PGX_DB_READY=""
+PGX_ATTEMPT=0
+while [ "$PGX_ATTEMPT" -lt 600 ]; do
+  if ! kill -0 "$PGX_POSTGRES_PID" 2>/dev/null; then
+    break
   fi
-  TZ=UTC "$POSTGRES" -D "$PGX_DATA" -h 127.0.0.1 -p "$PGX_PORT" \
-    -k "$PGX_SOCKET" -c timezone=UTC -c max_connections=16 \
-    >>"$PGX_LOG" 2>&1 &
-  PGX_PID=$!
-  for _ in $(seq 1 100); do
-    if ! kill -0 "$PGX_PID" 2>/dev/null; then
+  if "$PG_ISREADY" -q -h "$PGX_SOCKET" -p "$PGX_DB_PORT" -U postgres; then
+    PGX_DB_READY=1
+    break
+  fi
+  PGX_ATTEMPT=$((PGX_ATTEMPT + 1))
+  "$SLEEP" 0.05
+done
+
+if [ -z "$PGX_DB_READY" ]; then
+  echo "PostgreSQL failed to start on its private Unix socket" >&2
+  pgx_print_log "$PGX_LOG"
+  exit 1
+fi
+
+PGX_BRIDGE_READY=""
+PGX_ATTEMPT=0
+while [ "$PGX_ATTEMPT" -lt 25 ]; do
+  PGX_PORT=$((20000 + (($$ * 1103 + PGX_ATTEMPT * 997 + RANDOM) % 30000)))
+  "$SOCAT" \
+    "TCP4-LISTEN:$PGX_PORT,bind=127.0.0.1,reuseaddr,nodelay,fork" \
+    "UNIX-CONNECT:$PGX_SOCKET/.s.PGSQL.$PGX_DB_PORT" \
+    >>"$PGX_SOCAT_LOG" 2>&1 &
+  PGX_SOCAT_PID=$!
+  "$SLEEP" 0.05
+  PGX_READY_ATTEMPT=0
+  while [ "$PGX_READY_ATTEMPT" -lt 200 ]; do
+    if ! kill -0 "$PGX_SOCAT_PID" 2>/dev/null; then
       break
     fi
     if "$PG_ISREADY" -q -h 127.0.0.1 -p "$PGX_PORT" -U postgres; then
-      PGX_READY=1
+      PGX_BRIDGE_READY=1
       break
     fi
-    sleep 0.05
+    PGX_READY_ATTEMPT=$((PGX_READY_ATTEMPT + 1))
+    "$SLEEP" 0.05
   done
-  if [ -n "$PGX_READY" ]; then
+  if [ -n "$PGX_BRIDGE_READY" ]; then
     break
   fi
-  if kill -0 "$PGX_PID" 2>/dev/null; then
-    kill "$PGX_PID" 2>/dev/null || true
-    wait "$PGX_PID" 2>/dev/null || true
+  if kill -0 "$PGX_SOCAT_PID" 2>/dev/null; then
+    kill "$PGX_SOCAT_PID" 2>/dev/null || true
   fi
-  PGX_PID=""
+  wait "$PGX_SOCAT_PID" 2>/dev/null || true
+  PGX_SOCAT_PID=""
+  PGX_ATTEMPT=$((PGX_ATTEMPT + 1))
 done
 
-if [ -z "$PGX_READY" ]; then
-  echo "PostgreSQL failed to start" >&2
-  sed -n '1,240p' "$PGX_LOG" >&2
+if [ -z "$PGX_BRIDGE_READY" ]; then
+  echo "socat failed to bridge loopback TCP to the private PostgreSQL socket" >&2
+  if [ -s "$PGX_SOCAT_LOG" ]; then
+    pgx_print_log "$PGX_SOCAT_LOG"
+  fi
   exit 1
 fi
 
@@ -285,6 +353,13 @@ def _lean_pg_generate_impl(ctx):
     postgres = _find_postgres_tool(postgres_files, "postgres")
     pg_isready = _find_postgres_tool(postgres_files, "pg_isready")
     pg_ctl = _find_postgres_tool(postgres_files, "pg_ctl")
+    socat_files = ctx.files._socat
+    socat = _find_distribution_tool(socat_files, "socat", "socat")
+    coreutils_files = ctx.files._coreutils
+    mktemp = _find_distribution_tool(coreutils_files, "mktemp", "coreutils")
+    mkdir = _find_distribution_tool(coreutils_files, "mkdir", "coreutils")
+    rm = _find_distribution_tool(coreutils_files, "rm", "coreutils")
+    sleep = _find_distribution_tool(coreutils_files, "sleep", "coreutils")
 
     ctx.actions.run_shell(
         command = _SERVER_LIFECYCLE,
@@ -293,6 +368,11 @@ def _lean_pg_generate_impl(ctx):
             postgres.path,
             pg_isready.path,
             pg_ctl.path,
+            socat.path,
+            mktemp.path,
+            mkdir.path,
+            rm.path,
+            sleep.path,
             ctx.executable._generator.path,
             args,
         ],
@@ -301,13 +381,11 @@ def _lean_pg_generate_impl(ctx):
         ),
         outputs = outputs,
         tools = depset(
-            direct = postgres_files + [ctx.executable._generator],
+            direct = postgres_files + socat_files + coreutils_files + [ctx.executable._generator],
         ),
-        use_default_shell_env = True,
+        use_default_shell_env = False,
         execution_requirements = {
-            "local": "1",
-            "no-remote": "1",
-            "no-sandbox": "1",
+            "block-network": "1",
         },
         mnemonic = "LeanPgGenerate",
         progress_message = "Replaying DDL and generating checked Lean API for %s" % ctx.label,
@@ -353,12 +431,23 @@ _lean_pg_generate = rule(
         "postgres": attr.label(
             default = "@postgresql_18//:toolchain",
             allow_files = True,
+            cfg = "exec",
         ),
         "canonical_major": attr.int(default = 18),
         "server_majors": attr.int_list(default = [17, 18]),
         "_generator": attr.label(
             default = "@lean-pgx//lean/Pgx/Codegen:pgx_codegen",
             executable = True,
+            cfg = "exec",
+        ),
+        "_socat": attr.label(
+            default = "@socat//:toolchain",
+            allow_files = True,
+            cfg = "exec",
+        ),
+        "_coreutils": attr.label(
+            default = "@coreutils//:toolchain",
+            allow_files = True,
             cfg = "exec",
         ),
     },
@@ -406,6 +495,13 @@ def _pg_compat_snapshot_impl(ctx):
     postgres = _find_postgres_tool(postgres_files, "postgres")
     pg_isready = _find_postgres_tool(postgres_files, "pg_isready")
     pg_ctl = _find_postgres_tool(postgres_files, "pg_ctl")
+    socat_files = ctx.files._socat
+    socat = _find_distribution_tool(socat_files, "socat", "socat")
+    coreutils_files = ctx.files._coreutils
+    mktemp = _find_distribution_tool(coreutils_files, "mktemp", "coreutils")
+    mkdir = _find_distribution_tool(coreutils_files, "mkdir", "coreutils")
+    rm = _find_distribution_tool(coreutils_files, "rm", "coreutils")
+    sleep = _find_distribution_tool(coreutils_files, "sleep", "coreutils")
 
     ctx.actions.run_shell(
         command = _SERVER_LIFECYCLE,
@@ -414,6 +510,11 @@ def _pg_compat_snapshot_impl(ctx):
             postgres.path,
             pg_isready.path,
             pg_ctl.path,
+            socat.path,
+            mktemp.path,
+            mkdir.path,
+            rm.path,
+            sleep.path,
             ctx.executable._generator.path,
             args,
         ],
@@ -422,13 +523,11 @@ def _pg_compat_snapshot_impl(ctx):
         ),
         outputs = [ir_out, contract_out, compatibility_out],
         tools = depset(
-            direct = postgres_files + [ctx.executable._generator],
+            direct = postgres_files + socat_files + coreutils_files + [ctx.executable._generator],
         ),
-        use_default_shell_env = True,
+        use_default_shell_env = False,
         execution_requirements = {
-            "local": "1",
-            "no-remote": "1",
-            "no-sandbox": "1",
+            "block-network": "1",
         },
         mnemonic = "LeanPgCompatProbe",
         progress_message = "Probing %s with PostgreSQL %s" % (ctx.attr.database.label, ctx.attr.major),
@@ -448,11 +547,22 @@ _pg_compat_snapshot = rule(
         "postgres": attr.label(
             mandatory = True,
             allow_files = True,
+            cfg = "exec",
         ),
         "major": attr.int(mandatory = True),
         "_generator": attr.label(
             default = "@lean-pgx//lean/Pgx/Codegen:pgx_codegen",
             executable = True,
+            cfg = "exec",
+        ),
+        "_socat": attr.label(
+            default = "@socat//:toolchain",
+            allow_files = True,
+            cfg = "exec",
+        ),
+        "_coreutils": attr.label(
+            default = "@coreutils//:toolchain",
+            allow_files = True,
             cfg = "exec",
         ),
     },
@@ -513,6 +623,13 @@ def _pg_live_test_impl(ctx):
     postgres = _find_postgres_tool(postgres_files, "postgres")
     pg_isready = _find_postgres_tool(postgres_files, "pg_isready")
     pg_ctl = _find_postgres_tool(postgres_files, "pg_ctl")
+    socat_files = ctx.files._socat
+    socat = _find_distribution_tool(socat_files, "socat", "socat")
+    coreutils_files = ctx.files._coreutils
+    mktemp = _find_distribution_tool(coreutils_files, "mktemp", "coreutils")
+    mkdir = _find_distribution_tool(coreutils_files, "mkdir", "coreutils")
+    rm = _find_distribution_tool(coreutils_files, "rm", "coreutils")
+    sleep = _find_distribution_tool(coreutils_files, "sleep", "coreutils")
     command = _SERVER_LIFECYCLE + '\nprintf "ok\\n" > "$PGX_STAMP"\n'
     ctx.actions.run_shell(
         command = command,
@@ -521,6 +638,11 @@ def _pg_live_test_impl(ctx):
             postgres.path,
             pg_isready.path,
             pg_ctl.path,
+            socat.path,
+            mktemp.path,
+            mkdir.path,
+            rm.path,
+            sleep.path,
             ctx.executable.runner.path,
             args,
         ],
@@ -530,13 +652,11 @@ def _pg_live_test_impl(ctx):
         ),
         outputs = [stamp],
         tools = depset(
-            direct = postgres_files + [ctx.executable.runner],
+            direct = postgres_files + socat_files + coreutils_files + [ctx.executable.runner],
         ),
-        use_default_shell_env = True,
+        use_default_shell_env = False,
         execution_requirements = {
-            "local": "1",
-            "no-remote": "1",
-            "no-sandbox": "1",
+            "block-network": "1",
         },
         mnemonic = "LeanPgLiveTest",
         progress_message = "Running checked PostgreSQL acceptance test %s" % ctx.label,
@@ -567,9 +687,20 @@ _pg_live_test = rule(
         "postgres": attr.label(
             default = "@postgresql_18//:toolchain",
             allow_files = True,
+            cfg = "exec",
         ),
         "runner_args": attr.string_list(),
         "data": attr.label_list(allow_files = True),
+        "_socat": attr.label(
+            default = "@socat//:toolchain",
+            allow_files = True,
+            cfg = "exec",
+        ),
+        "_coreutils": attr.label(
+            default = "@coreutils//:toolchain",
+            allow_files = True,
+            cfg = "exec",
+        ),
     },
 )
 
