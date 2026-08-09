@@ -20,6 +20,10 @@ private def syntaxTests : IO Unit := do
   assert! okEq (parseCompositeText "(NULL,\"\")") #[some "NULL", some ""]
   assert! okEq (parseCompositeText "  (alpha,beta)\t")
     #[some "alpha", some "beta"]
+  assert! okEq (parseCompositeTextArity 0 "()") #[]
+  assert! okEq (parseCompositeTextArity 1 "()") #[none]
+  assert! isError (parseCompositeTextArity 2 "()")
+  assert! isError (parseCompositeTextArity 2 "(only_one)")
 
   -- PostgreSQL accepts backslash escapes in both quoted and unquoted fields.
   assert! okEq (parseCompositeText "(a\\,b,c\\)d,e\\\\f)")
@@ -55,6 +59,10 @@ private def roundTripTests : IO Unit := do
   let nulls : CompositeTextFields := #[none, none, none]
   assert! renderCompositeText nulls == "(,,)"
   assert! okEq (parseCompositeText (renderCompositeText nulls)) nulls
+
+  let empty : CompositeTextFields := #[]
+  assert! renderCompositeText empty == "()"
+  assert! okEq (parseCompositeTextArity 0 (renderCompositeText empty)) empty
 
 private def malformedTests : IO Unit := do
   assert! isError (parseCompositeText "")

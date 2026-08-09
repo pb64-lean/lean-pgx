@@ -98,11 +98,13 @@ private def scanCompositeText (source : String) :
 termination_by _ chars => chars.length
 decreasing_by all_goals simp_wf
 
-/-- Parse PostgreSQL's text representation of one composite value.
+/-- Parse PostgreSQL's text representation of one composite value syntactically.
 
 Outer ASCII whitespace is accepted and field whitespace is preserved.
-PostgreSQL composite types have at least one logical field, so `()` is
-represented as one NULL field. -/
+Without a row descriptor, `()` is ambiguous between a zero-field composite and
+a one-field composite containing NULL.  This raw parser follows the delimiter
+grammar and returns one NULL field; `parseCompositeTextArity` resolves the
+ambiguity when the descriptor's field count is known. -/
 def parseCompositeText (source : String) : Except String CompositeTextFields :=
   match Pg.trimAsciiChars source.toList with
   | '(' :: rest =>
@@ -114,6 +116,22 @@ def parseCompositeText (source : String) : Except String CompositeTextFields :=
           else
             .error s!"composite: unterminated literal {source}"
   | _ => .error s!"not a composite literal: {source}"
+
+/-- Parse a composite and require exactly the descriptor's number of fields.
+
+The expected arity is needed only to disambiguate `()` and to reject payloads
+whose field count does not match their runtime-resolved composite descriptor. -/
+def parseCompositeTextArity (expectedArity : Nat) (source : String) :
+    Except String CompositeTextFields := do
+  let fields ← parseCompositeText source
+  let fields :=
+    if expectedArity == 0 && Pg.trimAsciiChars source.toList == ['(', ')'] then
+      #[]
+    else
+      fields
+  unless fields.size == expectedArity do
+    throw s!"composite: expected {expectedArity} fields, got {fields.size} in {source}"
+  pure fields
 
 private def escapeCompositeField : List Char → List Char
   | [] => []
@@ -131,7 +149,8 @@ private def renderCompositeField : Option String → String
 /-- Render raw composite fields in a canonical, lossless text form.
 
 Every present field is quoted.  This intentionally avoids relying on the
-lexical rules of the field's concrete PostgreSQL type. -/
+lexical rules of the field's concrete PostgreSQL type.  Use
+`parseCompositeTextArity` for a total round trip, including zero-field values. -/
 def renderCompositeText (fields : CompositeTextFields) : String :=
   "(" ++ String.intercalate "," (fields.toList.map renderCompositeField) ++ ")"
 
