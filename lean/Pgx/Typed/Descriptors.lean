@@ -1,4 +1,5 @@
 import Pgx.IR
+import Pgx.Constraint.Semantics
 import Pg
 
 /-!
@@ -17,6 +18,7 @@ inductive Error where
   | schemaDrift (message : String)
   | queryDrift (message : String)
   | unsupportedType (key : Pgx.TypeKey)
+  | constraintViolation (violation : Pgx.ConstraintViolation)
   | encode (message : String)
   | decode (message : String)
   | cardinality (expected actual : String)
@@ -29,6 +31,7 @@ def toMessage : Error → String
   | .schemaDrift message => s!"schema drift: {message}"
   | .queryDrift message => s!"query drift: {message}"
   | .unsupportedType key => s!"unsupported PostgreSQL type: {key}"
+  | .constraintViolation violation => s!"local constraint violation: {violation}"
   | .encode message => s!"parameter encoding failed: {message}"
   | .decode message => s!"row decoding failed: {message}"
   | .cardinality expected actual =>

@@ -22,6 +22,34 @@ private def isError : Except Error α → Bool
 
 private def relation : Pgx.RelationKey := { schema := "app", name := "users" }
 
+private def textType : Pgx.TypeRef := {
+  key := { schema := "pg_catalog", name := "text", kind := .base }
+}
+
+private def intType : Pgx.TypeRef := {
+  key := { schema := "pg_catalog", name := "int4", kind := .base }
+}
+
+private def trimmedKey : Pgx.TypeKey := {
+  schema := "app", name := "trimmed_text", kind := .domain
+}
+
+private def emailKey : Pgx.TypeKey := {
+  schema := "app", name := "email_address", kind := .domain
+}
+
+private def domainMetadata : Array Pgx.DomainIR := #[
+  { key := trimmedKey, base := textType, notNull := false },
+  { key := emailKey, base := { key := trimmedKey }, notNull := true }
+]
+
+private def emailColumn : Pgx.RelationColumnIR := {
+  name := "email"
+  ordinal := 1
+  ty := { key := emailKey }
+  nullable := false
+}
+
 private def commonConstraint : Pgx.ConstraintIR := {
   relation
   name := "users_pkey"
@@ -61,6 +89,16 @@ def main : IO UInt32 := do
   assert! (adapterForServerMajor? 17).map (·.serverMajor) == some 17
   assert! (adapterForServerMajor? 18).map (·.serverMajor) == some 18
   assert! (adapterForServerMajor? 16).isNone
+  match logicalTypeForDirectProjection domainMetadata "GetUser" "email"
+      emailColumn textType with
+  | .ok logical => assert! logical == some emailColumn.ty
+  | .error error => panic! toString error
+  assert! isError (logicalTypeForDirectProjection domainMetadata "GetUser" "email"
+    emailColumn intType)
+  match logicalTypeForDirectProjection domainMetadata "GetUser" "age"
+      { emailColumn with name := "age", ty := intType } intType with
+  | .ok logical => assert! logical.isNone
+  | .error error => panic! toString error
   assert! !Pg17.adapter.supportsNativeNotNull
   assert! Pg18.adapter.supportsNativeNotNull
   assert! !Pg17.adapter.constraintTypeTags.contains "n"

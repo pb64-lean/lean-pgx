@@ -18,9 +18,28 @@ lean_library(
 )
 
 lean_library(
+    name = "constraint_parser",
+    srcs = ["ConstraintParser.lean"],
+    deps = [
+        "//lean/Pgx/Constraint:ir",
+        "//lean/Pgx:ir",
+    ],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
+    name = "projection",
+    srcs = ["Projection.lean"],
+    deps = ["//lean/Pgx:ir"],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
     name = "probe",
     srcs = ["Probe.lean"],
     deps = [
+        ":constraint_parser",
+        ":projection",
         "//lean/Pgx/Codegen/Probe:pg17",
         "//lean/Pgx/Codegen/Probe:pg18",
         "//lean/Pgx:type_mapping",

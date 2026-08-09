@@ -26,6 +26,32 @@ private def status : TypeRef := {
 
 private def relationKey : RelationKey := { schema := "app", name := "users" }
 
+private def positiveId : TypeRef := {
+  key := { schema := "app", name := "positive_id", kind := .domain }
+}
+
+private def int4Scalar : Constraint.ScalarType := {
+  declared := int4
+  base := .int32
+}
+
+private def idPositive : Constraint.TruthExpr :=
+  .compare .gt
+    (.column "id" int4Scalar false)
+    (.literal (.integer 0) int4Scalar)
+
+private def valuePositive : Constraint.TruthExpr :=
+  .compare .gt
+    (.domainValue int4Scalar false)
+    (.literal (.integer 0) int4Scalar)
+
+private def localQueryConstraint : QueryConstraintIR := {
+  relation := relationKey
+  name := "users_id_positive"
+  source := "CHECK (id > 0)"
+  expression := idPositive
+}
+
 private def collation : CollationKey := { schema := "pg_catalog", name := "default" }
 
 private def sampleDatabase : DatabaseIR := {
@@ -49,6 +75,11 @@ private def sampleDatabase : DatabaseIR := {
     notNull := true
     defaultExpr := some "1"
     constraints := #["VALUE > 0"]
+    localConstraints := #[{
+      name := "positive_id_check"
+      source := "CHECK (VALUE > 0)"
+      expression := valuePositive
+    }]
   }]
   relations := #[{
     key := relationKey
@@ -69,6 +100,13 @@ private def sampleDatabase : DatabaseIR := {
     kind := .primaryKey
     columns := #["id"]
     validated := true
+  }, {
+    relation := relationKey
+    name := "users_id_positive"
+    kind := .check
+    columns := #["id"]
+    expression := some "CHECK (id > 0)"
+    localExpression := some idPositive
   }]
   indexes := #[{
     relation := relationKey
@@ -91,10 +129,12 @@ private def sampleDatabase : DatabaseIR := {
     columns := #[{
       name := "id"
       ty := int4
+      logicalType := some positiveId
       nullable := false
       origin := some { relation := relationKey, name := "id" }
       collation := some collation
     }]
+    localConstraints := #[localQueryConstraint]
     cardinality := .zeroOrOne
   }]
   requiredExtensions := #[("citext", "1.6")]
@@ -148,13 +188,18 @@ def main : IO UInt32 := do
   assert! roundTrips collation
   assert! roundTrips sampleDatabase.schemas[0]!
   assert! roundTrips sampleDatabase.enums[0]!
+  assert! roundTrips int4Scalar
+  assert! roundTrips idPositive
+  assert! roundTrips sampleDatabase.domains[0]!.localConstraints[0]!
   assert! roundTrips sampleDatabase.domains[0]!
   assert! roundTrips sampleDatabase.relations[0]!.columns[0]!
   assert! roundTrips sampleDatabase.relations[0]!
   assert! roundTrips sampleDatabase.constraints[0]!
+  assert! roundTrips sampleDatabase.constraints[1]!
   assert! roundTrips sampleDatabase.indexes[0]!
   assert! roundTrips sampleDatabase.queries[0]!.params[0]!
   assert! roundTrips sampleDatabase.queries[0]!.columns[0]!
+  assert! roundTrips sampleDatabase.queries[0]!.localConstraints[0]!
   assert! roundTrips sampleDatabase.queries[0]!
   assert! roundTrips sampleDatabase.session
   assert! roundTrips sampleDatabase.typeOverrides[0]!
@@ -173,6 +218,8 @@ def main : IO UInt32 := do
   let snapshot := sampleDatabase.renderSnapshot
   assert! snapshot == sampleDatabase.renderSnapshot
   assert! snapshot.contains "\"supportedServerMajors\""
+  assert! snapshot.contains "\"logicalType\""
+  assert! snapshot.contains "\"localConstraints\""
   assert! match DatabaseIR.parseSnapshot snapshot with
     | .ok decoded => decoded == sampleDatabase.normalize
     | .error _ => false
@@ -190,7 +237,7 @@ def main : IO UInt32 := do
   }
   assert! reversed.renderSnapshot == sampleDatabase.renderSnapshot
   assert! isError (DatabaseIR.parseSnapshot
-    (snapshot.replace "\"formatVersion\": 1" "\"formatVersion\": 2"))
+    (snapshot.replace "\"formatVersion\": 2" "\"formatVersion\": 99"))
 
   let manifest ← match Pgx.Codegen.Manifest.parse validManifest with
     | .ok manifest => pure manifest

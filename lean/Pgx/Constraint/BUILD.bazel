@@ -1,18 +1,19 @@
-"""Serialization support for the canonical PostgreSQL IR."""
+"""Typed local PostgreSQL constraint IR."""
 
 load("@rules_lean//lean:defs.bzl", "lean_library")
 
 package(default_visibility = ["//visibility:public"])
 
 lean_library(
-    name = "core",
-    srcs = ["Core.lean"],
+    name = "ir",
+    srcs = ["IR.lean"],
+    deps = ["//lean/Pgx/IR:core"],
     strip_module_prefix = "lean",
 )
 
 lean_library(
-    name = "json",
-    srcs = ["Json.lean"],
-    deps = ["//lean/Pgx:ir"],
+    name = "semantics",
+    srcs = ["Semantics.lean"],
+    deps = [":ir"],
     strip_module_prefix = "lean",
 )

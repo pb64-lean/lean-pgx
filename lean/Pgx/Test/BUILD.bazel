@@ -43,3 +43,24 @@ lean_test(
     deps = ["//lean/Pgx/IR:json"],
     strip_module_prefix = "lean",
 )
+
+lean_test(
+    name = "constraint_parser_test",
+    srcs = ["ConstraintParser.lean"],
+    deps = ["//lean/Pgx/Codegen:constraint_parser"],
+    strip_module_prefix = "lean",
+)
+
+lean_test(
+    name = "constraint_semantics_test",
+    srcs = ["ConstraintSemantics.lean"],
+    deps = ["//lean/Pgx/Constraint:semantics"],
+    strip_module_prefix = "lean",
+)
+
+lean_test(
+    name = "projection_test",
+    srcs = ["Projection.lean"],
+    deps = ["//lean/Pgx/Codegen:projection"],
+    strip_module_prefix = "lean",
+)

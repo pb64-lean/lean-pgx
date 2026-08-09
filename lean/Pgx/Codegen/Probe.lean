@@ -1,4 +1,6 @@
 import Pgx.TypeMapping
+import Pgx.Codegen.ConstraintParser
+import Pgx.Codegen.Projection
 import Pgx.Codegen.Probe.Pg17
 import Pgx.Codegen.Probe.Pg18
 import Pg.Connection
@@ -64,6 +66,8 @@ inductive Error where
   | catalog (message : String)
   | invalidQuery (query : String) (message : String)
   | unsupportedType (context : String) (key : Pgx.TypeKey)
+  | unsupportedConstraint (owner name source : String)
+      (diagnostic : Pgx.Constraint.Diagnostic)
   deriving Repr
 
 namespace Error
@@ -75,6 +79,9 @@ def toMessage : Error → String
   | .invalidQuery query message => s!"query {query}: {message}"
   | .unsupportedType context key =>
       s!"{context}: unsupported PostgreSQL type {key}"
+  | .unsupportedConstraint owner name source diagnostic =>
+      s!"constraint {owner}.{name}: category={diagnostic.category.tag}, \
+        offset={diagnostic.offset}: {diagnostic.message}; source={repr source}"
 
 end Error
 
@@ -382,6 +389,34 @@ private structure CatalogSnapshot where
 private def typeByOid? (types : Array CatalogType) (oid : UInt32) : Option CatalogType :=
   types.find? (fun value => value.oid == oid)
 
+private partial def unwrapDomainBase (domains : Array Pgx.DomainIR)
+    (context : String) (ref : Pgx.TypeRef) (seen : Array Pgx.TypeKey := #[]) :
+    Except Error Pgx.TypeRef := do
+  unless ref.key.kind == .domain do return ref
+  if seen.contains ref.key then
+    throw (.catalog s!"{context}: domain nesting cycle reaches {ref.key.display}")
+  let some domain := domains.find? (fun domain => domain.key == ref.key)
+    | throw (.catalog s!"{context}: missing metadata for domain {ref.key.display}")
+  unwrapDomainBase domains context domain.base (seen.push ref.key)
+
+/-- Recover the logical domain type of a descriptor-proven identity
+projection. PostgreSQL describes a domain-valued cell using its recursively
+unwrapped wire type. A direct origin with any other wire description is drift,
+not permission to attach the domain brand. -/
+def logicalTypeForDirectProjection (domains : Array Pgx.DomainIR)
+    (queryName resultName : String) (source : Pgx.RelationColumnIR)
+    (wire : Pgx.TypeRef) : Except Error (Option Pgx.TypeRef) := do
+  unless source.ty.key.kind == .domain do return none
+  let context := s!"result column {resultName} of query {queryName}"
+  let base ← unwrapDomainBase domains context source.ty
+  unless base == wire do
+    throw (.invalidQuery queryName
+      s!"direct domain projection {resultName} originates at {source.name} with logical \
+        type {source.ty.key.display}, whose wire type is {base.key.display} \
+        (typmod {repr base.typmod}); PostgreSQL described {wire.key.display} \
+        (typmod {repr wire.typmod})")
+  pure (some source.ty)
+
 private def typeRefByOid (types : Array CatalogType) (context : String)
     (oid : UInt32) (typmod : Option Int32 := none) : Except Error Pgx.TypeRef := do
   let some value := typeByOid? types oid
@@ -508,7 +543,8 @@ private def loadEnums (conn : Pg.Connection) (schemas : Array String)
     pure (.ok enums)
 
 private def loadDomains (conn : Pg.Connection) (schemas : Array String)
-    (types : Array CatalogType) : Async (Except Error (Array Pgx.DomainIR)) := do
+    (types : Array CatalogType) (enums : Array Pgx.EnumIR) :
+    Async (Except Error (Array Pgx.DomainIR)) := do
   let mut domains : Array Pgx.DomainIR := #[]
   for ty in types do
     if ty.key.kind == .domain && schemas.contains ty.key.schema then
@@ -521,7 +557,8 @@ private def loadDomains (conn : Pg.Connection) (schemas : Array String)
         defaultExpr := ty.defaultExpr
       }
   let sql :=
-    "SELECT t.oid::text, pg_catalog.pg_get_constraintdef(c.oid, true) " ++
+    "SELECT t.oid::text, c.conname, " ++
+    "pg_catalog.pg_get_constraintdef(c.oid, true), c.convalidated::text " ++
     "FROM pg_catalog.pg_type AS t " ++
     "JOIN pg_catalog.pg_constraint AS c ON c.contypid = t.oid " ++
     "WHERE c.contype = 'c' " ++
@@ -530,21 +567,36 @@ private def loadDomains (conn : Pg.Connection) (schemas : Array String)
   | .error error => pure (.error error)
   | .ok rows =>
     for row in rows.rows do
-      let parsed : Except Error (UInt32 × String) := do
+      let parsed : Except Error (UInt32 × String × String × Bool) := do
         pure (← parseUInt32 "read domain constraints"
             (← cell "read domain constraints" row 0),
-          ← cell "read domain constraints" row 1)
+          ← cell "read domain constraints" row 1,
+          ← cell "read domain constraints" row 2,
+          ← parseBool "read domain constraints"
+            (← cell "read domain constraints" row 3))
       match parsed with
       | .error error => return .error error
-      | .ok (oid, definition) =>
+      | .ok (oid, name, definition, validated) =>
         let some ty := typeByOid? types oid
           | return .error (.catalog s!"domain constraint refers to missing type OID {oid}")
         if schemas.contains ty.key.schema then
           let some index := domains.findIdx? (fun value => value.key == ty.key)
             | return .error (.catalog s!"constraint refers to non-domain type {ty.key}")
           let value := domains[index]!
+          let typedExpression ← match
+              ConstraintParser.parseDomainCheck value enums domains definition with
+            | .ok parsed => pure parsed.expression
+            | .error diagnostic =>
+                return .error (.unsupportedConstraint ty.key.display name definition diagnostic)
           domains := domains.set! index {
-            value with constraints := value.constraints.push definition
+            value with
+              constraints := value.constraints.push definition
+              localConstraints := value.localConstraints.push {
+                name
+                source := definition
+                expression := typedExpression
+                validated
+              }
           }
     pure (.ok domains)
 
@@ -653,7 +705,9 @@ private def loadRelations (conn : Pg.Connection) (schemas : Array String)
 
 private def loadConstraints (conn : Pg.Connection)
     (adapter : Adapter)
-    (relations : Array CatalogRelation) :
+    (relations : Array CatalogRelation)
+    (enums : Array Pgx.EnumIR)
+    (domains : Array Pgx.DomainIR) :
     Async (Except Error (Array Pgx.ConstraintIR)) := do
   match ← queryOne conn "read pg_constraint" adapter.constraintCatalogSql with
   | .error error => pure (.error error)
@@ -680,8 +734,18 @@ private def loadConstraints (conn : Pg.Connection)
         let expression ← cell? "read pg_constraint" row 7
         let validated ← parseBool "read pg_constraint"
           (← cell "read pg_constraint" row 8)
+        let localExpression ← if kind == .check then
+          let some source := expression
+            | throw (.catalog s!"check constraint {relation}.{name} has no definition")
+          let some catalogRelation := relationByKey? relations relation
+            | throw (.catalog s!"check constraint {relation}.{name} has no relation")
+          match ConstraintParser.parseTableCheck catalogRelation.ir enums domains source with
+          | .ok parsed => pure (some parsed.expression)
+          | .error diagnostic =>
+              throw (.unsupportedConstraint relation.display name source diagnostic)
+        else pure none
         pure { oid, ir := {
-          relation, name, kind, referencedRelation, expression, validated
+          relation, name, kind, referencedRelation, expression, localExpression, validated
         } }
       match parsed with
       | .error error => return .error error
@@ -1019,9 +1083,16 @@ private def analyzePrepared (conn : Pg.Connection) (config : Config)
     let originInfo := relationOrigin? snapshot.relations column.tableOid column.attnum
     let origin := originInfo.map (·.1)
     let sourceColumn := originInfo.map (·.2)
+    let logicalType ← match sourceColumn with
+      | none => pure none
+      | some source =>
+          match logicalTypeForDirectProjection snapshot.domains query.name column.name source ty with
+          | .ok value => pure value
+          | .error error => return .error error
     directColumns := directColumns.push {
       name := column.name
       ty
+      logicalType
       nullable := sourceColumn.map (·.nullable) |>.getD true
       origin
       collation := sourceColumn.bind (·.collation)
@@ -1076,13 +1147,13 @@ private def loadSnapshot (conn : Pg.Connection) (config : Config) :
   let enums ← match ← loadEnums conn config.schemas types with
     | .error error => return .error error
     | .ok value => pure value
-  let domains ← match ← loadDomains conn config.schemas types with
+  let domains ← match ← loadDomains conn config.schemas types enums with
     | .error error => return .error error
     | .ok value => pure value
   let relations ← match ← loadRelations conn config.schemas types with
     | .error error => return .error error
     | .ok value => pure value
-  let constraints ← match ← loadConstraints conn adapter relations with
+  let constraints ← match ← loadConstraints conn adapter relations enums domains with
     | .error error => return .error error
     | .ok value => pure value
   let indexes ← match ← loadIndexes conn relations with
@@ -1132,6 +1203,6 @@ def probeDatabase (conn : Pg.Connection) (config : Config) :
     requiredExtensions := snapshot.extensions
     typeOverrides := config.typeOverrides
   }
-  pure (.ok database.normalize)
+  pure (.ok (Projection.planDatabase database).normalize)
 
 end Pgx.Codegen.Probe

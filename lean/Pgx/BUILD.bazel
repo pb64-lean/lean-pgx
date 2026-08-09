@@ -18,7 +18,11 @@ lean_library(
 lean_library(
     name = "ir",
     srcs = ["IR.lean"],
-    deps = ["@pg_lean//:pg_lean"],
+    deps = [
+        "//lean/Pgx/Constraint:ir",
+        "//lean/Pgx/IR:core",
+        "@pg_lean//:pg_lean",
+    ],
     strip_module_prefix = "lean",
 )
 

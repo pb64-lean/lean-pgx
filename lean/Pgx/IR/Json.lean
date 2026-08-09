@@ -170,13 +170,286 @@ instance : FromJson EnumIR where
       labels := ← requiredField json "labels"
     }
 
+instance : ToJson Constraint.ScalarKind where
+  toJson value := match value with
+    | .boolean => Json.mkObj [("tag", "boolean")]
+    | .int16 => Json.mkObj [("tag", "int16")]
+    | .int32 => Json.mkObj [("tag", "int32")]
+    | .int64 => Json.mkObj [("tag", "int64")]
+    | .numeric => Json.mkObj [("tag", "numeric")]
+    | .text => Json.mkObj [("tag", "text")]
+    | .enumeration key => Json.mkObj [
+        ("tag", "enumeration"),
+        ("key", toJson key)
+      ]
+
+instance : FromJson Constraint.ScalarKind where
+  fromJson? json := do
+    let tag : String ← requiredField json "tag"
+    match tag with
+    | "boolean" => pure .boolean
+    | "int16" => pure .int16
+    | "int32" => pure .int32
+    | "int64" => pure .int64
+    | "numeric" => pure .numeric
+    | "text" => pure .text
+    | "enumeration" => pure (.enumeration (← requiredField json "key"))
+    | _ => throw s!"unsupported constraint scalar kind '{tag}'"
+
+instance : ToJson Constraint.ScalarType where
+  toJson value := Json.mkObj [
+    ("declared", toJson value.declared),
+    ("base", toJson value.base),
+    ("domains", toJson value.domains)
+  ]
+
+instance : FromJson Constraint.ScalarType where
+  fromJson? json := do
+    pure {
+      declared := ← requiredField json "declared"
+      base := ← requiredField json "base"
+      domains := ← optionalField json "domains" #[]
+    }
+
+instance : ToJson Constraint.Literal where
+  toJson value := match value with
+    | .null => Json.mkObj [("tag", "null")]
+    | .boolean value => Json.mkObj [
+        ("tag", "boolean"),
+        ("value", toJson value)
+      ]
+    | .integer value => Json.mkObj [
+        ("tag", "integer"),
+        ("value", toJson value)
+      ]
+    | .numeric value => Json.mkObj [
+        ("tag", "numeric"),
+        ("value", toJson value)
+      ]
+    | .text value => Json.mkObj [
+        ("tag", "text"),
+        ("value", toJson value)
+      ]
+    | .enumeration key label => Json.mkObj [
+        ("tag", "enumeration"),
+        ("key", toJson key),
+        ("label", toJson label)
+      ]
+
+instance : FromJson Constraint.Literal where
+  fromJson? json := do
+    let tag : String ← requiredField json "tag"
+    match tag with
+    | "null" => pure .null
+    | "boolean" => pure (.boolean (← requiredField json "value"))
+    | "integer" => pure (.integer (← requiredField json "value"))
+    | "numeric" => pure (.numeric (← requiredField json "value"))
+    | "text" => pure (.text (← requiredField json "value"))
+    | "enumeration" => pure (.enumeration
+        (← requiredField json "key") (← requiredField json "label"))
+    | _ => throw s!"unsupported constraint literal kind '{tag}'"
+
+instance : ToJson Constraint.CastPreservation where
+  toJson value := Json.str <| match value with
+    | .identity => "identity"
+    | .domain => "domain"
+    | .integerWiden => "integer-widen"
+    | .exactNumeric => "exact-numeric"
+    | .textRepresentation => "text-representation"
+    | .enumLiteral => "enum-literal"
+
+instance : FromJson Constraint.CastPreservation where
+  fromJson? := tagFromJson "constraint cast preservation" fun
+    | "identity" => some .identity
+    | "domain" => some .domain
+    | "integer-widen" => some .integerWiden
+    | "exact-numeric" => some .exactNumeric
+    | "text-representation" => some .textRepresentation
+    | "enum-literal" => some .enumLiteral
+    | _ => none
+
+private partial def constraintValueExprToJson : Constraint.ValueExpr → Json
+  | .column name ty nullable => Json.mkObj [
+      ("tag", "column"), ("name", toJson name), ("type", toJson ty),
+      ("nullable", toJson nullable)
+    ]
+  | .domainValue ty nullable => Json.mkObj [
+      ("tag", "domain-value"), ("type", toJson ty),
+      ("nullable", toJson nullable)
+    ]
+  | .literal value ty => Json.mkObj [
+      ("tag", "literal"), ("literal", toJson value), ("type", toJson ty)
+    ]
+  | .cast preservation value target => Json.mkObj [
+      ("tag", "cast"), ("preservation", toJson preservation),
+      ("value", constraintValueExprToJson value), ("target", toJson target)
+    ]
+  | .neg value result => Json.mkObj [
+      ("tag", "neg"), ("value", constraintValueExprToJson value),
+      ("result", toJson result)
+    ]
+  | .add left right result => Json.mkObj [
+      ("tag", "add"), ("left", constraintValueExprToJson left),
+      ("right", constraintValueExprToJson right), ("result", toJson result)
+    ]
+  | .sub left right result => Json.mkObj [
+      ("tag", "sub"), ("left", constraintValueExprToJson left),
+      ("right", constraintValueExprToJson right), ("result", toJson result)
+    ]
+  | .charLength value result => Json.mkObj [
+      ("tag", "char-length"), ("value", constraintValueExprToJson value),
+      ("result", toJson result)
+    ]
+  | .btrim value result => Json.mkObj [
+      ("tag", "btrim"), ("value", constraintValueExprToJson value),
+      ("result", toJson result)
+    ]
+  | .position substring string result => Json.mkObj [
+      ("tag", "position"), ("substring", constraintValueExprToJson substring),
+      ("string", constraintValueExprToJson string), ("result", toJson result)
+    ]
+
+private partial def constraintValueExprFromJson (json : Json) :
+    Except String Constraint.ValueExpr := do
+  let tag : String ← requiredField json "tag"
+  match tag with
+  | "column" => pure (.column (← requiredField json "name")
+      (← requiredField json "type") (← requiredField json "nullable"))
+  | "domain-value" => pure (.domainValue (← requiredField json "type")
+      (← requiredField json "nullable"))
+  | "literal" => pure (.literal (← requiredField json "literal")
+      (← requiredField json "type"))
+  | "cast" => pure (.cast (← requiredField json "preservation")
+      (← constraintValueExprFromJson (← requiredField json "value"))
+      (← requiredField json "target"))
+  | "neg" => pure (.neg
+      (← constraintValueExprFromJson (← requiredField json "value"))
+      (← requiredField json "result"))
+  | "add" => pure (.add
+      (← constraintValueExprFromJson (← requiredField json "left"))
+      (← constraintValueExprFromJson (← requiredField json "right"))
+      (← requiredField json "result"))
+  | "sub" => pure (.sub
+      (← constraintValueExprFromJson (← requiredField json "left"))
+      (← constraintValueExprFromJson (← requiredField json "right"))
+      (← requiredField json "result"))
+  | "char-length" => pure (.charLength
+      (← constraintValueExprFromJson (← requiredField json "value"))
+      (← requiredField json "result"))
+  | "btrim" => pure (.btrim
+      (← constraintValueExprFromJson (← requiredField json "value"))
+      (← requiredField json "result"))
+  | "position" => pure (.position
+      (← constraintValueExprFromJson (← requiredField json "substring"))
+      (← constraintValueExprFromJson (← requiredField json "string"))
+      (← requiredField json "result"))
+  | _ => throw s!"unsupported constraint value expression '{tag}'"
+
+instance : ToJson Constraint.ValueExpr where
+  toJson := constraintValueExprToJson
+
+instance : FromJson Constraint.ValueExpr where
+  fromJson? := constraintValueExprFromJson
+
+instance : ToJson Constraint.Comparison where
+  toJson value := Json.str <| match value with
+    | .eq => "eq"
+    | .ne => "ne"
+    | .lt => "lt"
+    | .le => "le"
+    | .gt => "gt"
+    | .ge => "ge"
+
+instance : FromJson Constraint.Comparison where
+  fromJson? := tagFromJson "constraint comparison" fun
+    | "eq" => some .eq
+    | "ne" => some .ne
+    | "lt" => some .lt
+    | "le" => some .le
+    | "gt" => some .gt
+    | "ge" => some .ge
+    | _ => none
+
+private partial def constraintTruthExprToJson : Constraint.TruthExpr → Json
+  | .constant value => Json.mkObj [
+      ("tag", "constant"), ("value", toJson value)
+    ]
+  | .fromBoolean value => Json.mkObj [
+      ("tag", "from-boolean"), ("value", toJson value)
+    ]
+  | .compare op left right => Json.mkObj [
+      ("tag", "compare"), ("operator", toJson op),
+      ("left", toJson left), ("right", toJson right)
+    ]
+  | .isNull value => Json.mkObj [
+      ("tag", "is-null"), ("value", toJson value)
+    ]
+  | .isNotNull value => Json.mkObj [
+      ("tag", "is-not-null"), ("value", toJson value)
+    ]
+  | .and left right => Json.mkObj [
+      ("tag", "and"), ("left", constraintTruthExprToJson left),
+      ("right", constraintTruthExprToJson right)
+    ]
+  | .or left right => Json.mkObj [
+      ("tag", "or"), ("left", constraintTruthExprToJson left),
+      ("right", constraintTruthExprToJson right)
+    ]
+  | .not value => Json.mkObj [
+      ("tag", "not"), ("value", constraintTruthExprToJson value)
+    ]
+
+private partial def constraintTruthExprFromJson (json : Json) :
+    Except String Constraint.TruthExpr := do
+  let tag : String ← requiredField json "tag"
+  match tag with
+  | "constant" => pure (.constant (← requiredField json "value"))
+  | "from-boolean" => pure (.fromBoolean (← requiredField json "value"))
+  | "compare" => pure (.compare (← requiredField json "operator")
+      (← requiredField json "left") (← requiredField json "right"))
+  | "is-null" => pure (.isNull (← requiredField json "value"))
+  | "is-not-null" => pure (.isNotNull (← requiredField json "value"))
+  | "and" => pure (.and
+      (← constraintTruthExprFromJson (← requiredField json "left"))
+      (← constraintTruthExprFromJson (← requiredField json "right")))
+  | "or" => pure (.or
+      (← constraintTruthExprFromJson (← requiredField json "left"))
+      (← constraintTruthExprFromJson (← requiredField json "right")))
+  | "not" => pure (.not (← constraintTruthExprFromJson
+      (← requiredField json "value")))
+  | _ => throw s!"unsupported constraint truth expression '{tag}'"
+
+instance : ToJson Constraint.TruthExpr where
+  toJson := constraintTruthExprToJson
+
+instance : FromJson Constraint.TruthExpr where
+  fromJson? := constraintTruthExprFromJson
+
+instance : ToJson DomainConstraintIR where
+  toJson value := Json.mkObj [
+    ("name", toJson value.name),
+    ("source", toJson value.source),
+    ("expression", toJson value.expression),
+    ("validated", toJson value.validated)
+  ]
+
+instance : FromJson DomainConstraintIR where
+  fromJson? json := do
+    pure {
+      name := ← requiredField json "name"
+      source := ← requiredField json "source"
+      expression := ← requiredField json "expression"
+      validated := ← optionalField json "validated" true
+    }
+
 instance : ToJson DomainIR where
   toJson value := Json.mkObj [
     ("key", toJson value.key),
     ("base", toJson value.base),
     ("notNull", toJson value.notNull),
     ("defaultExpr", toJson value.defaultExpr),
-    ("constraints", toJson value.constraints)
+    ("constraints", toJson value.constraints),
+    ("localConstraints", toJson value.localConstraints)
   ]
 
 instance : FromJson DomainIR where
@@ -187,6 +460,7 @@ instance : FromJson DomainIR where
       notNull := ← requiredField json "notNull"
       defaultExpr := ← optionalField json "defaultExpr" none
       constraints := ← optionalField json "constraints" #[]
+      localConstraints := ← optionalField json "localConstraints" #[]
     }
 
 instance : ToJson RelationKind where
@@ -263,6 +537,7 @@ instance : ToJson ConstraintIR where
     ("referencedRelation", toJson value.referencedRelation),
     ("referencedColumns", toJson value.referencedColumns),
     ("expression", toJson value.expression),
+    ("localExpression", toJson value.localExpression),
     ("validated", toJson value.validated)
   ]
 
@@ -276,6 +551,7 @@ instance : FromJson ConstraintIR where
       referencedRelation := ← optionalField json "referencedRelation" none
       referencedColumns := ← optionalField json "referencedColumns" #[]
       expression := ← optionalField json "expression" none
+      localExpression := ← optionalField json "localExpression" none
       validated := ← optionalField json "validated" true
     }
 
@@ -336,6 +612,7 @@ instance : ToJson QueryColumnIR where
   toJson value := Json.mkObj [
     ("name", toJson value.name),
     ("type", toJson value.ty),
+    ("logicalType", toJson value.logicalType),
     ("nullable", toJson value.nullable),
     ("origin", toJson value.origin),
     ("collation", toJson value.collation)
@@ -346,9 +623,29 @@ instance : FromJson QueryColumnIR where
     pure {
       name := ← requiredField json "name"
       ty := ← requiredField json "type"
+      logicalType := ← optionalField json "logicalType" none
       nullable := ← requiredField json "nullable"
       origin := ← optionalField json "origin" none
       collation := ← optionalField json "collation" none
+    }
+
+instance : ToJson QueryConstraintIR where
+  toJson value := Json.mkObj [
+    ("relation", toJson value.relation),
+    ("name", toJson value.name),
+    ("source", toJson value.source),
+    ("expression", toJson value.expression),
+    ("validated", toJson value.validated)
+  ]
+
+instance : FromJson QueryConstraintIR where
+  fromJson? json := do
+    pure {
+      relation := ← requiredField json "relation"
+      name := ← requiredField json "name"
+      source := ← requiredField json "source"
+      expression := ← requiredField json "expression"
+      validated := ← optionalField json "validated" true
     }
 
 instance : ToJson QueryIR where
@@ -358,6 +655,7 @@ instance : ToJson QueryIR where
     ("sqlHash", toJson value.sqlHash),
     ("params", toJson value.params),
     ("columns", toJson value.columns),
+    ("localConstraints", toJson value.localConstraints),
     ("cardinality", toJson value.cardinality)
   ]
 
@@ -369,6 +667,7 @@ instance : FromJson QueryIR where
       sqlHash := ← requiredField json "sqlHash"
       params := ← requiredField json "params"
       columns := ← requiredField json "columns"
+      localConstraints := ← optionalField json "localConstraints" #[]
       cardinality := ← requiredField json "cardinality"
     }
 
@@ -495,7 +794,7 @@ def renderSnapshotCompact (database : DatabaseIR) : String :=
 /-- Decode a snapshot JSON value and reject unsupported format versions. -/
 def parseSnapshotJson (json : Json) : Except String DatabaseIR := do
   let database : DatabaseIR ← fromJson? json
-  if database.formatVersion == 1 then
+  if database.formatVersion == 1 || database.formatVersion == 2 then
     pure database.normalize
   else
     throw s!"unsupported Pgx IR format version {database.formatVersion}"

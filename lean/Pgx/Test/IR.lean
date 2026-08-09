@@ -11,6 +11,28 @@ private def text : TypeRef :=
 private def status : TypeRef :=
   { key := { schema := "app", name := "status", kind := .enum } }
 
+private def positiveId : TypeRef :=
+  { key := { schema := "app", name := "positive_id", kind := .domain } }
+
+private def int4Scalar : Constraint.ScalarType := {
+  declared := int4
+  base := .int32
+}
+
+private def idComparison (op : Constraint.Comparison) (bound : Int) :
+    Constraint.TruthExpr :=
+  .compare op
+    (.column "id" int4Scalar false)
+    (.literal (.integer bound) int4Scalar)
+
+private def queryConstraint (name source : String)
+    (expression : Constraint.TruthExpr) : QueryConstraintIR := {
+  relation := { schema := "app", name := "users" }
+  name
+  source
+  expression
+}
+
 private def sample : DatabaseIR := {
   serverMajor := 18
   supportedServerMajors := #[18, 17]
@@ -31,7 +53,7 @@ private def sample : DatabaseIR := {
     key := { schema := "app", name := "users" }
     kind := .table
     columns := #[
-      { name := "id", ordinal := 1, ty := int4, nullable := false },
+      { name := "id", ordinal := 1, ty := positiveId, nullable := false },
       { name := "status", ordinal := 2, ty := status, nullable := false }
     ]
   }]
@@ -54,6 +76,7 @@ private def sample : DatabaseIR := {
       {
         name := "id"
         ty := int4
+        logicalType := some positiveId
         nullable := false
         origin := some {
           relation := { schema := "app", name := "users" }
@@ -69,6 +92,12 @@ private def sample : DatabaseIR := {
           name := "status"
         }
       }
+    ]
+    localConstraints := #[
+      queryConstraint "users_id_positive" "CHECK (id > 0)"
+        (idComparison .gt 0),
+      queryConstraint "users_id_bounded" "CHECK (id < 2147483647)"
+        (idComparison .lt 2147483647)
     ]
     cardinality := .zeroOrOne
   }]
@@ -152,7 +181,9 @@ private def shuffled (db : DatabaseIR) : DatabaseIR := {
   constraints := db.constraints.reverse
   indexes := db.indexes.reverse
   queries := db.queries.reverse.map fun query =>
-    { query with params := query.params.reverse }
+    { query with
+      params := query.params.reverse
+      localConstraints := query.localConstraints.reverse }
   requiredExtensions := db.requiredExtensions.reverse
   typeOverrides := db.typeOverrides.reverse
 }
@@ -169,6 +200,18 @@ def main : IO UInt32 := do
         { c with nullable := true }) }
   let changed : DatabaseIR := { sample with queries := changedQueries }
   assert! sample.contractHash != changed.contractHash
+  let withoutLogicalType : DatabaseIR := {
+    sample with queries := sample.queries.map fun query => {
+      query with columns := query.columns.map fun column =>
+        { column with logicalType := none }
+    }
+  }
+  assert! sample.contractHash != withoutLogicalType.contractHash
+  let withoutQueryConstraints : DatabaseIR := {
+    sample with queries := sample.queries.map fun query =>
+      { query with localConstraints := #[] }
+  }
+  assert! sample.contractHash != withoutQueryConstraints.contractHash
   let reordered := shuffled shuffledFixture
   assert! shuffledFixture.normalize == reordered.normalize
   assert! shuffledFixture.contractHash == reordered.contractHash

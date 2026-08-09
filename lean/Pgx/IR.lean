@@ -1,3 +1,5 @@
+import Pgx.IR.Core
+import Pgx.Constraint.IR
 import Pg.Crypto.Sha256
 import Pg.Crypto.Hex
 
@@ -11,74 +13,6 @@ do not occur in the structures below.
 
 namespace Pgx
 
-inductive TypeKind where
-  | base
-  | enum
-  | domain
-  | array
-  | range
-  | multirange
-  | composite
-  | pseudo
-  deriving Repr, BEq, DecidableEq, Inhabited
-
-namespace TypeKind
-
-def tag : TypeKind → String
-  | .base => "base"
-  | .enum => "enum"
-  | .domain => "domain"
-  | .array => "array"
-  | .range => "range"
-  | .multirange => "multirange"
-  | .composite => "composite"
-  | .pseudo => "pseudo"
-
-end TypeKind
-
-/-- Stable PostgreSQL type identity.  OIDs are intentionally absent. -/
-structure TypeKey where
-  schema : String
-  name : String
-  kind : TypeKind
-  deriving Repr, BEq, DecidableEq, Inhabited
-
-namespace TypeKey
-
-def display (key : TypeKey) : String := s!"{key.schema}.{key.name} ({key.kind.tag})"
-
-end TypeKey
-
-instance : ToString TypeKey := ⟨TypeKey.display⟩
-
-structure TypeRef where
-  key : TypeKey
-  typmod : Option Int32 := none
-  deriving Repr, BEq, DecidableEq, Inhabited
-
-structure RelationKey where
-  schema : String
-  name : String
-  deriving Repr, BEq, DecidableEq, Inhabited
-
-namespace RelationKey
-
-def display (key : RelationKey) : String := s!"{key.schema}.{key.name}"
-
-end RelationKey
-
-instance : ToString RelationKey := ⟨RelationKey.display⟩
-
-structure ColumnKey where
-  relation : RelationKey
-  name : String
-  deriving Repr, BEq, DecidableEq, Inhabited
-
-structure CollationKey where
-  schema : String
-  name : String
-  deriving Repr, BEq, DecidableEq, Inhabited
-
 structure SchemaIR where
   name : String
   deriving Repr, BEq, DecidableEq, Inhabited
@@ -88,14 +22,26 @@ structure EnumIR where
   labels : Array String
   deriving Repr, BEq, Inhabited
 
-/-- A domain is branded in Milestone 1; its check expressions remain SQL text
-until the local-refinement milestone translates them into propositions. -/
+/-- One locally recheckable domain constraint.  The normalized PostgreSQL
+source is retained for diagnostics; `expression` is the typed, authoritative
+form used to emit a proposition and its proof-producing validator. -/
+structure DomainConstraintIR where
+  name : String
+  source : String
+  expression : Pgx.Constraint.TruthExpr
+  validated : Bool := true
+  deriving Repr, BEq, Inhabited
+
 structure DomainIR where
   key : TypeKey
   base : TypeRef
   notNull : Bool
   defaultExpr : Option String := none
+  /-- Legacy/raw normalized definitions retained for snapshot compatibility
+  and diagnostics while the typed local constraints are populated by the
+  Milestone-2 probe. -/
   constraints : Array String := #[]
+  localConstraints : Array DomainConstraintIR := #[]
   deriving Repr, BEq, Inhabited
 
 inductive RelationKind where
@@ -163,6 +109,9 @@ structure ConstraintIR where
   referencedRelation : Option RelationKey := none
   referencedColumns : Array String := #[]
   expression : Option String := none
+  /-- Typed local expression for `.check`; cross-row and non-check kinds keep
+  this field empty and are never misrepresented as row predicates. -/
+  localExpression : Option Pgx.Constraint.TruthExpr := none
   validated : Bool := true
   deriving Repr, BEq, Inhabited
 
@@ -203,10 +152,24 @@ structure ParamIR where
 
 structure QueryColumnIR where
   name : String
+  /-- PostgreSQL wire type returned by Parse/Describe and checked before
+  decoding. -/
   ty : TypeRef
+  /-- Logical type recovered from a verified direct projection.  `none`
+  means the logical type is exactly `ty`; `some` is decoded from the wire
+  value and then locally validated/refined. -/
+  logicalType : Option TypeRef := none
   nullable : Bool
   origin : Option ColumnKey := none
   collation : Option CollationKey := none
+  deriving Repr, BEq, Inhabited
+
+structure QueryConstraintIR where
+  relation : RelationKey
+  name : String
+  source : String
+  expression : Pgx.Constraint.TruthExpr
+  validated : Bool := true
   deriving Repr, BEq, Inhabited
 
 structure QueryIR where
@@ -215,6 +178,9 @@ structure QueryIR where
   sqlHash : String
   params : Array ParamIR
   columns : Array QueryColumnIR
+  /-- Value-local source-row constraints whose complete identity projections
+  are present in this result contract. -/
+  localConstraints : Array QueryConstraintIR := #[]
   cardinality : Cardinality
   deriving Repr, BEq, Inhabited
 
@@ -237,7 +203,9 @@ structure TypeOverrideIR where
   deriving Repr, BEq, Inhabited
 
 structure DatabaseIR where
-  formatVersion : Nat := 1
+  /-- Version 2 makes executable local-constraint expressions and explicit
+  query refinement plans part of the canonical contract. -/
+  formatVersion : Nat := 2
   serverMajor : Nat
   /-- Server majors which passed the generated contract's compatibility
   checks.  Empty is retained only for snapshots written before this field was
@@ -295,14 +263,97 @@ private def relationAtom (relation : RelationIR) : String :=
 private def enumAtom (value : EnumIR) : String :=
   typeKeyAtom value.key ++ arrayAtom id value.labels
 
+private def scalarKindAtom : Pgx.Constraint.ScalarKind → String
+  | .boolean => "boolean"
+  | .int16 => "int16"
+  | .int32 => "int32"
+  | .int64 => "int64"
+  | .numeric => "numeric"
+  | .text => "text"
+  | .enumeration key => "enumeration" ++ typeKeyAtom key
+
+private def scalarTypeAtom (value : Pgx.Constraint.ScalarType) : String :=
+  typeRefAtom value.declared ++ atom (scalarKindAtom value.base) ++
+    arrayAtom typeKeyAtom value.domains
+
+private def literalAtom : Pgx.Constraint.Literal → String
+  | .null => "null"
+  | .boolean value => "boolean" ++ boolAtom value
+  | .integer value => "integer" ++ atom (toString value)
+  | .numeric value => "numeric" ++ atom value
+  | .text value => "text" ++ atom value
+  | .enumeration key label => "enumeration" ++ typeKeyAtom key ++ atom label
+
+private def castPreservationAtom : Pgx.Constraint.CastPreservation → String
+  | .identity => "identity"
+  | .domain => "domain"
+  | .integerWiden => "integer-widen"
+  | .exactNumeric => "exact-numeric"
+  | .textRepresentation => "text-representation"
+  | .enumLiteral => "enum-literal"
+
+private partial def valueExprAtom : Pgx.Constraint.ValueExpr → String
+  | .column name ty nullable =>
+      "column" ++ atom name ++ scalarTypeAtom ty ++ boolAtom nullable
+  | .domainValue ty nullable =>
+      "domain-value" ++ scalarTypeAtom ty ++ boolAtom nullable
+  | .literal value ty => "literal" ++ literalAtom value ++ scalarTypeAtom ty
+  | .cast preservation value target =>
+      "cast" ++ atom (castPreservationAtom preservation) ++
+        atom (valueExprAtom value) ++ scalarTypeAtom target
+  | .neg value result =>
+      "neg" ++ atom (valueExprAtom value) ++ scalarTypeAtom result
+  | .add left right result =>
+      "add" ++ atom (valueExprAtom left) ++ atom (valueExprAtom right) ++
+        scalarTypeAtom result
+  | .sub left right result =>
+      "sub" ++ atom (valueExprAtom left) ++ atom (valueExprAtom right) ++
+        scalarTypeAtom result
+  | .charLength value result =>
+      "char-length" ++ atom (valueExprAtom value) ++ scalarTypeAtom result
+  | .btrim value result =>
+      "btrim" ++ atom (valueExprAtom value) ++ scalarTypeAtom result
+  | .position substring string result =>
+      "position" ++ atom (valueExprAtom substring) ++ atom (valueExprAtom string) ++
+        scalarTypeAtom result
+
+private def comparisonAtom : Pgx.Constraint.Comparison → String
+  | .eq => "eq"
+  | .ne => "ne"
+  | .lt => "lt"
+  | .le => "le"
+  | .gt => "gt"
+  | .ge => "ge"
+
+private partial def truthExprAtom : Pgx.Constraint.TruthExpr → String
+  | .constant value =>
+      "constant" ++ optionAtom boolAtom value
+  | .fromBoolean value => "from-boolean" ++ atom (valueExprAtom value)
+  | .compare op left right =>
+      "compare" ++ atom (comparisonAtom op) ++ atom (valueExprAtom left) ++
+        atom (valueExprAtom right)
+  | .isNull value => "is-null" ++ atom (valueExprAtom value)
+  | .isNotNull value => "is-not-null" ++ atom (valueExprAtom value)
+  | .and left right =>
+      "and" ++ atom (truthExprAtom left) ++ atom (truthExprAtom right)
+  | .or left right =>
+      "or" ++ atom (truthExprAtom left) ++ atom (truthExprAtom right)
+  | .not value => "not" ++ atom (truthExprAtom value)
+
+private def domainConstraintAtom (value : DomainConstraintIR) : String :=
+  atom value.name ++ atom value.source ++ atom (truthExprAtom value.expression) ++
+    boolAtom value.validated
+
 private def domainAtom (value : DomainIR) : String :=
   typeKeyAtom value.key ++ typeRefAtom value.base ++ boolAtom value.notNull ++
-    optionAtom atom value.defaultExpr ++ arrayAtom id value.constraints
+    optionAtom atom value.defaultExpr ++ arrayAtom id value.constraints ++
+    arrayAtom domainConstraintAtom value.localConstraints
 
 private def constraintAtom (value : ConstraintIR) : String :=
   relationKeyAtom value.relation ++ atom value.name ++ atom value.kind.tag ++
     arrayAtom id value.columns ++ optionAtom relationKeyAtom value.referencedRelation ++
     arrayAtom id value.referencedColumns ++ optionAtom atom value.expression ++
+    optionAtom truthExprAtom value.localExpression ++
     boolAtom value.validated
 
 private def indexAtom (value : IndexIR) : String :=
@@ -315,8 +366,13 @@ private def overrideAtom (value : TypeOverrideIR) : String :=
     optionAtom atom value.importModule
 
 private def queryColumnAtom (column : QueryColumnIR) : String :=
-  atom column.name ++ typeRefAtom column.ty ++ boolAtom column.nullable ++
+  atom column.name ++ typeRefAtom column.ty ++
+    optionAtom typeRefAtom column.logicalType ++ boolAtom column.nullable ++
     optionAtom (fun origin => relationKeyAtom origin.relation ++ atom origin.name) column.origin
+
+private def queryConstraintAtom (constraint : QueryConstraintIR) : String :=
+  relationKeyAtom constraint.relation ++ atom constraint.name ++ atom constraint.source ++
+    atom (truthExprAtom constraint.expression) ++ boolAtom constraint.validated
 
 private def paramAtom (param : ParamIR) : String :=
   atom (toString param.position) ++ atom param.name ++ typeRefAtom param.ty ++
@@ -324,7 +380,8 @@ private def paramAtom (param : ParamIR) : String :=
 
 private def queryAtom (query : QueryIR) : String :=
   atom query.name ++ atom query.sqlHash ++ arrayAtom paramAtom query.params ++
-    arrayAtom queryColumnAtom query.columns ++ atom query.cardinality.tag
+    arrayAtom queryColumnAtom query.columns ++
+    arrayAtom queryConstraintAtom query.localConstraints ++ atom query.cardinality.tag
 
 private def sortByAtom (f : α → String) (values : Array α) : Array α :=
   (values.toList.mergeSort fun left right =>
@@ -355,13 +412,17 @@ private def paramLess (left right : ParamIR) : Bool :=
       | .eq => compare (paramAtom left) (paramAtom right) == Ordering.lt
 
 private def normalizeDomain (domain : DomainIR) : DomainIR :=
-  { domain with constraints := sortByAtom id domain.constraints }
+  { domain with
+    constraints := sortByAtom id domain.constraints
+    localConstraints := sortByAtom domainConstraintAtom domain.localConstraints }
 
 private def normalizeRelation (relation : RelationIR) : RelationIR :=
   { relation with columns := relation.columns.toList.mergeSort relationColumnLess |>.toArray }
 
 private def normalizeQuery (query : QueryIR) : QueryIR :=
-  { query with params := query.params.toList.mergeSort paramLess |>.toArray }
+  { query with
+    params := query.params.toList.mergeSort paramLess |>.toArray
+    localConstraints := sortByAtom queryConstraintAtom query.localConstraints }
 
 /-- Put every unordered IR collection in a stable order before serialization.
 Arrays whose order is part of PostgreSQL semantics (including enum labels,

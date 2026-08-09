@@ -8,6 +8,7 @@ lean_library(
     name = "descriptors",
     srcs = ["Descriptors.lean"],
     deps = [
+        "//lean/Pgx/Constraint:semantics",
         "//lean/Pgx:ir",
         "@pg_lean//:pg_lean",
     ],
