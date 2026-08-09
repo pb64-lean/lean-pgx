@@ -290,6 +290,59 @@ def runListProfiles
         (Array AppDb.Queries.ListUsersWithProfile.Row)) :=
   AppDb.Queries.ListUsersWithProfile.run conn params
 
+/-! Milestone-3 containers, composites, type modifiers, views, and routines. -/
+
+def typeSampleStatuses
+    (params : AppDb.Queries.PutTypeSample.Params) :
+    AppDb.Types.AppUserStatus_2 :=
+  params.statuses
+
+def typeSampleEmails
+    (params : AppDb.Queries.PutTypeSample.Params) :
+    AppDb.Types.AppEmailAddress_2 :=
+  params.emails
+
+def typeSampleCard
+    (params : AppDb.Queries.PutTypeSample.Params) :
+    AppDb.Types.AppContactCard :=
+  params.card
+
+def typeSampleScore
+    (params : AppDb.Queries.PutTypeSample.Params) :
+    AppDb.Types.AppScoreRange :=
+  params.score
+
+def typeSampleScores
+    (params : AppDb.Queries.PutTypeSample.Params) :
+    AppDb.Types.AppScoreMultirange :=
+  params.scores
+
+def typeSampleAmount
+    (row : AppDb.Queries.PutTypeSample.Row) : Pg.PgNumeric :=
+  row.val.amount
+
+def typeSampleObservedAt
+    (row : AppDb.Queries.PutTypeSample.Row) : Std.Time.PlainTime :=
+  row.val.observedAt
+
+def typeSampleCardStatus
+    (card : AppDb.Types.AppContactCard) : Option AppDb.Types.AppUserStatus :=
+  card.status
+
+def summaryViewAmount
+    (row : AppDb.Queries.ListTypeSampleView.Row) : Option Pg.PgNumeric :=
+  row.val.amount
+
+def summaryFunctionAmount
+    (row : AppDb.Queries.CallTypeSampleTvf.Row) : Option Pg.PgNumeric :=
+  row.val.amount
+
+def generatedViews : Array Pgx.ViewIR :=
+  AppDb.Constraints.views
+
+def generatedRoutines : Array Pgx.RoutineIR :=
+  AppDb.Constraints.routines
+
 end AppDb.Consumer
 
 def main : IO UInt32 := pure 0

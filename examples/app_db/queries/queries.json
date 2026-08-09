@@ -1,5 +1,16 @@
 {
   "supportedServerMajors": [17, 18],
+  "call_type_sample_tvf.sql": {
+    "leanName": "CallTypeSampleTvf",
+    "cardinality": "many",
+    "parameters": [
+      {
+        "position": 1,
+        "name": "minimum",
+        "nullable": false
+      }
+    ]
+  },
   "create_user.sql": {
     "leanName": "CreateUser",
     "cardinality": "execute",
@@ -79,5 +90,51 @@
     "leanName": "ListUsersWithProfile",
     "cardinality": "many",
     "parameters": []
+  },
+  "list_type_sample_view.sql": {
+    "leanName": "ListTypeSampleView",
+    "cardinality": "many",
+    "parameters": []
+  },
+  "put_type_sample.sql": {
+    "leanName": "PutTypeSample",
+    "cardinality": "exactlyOne",
+    "parameters": [
+      {
+        "position": 1,
+        "name": "statuses",
+        "nullable": false
+      },
+      {
+        "position": 2,
+        "name": "emails",
+        "nullable": false
+      },
+      {
+        "position": 3,
+        "name": "card",
+        "nullable": false
+      },
+      {
+        "position": 4,
+        "name": "score",
+        "nullable": false
+      },
+      {
+        "position": 5,
+        "name": "scores",
+        "nullable": false
+      },
+      {
+        "position": 6,
+        "name": "amount",
+        "nullable": false
+      },
+      {
+        "position": 7,
+        "name": "observedAt",
+        "nullable": false
+      }
+    ]
   }
 }

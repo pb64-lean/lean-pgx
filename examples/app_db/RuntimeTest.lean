@@ -58,6 +58,16 @@ private def validatedEmail! (context value : String) :
 private def emailBase (email : AppDb.Types.AppEmailAddress) : String :=
   AppDb.Types.AppEmailAddress.toBase email
 
+private def numeric! (context value : String) : Async Pg.PgNumeric :=
+  match Pg.PgNumeric.fromString value with
+  | .ok parsed => pure parsed
+  | .error error => fail s!"{context}: {error}"
+
+private def plainTime! (context value : String) : Async Std.Time.PlainTime :=
+  match Pg.PgDecode.decodeText Pg.Oid.time value with
+  | .ok parsed => pure parsed
+  | .error error => fail s!"{context}: {error}"
+
 private def expectConstraintViolation (context expectedConstraint : String)
     (result : Except Pgx.Typed.Error α) : Async Unit :=
   match result with
@@ -221,6 +231,76 @@ private def exerciseSelfJoinProvenance
   unless mixed.val.leftStatus == .disabled && mixed.val.rightDisplayName.isNone do
     fail "self-join projection decoded unexpected field values"
 
+private def exerciseBroaderTypes
+    (conn : Pgx.Typed.CheckedConnection AppDb.database) : Async Unit := do
+  let primaryEmail ← validatedEmail! "validate composite email" "card@example.com"
+  let secondaryEmail ← validatedEmail! "validate array email" "array@example.com"
+  let statuses : AppDb.Types.AppUserStatus_2 :=
+    #[some .active, none, some .disabled]
+  let emails : AppDb.Types.AppEmailAddress_2 :=
+    #[some primaryEmail, some secondaryEmail]
+  let card : AppDb.Types.AppContactCard := {
+    label := some "quoted, composite \\ value"
+    status := some .active
+    email := some primaryEmail
+  }
+  let score : AppDb.Types.AppScoreRange :=
+    .span (some { value := 10, inclusive := true })
+      (some { value := 20, inclusive := false })
+  let otherScore : AppDb.Types.AppScoreRange :=
+    .span (some { value := 30, inclusive := true })
+      (some { value := 40, inclusive := false })
+  let scores : AppDb.Types.AppScoreMultirange := #[score, otherScore]
+  let amount ← numeric! "parse numeric(6,2) fixture" "1234.50"
+  let observedAt ← plainTime! "parse time(3) fixture" "12:34:56.789"
+
+  let stored ← typed! "PutTypeSample.exactlyOne" (←
+    AppDb.Queries.PutTypeSample.run conn {
+      statuses, emails, card, score, scores, amount, observedAt
+    })
+  unless stored.val.statuses == statuses do
+    fail "enum array did not round-trip, including its NULL element"
+  unless stored.val.emails.map (fun value => value.map emailBase) ==
+      emails.map (fun value => value.map emailBase) do
+    fail "domain array did not round-trip"
+  unless stored.val.card.label == card.label &&
+      stored.val.card.status == card.status &&
+      stored.val.card.email.map emailBase == card.email.map emailBase do
+    fail "composite value did not round-trip"
+  unless stored.val.score == score && stored.val.scores == scores do
+    fail "range or multirange did not round-trip"
+  unless stored.val.amount.toString == "1234.50" &&
+      stored.val.observedAt.toNanoseconds == observedAt.toNanoseconds do
+    fail "numeric/time type-modifier values did not round-trip"
+
+  let summaries ← typed! "ListTypeSampleView.many" (←
+    AppDb.Queries.ListTypeSampleView.run conn {})
+  let some summary := summaries[0]?
+    | fail "generated view query returned no row"
+  unless summaries.size == 1 && summary.val.id == some stored.val.id &&
+      summary.val.statusCount == some 3 &&
+      summary.val.amount.map (·.toString) == some "1234.50" do
+    fail "generated view query returned unexpected metadata-shaped values"
+
+  let minimum ← numeric! "parse TVF minimum" "1000.00"
+  let functionRows ← typed! "CallTypeSampleTvf.many" (←
+    AppDb.Queries.CallTypeSampleTvf.run conn { minimum })
+  let some functionRow := functionRows[0]?
+    | fail "table-valued function query returned no row"
+  unless functionRows.size == 1 &&
+      functionRow.val.id == some stored.val.id &&
+      functionRow.val.statusCount == some 3 do
+    fail "table-valued function query returned unexpected values"
+
+  unless AppDb.Constraints.views.any (fun view =>
+      view.relation == { schema := "app", name := "type_sample_summary" }) do
+    fail "generated metadata omitted the application view"
+  unless AppDb.Constraints.routines.any (fun routine =>
+      routine.key.schema == "app" &&
+      routine.key.name == "list_type_sample_summaries" &&
+      routine.returnsSet && routine.resultColumns.size == 3) do
+    fail "generated metadata omitted the table-valued function shape"
+
 private def exerciseStoredConstraintViolations
     (raw : Pg.Connection)
     (conn : Pgx.Typed.CheckedConnection AppDb.database)
@@ -299,6 +379,7 @@ private def runAcceptance (options : Options) : Async Unit := do
     exerciseGeneratedQueries checked organizationId
     exerciseNullableCheck checked organizationId
     exerciseSelfJoinProvenance checked organizationId
+    exerciseBroaderTypes checked
     exerciseStoredConstraintViolations raw checked organizationId
 
     -- This physical connection is attached before the DDL change, but its

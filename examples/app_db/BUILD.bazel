@@ -15,11 +15,14 @@ pg_query_set(
     name = "queries",
     srcs = [
         "queries/create_user.sql",
+        "queries/call_type_sample_tvf.sql",
         "queries/find_user_by_email.sql",
         "queries/get_user_by_id.sql",
         "queries/list_users.sql",
         "queries/list_users_with_profile.sql",
+        "queries/list_type_sample_view.sql",
         "queries/mix_user_rows.sql",
+        "queries/put_type_sample.sql",
     ],
     manifest = "queries/queries.json",
 )
@@ -31,6 +34,7 @@ lean_pg_library(
         "migrations/0001_schema_and_types.sql",
         "migrations/0002_tables.sql",
         "migrations/0003_indexes.sql",
+        "migrations/0004_broader_types.sql",
     ],
     queries = ":queries",
     schemas = ["app"],
@@ -63,5 +67,13 @@ lean_binary(
 pg_live_test(
     name = "runtime_test",
     database = ":app_db",
+    postgres = "@postgresql_18//:toolchain",
+    runner = ":runtime_test_bin",
+)
+
+pg_live_test(
+    name = "runtime_test_pg17",
+    database = ":app_db",
+    postgres = "@postgresql_17//:toolchain",
     runner = ":runtime_test_bin",
 )
