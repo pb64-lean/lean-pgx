@@ -750,7 +750,10 @@ def lean_pg_library(
         name = name,
         srcs = [":" + srcs_name],
         strip_module_prefix = native.package_name(),
-        deps = ["@lean-pgx//lean:pg_typed"] + (deps or []),
+        deps = [
+            "@lean-pgx//lean:pg_typed",
+            "@lean-pgx//lean/Pgx/Constraint:semantics",
+        ] + (deps or []),
         visibility = visibility,
         **kwargs
     )

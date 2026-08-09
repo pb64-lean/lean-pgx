@@ -1,4 +1,7 @@
+import Pgx.Codegen.ConstraintParser
 import Pgx.Codegen.Identifier
+import Pgx.Codegen.Projection
+import Pgx.Constraint.Semantics
 import Pgx.TypeMapping
 import Pgx.Typed
 
@@ -22,6 +25,7 @@ inductive CodegenError where
   | duplicateRelation (key : Pgx.RelationKey)
   | duplicateQuery (name : String)
   | unsupportedType (key : Pgx.TypeKey) (context : String)
+  | unsupportedConstraint (context reason : String)
   | cyclicDomain (key : Pgx.TypeKey)
   deriving Repr, BEq, Inhabited
 
@@ -36,6 +40,8 @@ def toMessage : CodegenError → String
   | .duplicateQuery name => s!"duplicate generated query name: {name}"
   | .unsupportedType key context =>
       s!"unsupported PostgreSQL type {key} while generating {context}"
+  | .unsupportedConstraint context reason =>
+      s!"unsupported local constraint while generating {context}: {reason}"
   | .cyclicDomain key => s!"cyclic PostgreSQL domain base chain at {key}"
 
 end CodegenError
@@ -49,7 +55,7 @@ structure GeneratedSource where
   contents : String
   deriving Repr, BEq, Inhabited
 
-/-- The fixed Milestone-1 output partition.  Query modules vary only with the
+/-- The fixed generated output partition.  Query modules vary only with the
 declared query inputs; catalog-discovered objects remain in the three fixed
 schema modules. -/
 structure GeneratedSources where
@@ -203,12 +209,89 @@ private def constraintKindExpr : Pgx.ConstraintKind → String
   | .foreignKey => "foreignKey"
   | .exclusion => "exclusion"
 
+private def scalarKindExpr : Pgx.Constraint.ScalarKind → String
+  | .boolean => "Pgx.Constraint.ScalarKind.boolean"
+  | .int16 => "Pgx.Constraint.ScalarKind.int16"
+  | .int32 => "Pgx.Constraint.ScalarKind.int32"
+  | .int64 => "Pgx.Constraint.ScalarKind.int64"
+  | .numeric => "Pgx.Constraint.ScalarKind.numeric"
+  | .text => "Pgx.Constraint.ScalarKind.text"
+  | .enumeration key =>
+      "Pgx.Constraint.ScalarKind.enumeration (" ++ typeKeyExpr key ++ ")"
+
+private def scalarTypeExpr (ty : Pgx.Constraint.ScalarType) : String :=
+  recordExpr s!"declared := {typeRefExpr ty.declared}, base := {scalarKindExpr ty.base}, domains := {arrayExpr (ty.domains.map typeKeyExpr)}"
+
+private def literalExpr : Pgx.Constraint.Literal → String
+  | .null => "Pgx.Constraint.Literal.null"
+  | .boolean value => s!"Pgx.Constraint.Literal.boolean {boolExpr value}"
+  | .integer value => s!"Pgx.Constraint.Literal.integer ({value})"
+  | .numeric value => s!"Pgx.Constraint.Literal.numeric {stringLiteral value}"
+  | .text value => s!"Pgx.Constraint.Literal.text {stringLiteral value}"
+  | .enumeration key label =>
+      s!"Pgx.Constraint.Literal.enumeration ({typeKeyExpr key}) {stringLiteral label}"
+
+private def castPreservationExpr : Pgx.Constraint.CastPreservation → String
+  | .identity => "identity"
+  | .domain => "domain"
+  | .integerWiden => "integerWiden"
+  | .exactNumeric => "exactNumeric"
+  | .textRepresentation => "textRepresentation"
+  | .enumLiteral => "enumLiteral"
+
+private partial def valueExprExpr : Pgx.Constraint.ValueExpr → String
+  | .column name ty nullable =>
+      s!"Pgx.Constraint.ValueExpr.column {stringLiteral name} ({scalarTypeExpr ty}) {boolExpr nullable}"
+  | .domainValue ty nullable =>
+      s!"Pgx.Constraint.ValueExpr.domainValue ({scalarTypeExpr ty}) {boolExpr nullable}"
+  | .literal value ty =>
+      s!"Pgx.Constraint.ValueExpr.literal ({literalExpr value}) ({scalarTypeExpr ty})"
+  | .cast preservation value target =>
+      s!"Pgx.Constraint.ValueExpr.cast .{castPreservationExpr preservation} ({valueExprExpr value}) ({scalarTypeExpr target})"
+  | .neg value result =>
+      s!"Pgx.Constraint.ValueExpr.neg ({valueExprExpr value}) ({scalarTypeExpr result})"
+  | .add left right result =>
+      s!"Pgx.Constraint.ValueExpr.add ({valueExprExpr left}) ({valueExprExpr right}) ({scalarTypeExpr result})"
+  | .sub left right result =>
+      s!"Pgx.Constraint.ValueExpr.sub ({valueExprExpr left}) ({valueExprExpr right}) ({scalarTypeExpr result})"
+  | .charLength value result =>
+      s!"Pgx.Constraint.ValueExpr.charLength ({valueExprExpr value}) ({scalarTypeExpr result})"
+  | .btrim value result =>
+      s!"Pgx.Constraint.ValueExpr.btrim ({valueExprExpr value}) ({scalarTypeExpr result})"
+  | .position substring string result =>
+      s!"Pgx.Constraint.ValueExpr.position ({valueExprExpr substring}) ({valueExprExpr string}) ({scalarTypeExpr result})"
+
+private def comparisonExprName : Pgx.Constraint.Comparison → String
+  | .eq => "eq"
+  | .ne => "ne"
+  | .lt => "lt"
+  | .le => "le"
+  | .gt => "gt"
+  | .ge => "ge"
+
+private partial def truthExprExpr : Pgx.Constraint.TruthExpr → String
+  | .constant value =>
+      let value := optionExpr (value.map boolExpr)
+      s!"Pgx.Constraint.TruthExpr.constant {value}"
+  | .fromBoolean value =>
+      s!"Pgx.Constraint.TruthExpr.fromBoolean ({valueExprExpr value})"
+  | .compare operator left right =>
+      s!"Pgx.Constraint.TruthExpr.compare .{comparisonExprName operator} ({valueExprExpr left}) ({valueExprExpr right})"
+  | .isNull value => s!"Pgx.Constraint.TruthExpr.isNull ({valueExprExpr value})"
+  | .isNotNull value => s!"Pgx.Constraint.TruthExpr.isNotNull ({valueExprExpr value})"
+  | .and left right =>
+      s!"Pgx.Constraint.TruthExpr.and ({truthExprExpr left}) ({truthExprExpr right})"
+  | .or left right =>
+      s!"Pgx.Constraint.TruthExpr.or ({truthExprExpr left}) ({truthExprExpr right})"
+  | .not value => s!"Pgx.Constraint.TruthExpr.not ({truthExprExpr value})"
+
 private def constraintExpr (constraint : Pgx.ConstraintIR) : String :=
   let columns := arrayExpr (constraint.columns.map stringLiteral)
   let referencedRelation := optionExpr (constraint.referencedRelation.map relationKeyExpr)
   let referencedColumns := arrayExpr (constraint.referencedColumns.map stringLiteral)
   let expression := optionExpr (constraint.expression.map stringLiteral)
-  recordExpr s!"relation := {relationKeyExpr constraint.relation}, name := {stringLiteral constraint.name}, kind := .{constraintKindExpr constraint.kind}, columns := {columns}, referencedRelation := {referencedRelation}, referencedColumns := {referencedColumns}, expression := {expression}, validated := {boolExpr constraint.validated}"
+  let localExpression := optionExpr (constraint.localExpression.map truthExprExpr)
+  recordExpr s!"relation := {relationKeyExpr constraint.relation}, name := {stringLiteral constraint.name}, kind := .{constraintKindExpr constraint.kind}, columns := {columns}, referencedRelation := {referencedRelation}, referencedColumns := {referencedColumns}, expression := {expression}, localExpression := {localExpression}, validated := {boolExpr constraint.validated}"
 
 private def indexExpr (index : Pgx.IndexIR) : String :=
   let columns := arrayExpr (index.columns.map stringLiteral)
@@ -257,6 +340,103 @@ private def checkTypeSupported (db : Pgx.DatabaseIR) (key : Pgx.TypeKey)
     (context : String) : Except CodegenError Unit :=
   checkTypeSupportedAux db key context #[] (db.domains.size + 1)
 
+private def relation? (db : Pgx.DatabaseIR) (key : Pgx.RelationKey) :
+    Option Pgx.RelationIR :=
+  db.relations.find? (fun relation => relation.key == key)
+
+private partial def wireBaseRefAux (db : Pgx.DatabaseIR) (ref : Pgx.TypeRef)
+    (seen : Array Pgx.TypeKey) : Except CodegenError Pgx.TypeRef := do
+  if seen.contains ref.key then throw (.cyclicDomain ref.key)
+  match db.domain? ref.key with
+  | none => pure ref
+  | some domain => wireBaseRefAux db domain.base (seen.push ref.key)
+
+private def wireBaseRef (db : Pgx.DatabaseIR) (ref : Pgx.TypeRef) :
+    Except CodegenError Pgx.TypeRef :=
+  wireBaseRefAux db ref #[]
+
+private def validateRefinementTypmod (db : Pgx.DatabaseIR) (ref : Pgx.TypeRef)
+    (context : String) :
+    Except CodegenError Unit := do
+  if ref.key.schema == "pg_catalog" &&
+      (ref.key.name == "varchar" || ref.key.name == "bpchar") then
+    if ref.typmod.isSome && (db.typeOverride? ref.key).isSome then
+      throw (.unsupportedConstraint context
+        s!"type override {ref.key} has no character-typmod refinement adapter")
+    match Pgx.Constraint.decodeCharacterTypmod ref.typmod with
+    | .ok _ => pure ()
+    | .error error => throw (.malformedIR context (toString error))
+  else if ref.key.schema == "pg_catalog" && ref.key.name == "numeric" &&
+      ref.typmod.isSome then
+    throw (.unsupportedConstraint context
+      (toString (Pgx.Constraint.unsupportedNumericTypmod ref.typmod)))
+
+private def validateDomainConstraints (db : Pgx.DatabaseIR)
+    (domain : Pgx.DomainIR) : Except CodegenError Unit := do
+  if (db.typeOverride? domain.key).isSome &&
+      (domain.notNull || !domain.localConstraints.isEmpty || domain.base.typmod.isSome) then
+    throw (.unsupportedConstraint s!"domain {domain.key}"
+      "a constrained type override requires an explicit refinement adapter")
+  let raw := sortStrings domain.constraints
+  let typed := sortStrings (domain.localConstraints.map (·.source))
+  unless raw == typed do
+    throw (.malformedIR s!"domain {domain.key}"
+      "raw and typed local constraint definitions differ")
+  for constraint in domain.localConstraints do
+    match Pgx.Codegen.ConstraintParser.parseDomainCheck domain db.enums db.domains
+        constraint.source with
+    | .error diagnostic =>
+        throw (.unsupportedConstraint s!"domain {domain.key} constraint {constraint.name}"
+          (toString diagnostic))
+    | .ok parsed =>
+        unless parsed.expression == constraint.expression do
+          throw (.malformedIR s!"domain {domain.key} constraint {constraint.name}"
+            "typed expression differs from reparsing its normalized source")
+
+private def validateRelationConstraints (db : Pgx.DatabaseIR) :
+    Except CodegenError Unit := do
+  for constraint in db.constraints do
+    let some relation := relation? db constraint.relation
+      | throw (.malformedIR s!"constraint {constraint.name}"
+          s!"relation {constraint.relation} is not present")
+    if constraint.kind == .check then
+      let some source := constraint.expression
+        | throw (.malformedIR s!"constraint {constraint.name}"
+            "check has no normalized source expression")
+      let some expression := constraint.localExpression
+        | throw (.malformedIR s!"constraint {constraint.name}"
+            "check has no typed local expression")
+      match Pgx.Codegen.ConstraintParser.parseTableCheck relation db.enums db.domains source with
+      | .error diagnostic =>
+          throw (.unsupportedConstraint s!"constraint {constraint.name}" (toString diagnostic))
+      | .ok parsed =>
+          unless parsed.expression == expression do
+            throw (.malformedIR s!"constraint {constraint.name}"
+              "typed expression differs from reparsing its normalized source")
+    else if constraint.localExpression.isSome then
+      throw (.malformedIR s!"constraint {constraint.name}"
+        "only a row-local check may carry a typed local expression")
+
+private def validateLogicalColumn (db : Pgx.DatabaseIR) (queryName : String)
+    (column : Pgx.QueryColumnIR) : Except CodegenError Unit := do
+  let some logical := column.logicalType | pure ()
+  let some _ := db.domain? logical.key
+    | throw (.malformedIR s!"result {queryName}.{column.name}"
+        "logicalType is not a declared domain")
+  let some origin := column.origin
+    | throw (.malformedIR s!"result {queryName}.{column.name}"
+        "a logical domain requires direct column provenance")
+  let some relation := relation? db origin.relation
+    | throw (.malformedIR s!"result {queryName}.{column.name}"
+        "logical origin relation is not present")
+  let candidates := relation.columns.filter (fun source => source.name == origin.name)
+  unless candidates.size == 1 && candidates[0]!.ty == logical do
+    throw (.malformedIR s!"result {queryName}.{column.name}"
+      "logical type differs from its source relation column")
+  unless (← wireBaseRef db logical) == column.ty do
+    throw (.malformedIR s!"result {queryName}.{column.name}"
+      "wire type differs from the logical domain's fully unwrapped base")
+
 private def validateIR (db : Pgx.DatabaseIR) : Except CodegenError Unit := do
   for value in db.enums do
     unless value.key.kind == .enum do
@@ -266,6 +446,8 @@ private def validateIR (db : Pgx.DatabaseIR) : Except CodegenError Unit := do
   for value in db.domains do
     unless value.key.kind == .domain do
       throw (.malformedIR s!"domain {value.key}" "its TypeKey kind is not domain")
+    validateRefinementTypmod db value.base s!"domain {value.key}"
+    validateDomainConstraints db value
   let declaredTypeKeys := db.enums.map (·.key) ++ db.domains.map (·.key)
   if let some key := firstDuplicate? declaredTypeKeys then throw (.duplicateType key)
   if let some key := firstDuplicate? (db.typeOverrides.map (·.key)) then throw (.duplicateType key)
@@ -278,6 +460,10 @@ private def validateIR (db : Pgx.DatabaseIR) : Except CodegenError Unit := do
       throw (.malformedIR s!"relation {relation.key}" s!"duplicate column {repr name}")
     for column in relation.columns do
       checkTypeSupported db column.ty.key s!"column {relation.key}.{column.name}"
+      let base ← wireBaseRef db column.ty
+      validateRefinementTypmod db base s!"column {relation.key}.{column.name}"
+
+  validateRelationConstraints db
 
   if let some name := firstDuplicate? (db.queries.map (·.name)) then
     throw (.duplicateQuery name)
@@ -304,6 +490,15 @@ private def validateIR (db : Pgx.DatabaseIR) : Except CodegenError Unit := do
       if column.name.isEmpty then
         throw (.malformedIR s!"query {query.name}" "result column name is empty")
       checkTypeSupported db column.ty.key s!"result {query.name}.{column.name}"
+      if let some logical := column.logicalType then
+        checkTypeSupported db logical.key s!"logical result {query.name}.{column.name}"
+      validateLogicalColumn db query.name column
+      let base ← wireBaseRef db (column.logicalType.getD column.ty)
+      validateRefinementTypmod db base s!"result {query.name}.{column.name}"
+    let planned := Pgx.Codegen.Projection.planQuery db.relations db.constraints query
+    unless planned.localConstraints == query.localConstraints do
+      throw (.malformedIR s!"query {query.name}"
+        "local constraints differ from the direct-projection plan")
 
   for value in db.enums do checkTypeSupported db value.key s!"enum {value.key}"
   for value in db.domains do
@@ -434,7 +629,9 @@ private def collectTypeKeys (db : Pgx.DatabaseIR) : Array Pgx.TypeKey := Id.run 
     for column in relation.columns do values := pushUnique values column.ty.key
   for query in db.queries do
     for param in query.params do values := pushUnique values param.ty.key
-    for column in query.columns do values := pushUnique values column.ty.key
+    for column in query.columns do
+      values := pushUnique values column.ty.key
+      if let some logical := column.logicalType then values := pushUnique values logical.key
   return sortTypeKeys values
 
 private def allocatedNames (sources : Array String) (fallback : String) : Array String := Id.run do
@@ -445,6 +642,270 @@ private def allocatedNames (sources : Array String) (fallback : String) : Array 
     scope := next
     names := names.push name
   return names
+
+private structure ExprBinding where
+  sourceName : String
+  access : String
+  declared : Pgx.TypeRef
+  storage : Pgx.TypeRef
+  nullable : Bool
+  deriving Inhabited
+
+private structure ExprScope where
+  columns : Array ExprBinding := #[]
+  domainValue : Option ExprBinding := none
+
+private structure CompiledValue where
+  expression : String
+  semanticType : String
+  scalarType : Pgx.Constraint.ScalarType
+
+private structure GeneratedCheck where
+  name : String
+  evaluate : String
+
+private def semanticTypeName (context : String) : Pgx.Constraint.ScalarType →
+    Except CodegenError String
+  | { base := .boolean, .. } => pure "Bool"
+  | { base := .int16, .. } | { base := .int32, .. } | { base := .int64, .. } =>
+      pure "Int"
+  | { base := .text, .. } | { base := .enumeration _, .. } => pure "String"
+  | { base := .numeric, .. } =>
+      throw (.unsupportedConstraint context
+        "pg_catalog.numeric has no modeled exact local comparison semantics")
+
+private partial def scalarizeStorageAux (plan : NamingPlan) (db : Pgx.DatabaseIR)
+    (ref : Pgx.TypeRef) (expression context : String) (seen : Array Pgx.TypeKey) :
+    Except CodegenError String := do
+  if seen.contains ref.key then throw (.cyclicDomain ref.key)
+  if (db.typeOverride? ref.key).isSome then
+    throw (.unsupportedConstraint context
+      s!"type override {ref.key} has no local-refinement scalar adapter")
+  match db.domain? ref.key with
+  | some domain =>
+      let some named := namedType? plan ref.key
+        | throw (.unsupportedConstraint context
+            s!"domain {ref.key} has no generated local validator")
+      scalarizeStorageAux plan db domain.base
+        s!"{named.leanType}.toBase ({expression})" context (seen.push ref.key)
+  | none =>
+      match db.enum? ref.key with
+      | some _ =>
+          let some named := namedType? plan ref.key
+            | throw (.unsupportedConstraint context
+                s!"enum {ref.key} has no generated label mapping")
+          pure s!"{named.leanType}.toLabel ({expression})"
+      | none =>
+          if ref.key.schema != "pg_catalog" then
+            throw (.unsupportedConstraint context
+              s!"type {ref.key} has no local-refinement scalar adapter")
+          else if ref.key.name == "bool" then pure expression
+          else if ref.key.name == "int2" || ref.key.name == "int4" ||
+              ref.key.name == "int8" then
+            pure s!"({expression}).toInt"
+          else if ref.key.name == "text" || ref.key.name == "varchar" ||
+              ref.key.name == "bpchar" || ref.key.name == "name" ||
+              ref.key.name == "char" then
+            pure expression
+          else
+            throw (.unsupportedConstraint context
+              s!"type {ref.key} has no local-refinement scalar adapter")
+
+private def scalarizeStorage (plan : NamingPlan) (db : Pgx.DatabaseIR)
+    (ref : Pgx.TypeRef) (expression context : String) : Except CodegenError String :=
+  scalarizeStorageAux plan db ref expression context #[]
+
+private def findBinding (scope : ExprScope) (name context : String) :
+    Except CodegenError ExprBinding := do
+  let bindings := scope.columns.filter (fun binding => binding.sourceName == name)
+  unless bindings.size == 1 do
+    throw (.malformedIR context s!"column {repr name} does not resolve uniquely")
+  pure bindings[0]!
+
+private def optionValueExpression (plan : NamingPlan) (db : Pgx.DatabaseIR)
+    (binding : ExprBinding) (semanticType context : String) : Except CodegenError String := do
+  let payload ← scalarizeStorage plan db binding.storage "present" context
+  if binding.nullable then
+    pure s!"({binding.access}).map (fun present => {payload})"
+  else
+    pure s!"(some ({← scalarizeStorage plan db binding.storage binding.access context}) : Option {semanticType})"
+
+private partial def compileValueExpr (plan : NamingPlan) (db : Pgx.DatabaseIR)
+    (scope : ExprScope) (context : String) : Pgx.Constraint.ValueExpr →
+    Except CodegenError CompiledValue
+  | expression@(.column name ty nullable) => do
+      let binding ← findBinding scope name context
+      unless binding.declared == ty.declared && binding.nullable == nullable do
+        throw (.malformedIR context s!"column annotation for {repr name} differs from its field")
+      let semanticType ← semanticTypeName context ty
+      let payload ← optionValueExpression plan db binding semanticType context
+      pure {
+        expression := s!"(.ok ({payload}) : Except Pgx.Constraint.EvaluationError (Option {semanticType}))"
+        semanticType
+        scalarType := expression.type
+      }
+  | expression@(.domainValue ty _) => do
+      let some binding := scope.domainValue
+        | throw (.malformedIR context "VALUE appears outside a domain constraint")
+      unless binding.declared == ty.declared do
+        throw (.malformedIR context "VALUE annotation differs from its domain")
+      let semanticType ← semanticTypeName context ty
+      let payload ← optionValueExpression plan db binding semanticType context
+      pure {
+        expression := s!"(.ok ({payload}) : Except Pgx.Constraint.EvaluationError (Option {semanticType}))"
+        semanticType
+        scalarType := expression.type
+      }
+  | expression@(.literal literal ty) => do
+      let semanticType ← semanticTypeName context ty
+      let payload ← match literal with
+        | .null => pure s!"(none : Option {semanticType})"
+        | .boolean value => pure s!"some ({boolExpr value})"
+        | .integer value => pure s!"some ({value})"
+        | .numeric _ =>
+            throw (.unsupportedConstraint context
+              "pg_catalog.numeric literals have no modeled exact local semantics")
+        | .text value => pure s!"some ({stringLiteral value})"
+        | .enumeration _ label => pure s!"some ({stringLiteral label})"
+      pure {
+        expression := s!"(.ok ({payload}) : Except Pgx.Constraint.EvaluationError (Option {semanticType}))"
+        semanticType
+        scalarType := expression.type
+      }
+  | expression@(.cast preservation value target) => do
+      if preservation == .exactNumeric then
+        throw (.unsupportedConstraint context
+          "exact numeric casts have no modeled local semantics")
+      let compiled ← compileValueExpr plan db scope context value
+      let targetType ← semanticTypeName context target
+      unless compiled.semanticType == targetType do
+        throw (.malformedIR context "preserving cast changes its normalized semantic carrier")
+      pure { compiled with scalarType := expression.type }
+  | .neg .. =>
+      throw (.unsupportedConstraint context
+        "fixed-width unary negation requires modeled PostgreSQL overflow semantics")
+  | .add .. | .sub .. =>
+      throw (.unsupportedConstraint context
+        "fixed-width arithmetic requires modeled PostgreSQL overflow semantics")
+  | expression@(.charLength value _) => do
+      let compiled ← compileValueExpr plan db scope context value
+      unless compiled.semanticType == "String" do
+        throw (.malformedIR context "char_length operand is not text")
+      pure {
+        expression := s!"({compiled.expression}).bind (fun value => Pgx.Constraint.liftNullable (fun present => .ok (Pgx.Constraint.charLength present)) value)"
+        semanticType := "Int"
+        scalarType := expression.type
+      }
+  | expression@(.btrim value _) => do
+      let compiled ← compileValueExpr plan db scope context value
+      unless compiled.semanticType == "String" do
+        throw (.malformedIR context "btrim operand is not text")
+      pure {
+        expression := s!"({compiled.expression}).bind (fun value => Pgx.Constraint.liftNullable (fun present => .ok (Pgx.Constraint.btrim present)) value)"
+        semanticType := "String"
+        scalarType := expression.type
+      }
+  | expression@(.position substring string _) => do
+      let left ← compileValueExpr plan db scope context substring
+      let right ← compileValueExpr plan db scope context string
+      unless left.semanticType == "String" && right.semanticType == "String" do
+        throw (.malformedIR context "position operands are not text")
+      pure {
+        expression := s!"({left.expression}).bind (fun substring => ({right.expression}).bind (fun string => Pgx.Constraint.liftNullable₂ (fun needle haystack => .ok (Pgx.Constraint.position needle haystack)) substring string))"
+        semanticType := "Int"
+        scalarType := expression.type
+      }
+
+private def comparisonName : Pgx.Constraint.Comparison → String
+  | .eq => "eq"
+  | .ne => "ne"
+  | .lt => "lt"
+  | .le => "le"
+  | .gt => "gt"
+  | .ge => "ge"
+
+private partial def compileTruthExpr (plan : NamingPlan) (db : Pgx.DatabaseIR)
+    (scope : ExprScope) (context : String) : Pgx.Constraint.TruthExpr →
+    Except CodegenError String
+  | .constant none => pure "(.ok .unknown)"
+  | .constant (some true) => pure "(.ok .true)"
+  | .constant (some false) => pure "(.ok .false)"
+  | .fromBoolean value => do
+      let compiled ← compileValueExpr plan db scope context value
+      unless compiled.semanticType == "Bool" do
+        throw (.malformedIR context "Boolean truth expression has a non-Boolean carrier")
+      pure s!"({compiled.expression}).map Pgx.Constraint.SqlTruth.ofOptionBool"
+  | .compare operator left right => do
+      let left ← compileValueExpr plan db scope context left
+      let right ← compileValueExpr plan db scope context right
+      unless left.semanticType == right.semanticType do
+        throw (.malformedIR context "comparison operands use different semantic carriers")
+      let body ← match operator with
+        | .eq => pure "Pgx.Constraint.equalNullable left right"
+        | .ne => pure "Pgx.Constraint.notEqualNullable left right"
+        | operator =>
+            unless left.semanticType == "Int" do
+              throw (.unsupportedConstraint context
+                "only fixed-width integer ordering has modeled local semantics")
+            pure s!"Pgx.Constraint.compareNullable .{comparisonName operator} left right"
+      pure s!"({left.expression}).bind (fun left => ({right.expression}).map (fun right => {body}))"
+  | .isNull value => do
+      let compiled ← compileValueExpr plan db scope context value
+      pure s!"({compiled.expression}).map Pgx.Constraint.SqlTruth.isNull"
+  | .isNotNull value => do
+      let compiled ← compileValueExpr plan db scope context value
+      pure s!"({compiled.expression}).map Pgx.Constraint.SqlTruth.isNotNull"
+  | .and left right => do
+      let left ← compileTruthExpr plan db scope context left
+      let right ← compileTruthExpr plan db scope context right
+      pure s!"({left}).bind (fun left => ({right}).map (fun right => left.conjunction right))"
+  | .or left right => do
+      let left ← compileTruthExpr plan db scope context left
+      let right ← compileTruthExpr plan db scope context right
+      pure s!"({left}).bind (fun left => ({right}).map (fun right => left.disjunction right))"
+  | .not value => do
+      let value ← compileTruthExpr plan db scope context value
+      pure s!"({value}).map Pgx.Constraint.SqlTruth.negate"
+
+private def characterTypmodCheck? (ref : Pgx.TypeRef) (access : String)
+    (nullable : Bool) (name : String) : Option GeneratedCheck :=
+  if ref.key.schema == "pg_catalog" &&
+      (ref.key.name == "varchar" || ref.key.name == "bpchar") && ref.typmod.isSome then
+    let value := if nullable then access else s!"some ({access})"
+    some {
+      name
+      evaluate := s!"Pgx.Constraint.evaluateCharacterTypmod ({optionExpr (ref.typmod.map toString)}) ({value})"
+    }
+  else none
+
+private def emitValidator (dataType publicType : String)
+    (checks : Array GeneratedCheck) : List String :=
+  let checkExprs := checks.map fun check =>
+    recordExpr s!"name := {stringLiteral check.name}, evaluate := fun value => {check.evaluate}"
+  [
+    s!"private def checks : List (Pgx.Constraint.Check {dataType}) :=",
+    "  [" ++ commaSep checkExprs ++ "]",
+    "",
+    s!"def ValidPred (value : {dataType}) : Prop :=",
+    "  Pgx.Constraint.Valid checks value",
+    "",
+    s!"instance (value : {dataType}) : Decidable (ValidPred value) :=",
+    "  Pgx.Constraint.validDecidable checks value",
+    "",
+    "abbrev " ++ publicType ++ " := { value : " ++ dataType ++ " // ValidPred value }",
+    "",
+    s!"def validate (value : {dataType}) : Except Pgx.ConstraintViolation {publicType} :=",
+    "  Pgx.Constraint.validate checks value",
+    "",
+    "theorem validate_sound {value : " ++ dataType ++ "} {refined : " ++ publicType ++ "} :",
+    "    validate value = .ok refined → refined.val = value ∧ ValidPred value := by",
+    "  exact Pgx.Constraint.validate_sound checks",
+    "",
+    "theorem validate_complete {value : " ++ dataType ++ "} :",
+    s!"    ValidPred value → ∃ refined : {publicType}, validate value = .ok refined := by",
+    "  exact Pgx.Constraint.validate_complete checks",
+    ""
+  ]
 
 private def rawEncodeBody (use : TypeUse) : List String :=
   match use.codec with
@@ -512,11 +973,36 @@ private def emitDomain (plan : NamingPlan) (db : Pgx.DatabaseIR)
     | throw (.unsupportedType value.key "domain declaration")
   let localName := (named.leanType.splitOn ".").getLast!
   let base ← resolveTypeUse plan db value.base.key
+  let context := s!"domain {value.key}"
+  let scope : ExprScope := {
+    domainValue := some {
+      sourceName := "VALUE"
+      access := "value.toBase"
+      declared := { key := value.key }
+      storage := value.base
+      nullable := false
+    }
+  }
+  let mut checks : Array GeneratedCheck := #[]
+  for constraint in value.localConstraints do
+    checks := checks.push {
+      name := constraint.name
+      evaluate := ← compileTruthExpr plan db scope
+        s!"{context} constraint {constraint.name}" constraint.expression
+    }
+  if let some check := characterTypmodCheck? value.base "value.toBase" false
+      s!"{value.key.display} character type modifier" then
+    checks := checks.push check
   let mut lines := [
-    s!"structure {localName} where",
-    s!"  toBase : {base.leanType}",
-    "",
     s!"namespace {localName}",
+    "",
+    "structure Data where",
+    s!"  toBase : {base.leanType}",
+    ""
+  ]
+  lines := lines ++ emitValidator "Data" "Value" checks
+  lines := lines ++ [
+    s!"def toBase (value : Value) : {base.leanType} := value.val.toBase",
     "",
     "def descriptor : Pgx.Typed.StaticTypeDesc :=",
     s!"  {typeDescExpr db value.key}",
@@ -534,12 +1020,18 @@ private def emitDomain (plan : NamingPlan) (db : Pgx.DatabaseIR)
   lines := lines ++ rawDecodeBody base
   lines := lines ++ [
     "",
-    s!"def codec : Pgx.Typed.ResolvedCodec {localName} where",
+    s!"def codec : Pgx.Typed.ResolvedCodec Value where",
     "  expected := descriptor",
-    "  encode resolved value := encodeBase resolved value.toBase",
-    s!"  decode resolved format value := {localName}.mk <$> decodeBase resolved format value",
+    "  encode resolved value := encodeBase resolved (toBase value)",
+    "  decode resolved format value := do",
+    "    let decoded ← decodeBase resolved format value",
+    "    match validate { toBase := decoded } with",
+    "    | .ok refined => pure refined",
+    "    | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)",
     "",
     s!"end {localName}",
+    "",
+    s!"abbrev {localName} := {localName}.Value",
     ""
   ]
   pure lines
@@ -556,6 +1048,7 @@ private def emitTypes (plan : NamingPlan) (db : Pgx.DatabaseIR) :
   for moduleName in importModules do
     lines := lines ++ ["import " ++ moduleName]
   lines := lines ++ [
+    "import Pgx.Constraint.Semantics",
     "import Pgx.Typed",
     "",
     s!"namespace {plan.modulePrefix}.Types",
@@ -595,15 +1088,41 @@ private def emitRelation (plan : NamingPlan) (db : Pgx.DatabaseIR)
     (relation : Pgx.RelationIR) : Except CodegenError (List String) := do
   let (schemaName, relationName) ← relationNames plan relation.key
   let names := allocatedNames (relation.columns.map (·.name)) "column"
+  let mut bindings : Array ExprBinding := #[]
+  for i in [0:relation.columns.size] do
+    let column := relation.columns[i]!
+    bindings := bindings.push {
+      sourceName := column.name
+      access := s!"value.{names[i]!}"
+      declared := column.ty
+      storage := column.ty
+      nullable := column.nullable
+    }
+  let scope : ExprScope := { columns := bindings }
+  let mut checks : Array GeneratedCheck := #[]
+  for constraint in db.constraints do
+    if constraint.relation == relation.key && constraint.kind == .check then
+      let some expression := constraint.localExpression
+        | throw (.malformedIR s!"constraint {constraint.name}"
+            "validated check has no typed local expression")
+      checks := checks.push {
+        name := constraint.name
+        evaluate := ← compileTruthExpr plan db scope
+          s!"relation {relation.key} constraint {constraint.name}" expression
+      }
+  for i in [0:relation.columns.size] do
+    let column := relation.columns[i]!
+    if let some check := characterTypmodCheck? column.ty s!"value.{names[i]!}"
+        column.nullable s!"{relation.key.display}.{column.name} character type modifier" then
+      checks := checks.push check
   let mut lines := [s!"namespace {plan.modulePrefix}.Schema.{schemaName}.{relationName}", ""]
   lines := lines ++ ["structure Data where"]
   for i in [0:relation.columns.size] do
     let column := relation.columns[i]!
     lines := lines ++ [s!"  {names[i]!} : {← fieldType plan db column.ty column.nullable}"]
+  lines := lines ++ [""]
+  lines := lines ++ emitValidator "Data" "Row" checks
   lines := lines ++ [
-    "",
-    "abbrev Row := Data",
-    "",
     "def descriptor : Pgx.Typed.StaticRelationDesc :=",
     s!"  {staticRelationExpr relation}",
     "",
@@ -684,6 +1203,60 @@ private def decodeValueExpr (plan : NamingPlan) (db : Pgx.DatabaseIR)
   | some codec => pure s!"Pgx.Typed.decodeResolved {codec} {args}"
   | none => pure s!"Pgx.Typed.decodeBuiltin {args}"
 
+private partial def domainChainAux (db : Pgx.DatabaseIR) (key : Pgx.TypeKey)
+    (seen : Array Pgx.TypeKey) : Except CodegenError (Array Pgx.DomainIR) := do
+  if seen.contains key then throw (.cyclicDomain key)
+  let some domain := db.domain? key
+    | throw (.malformedIR s!"logical type {key}" "expected a declared domain")
+  if (db.typeOverride? key).isSome then
+    throw (.unsupportedConstraint s!"logical type {key}"
+      "a type override has no generated proof-producing domain validator")
+  match db.domain? domain.base.key with
+  | none => pure #[domain]
+  | some _ =>
+      pure (#[domain] ++ (← domainChainAux db domain.base.key (seen.push key)))
+
+private def domainChain (db : Pgx.DatabaseIR) (key : Pgx.TypeKey) :
+    Except CodegenError (Array Pgx.DomainIR) :=
+  domainChainAux db key #[]
+
+private def refineDomainExpression (plan : NamingPlan) (db : Pgx.DatabaseIR)
+    (logical : Pgx.TypeRef) (wireValue context : String) : Except CodegenError String := do
+  let chain ← domainChain db logical.key
+  let mut lines : List String := ["(do"]
+  let mut previous := wireValue
+  let mut index := 0
+  for domain in chain.reverse do
+    let some named := namedType? plan domain.key
+      | throw (.unsupportedConstraint context
+          s!"domain {domain.key} has no generated validator")
+    let refined := s!"refined{index}"
+    lines := lines ++ [
+      "  let " ++ refined ++ " ← match " ++ named.leanType ++
+        ".validate { toBase := " ++ previous ++ " } with",
+      "    | .ok accepted => pure accepted",
+      "    | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)"
+    ]
+    previous := refined
+    index := index + 1
+  lines := lines ++ [s!"  pure {previous})"]
+  pure (String.intercalate "\n" lines)
+
+private def refineLogicalColumnExpression (plan : NamingPlan) (db : Pgx.DatabaseIR)
+    (column : Pgx.QueryColumnIR) (wireValue context : String) : Except CodegenError String := do
+  let some logical := column.logicalType | pure wireValue
+  if column.nullable then
+    let refined ← refineDomainExpression plan db logical "present" context
+    pure <| String.intercalate "\n" [
+      "(do",
+      s!"  match {wireValue} with",
+      "  | none => pure none",
+      "  | some present => some <$> " ++ refined,
+      ")"
+    ]
+  else
+    refineDomainExpression plan db logical wireValue context
+
 private def cardinalityName : Pgx.Cardinality → String
   | .execute => "execute"
   | .exactlyOne => "exactlyOne"
@@ -708,6 +1281,31 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
   let paramNames := allocatedNames (query.params.map (·.name)) "param"
   let columnNames := allocatedNames (query.columns.map (·.name)) "column"
   let namespaceName := plan.modulePrefix ++ ".Queries." ++ named.moduleName
+  let mut bindings : Array ExprBinding := #[]
+  for i in [0:query.columns.size] do
+    let column := query.columns[i]!
+    let logical := column.logicalType.getD column.ty
+    bindings := bindings.push {
+      sourceName := column.name
+      access := s!"value.{columnNames[i]!}"
+      declared := logical
+      storage := logical
+      nullable := column.nullable
+    }
+  let scope : ExprScope := { columns := bindings }
+  let mut checks : Array GeneratedCheck := #[]
+  for constraint in query.localConstraints do
+    checks := checks.push {
+      name := constraint.name
+      evaluate := ← compileTruthExpr plan db scope
+        s!"query {query.name} constraint {constraint.name}" constraint.expression
+    }
+  for i in [0:query.columns.size] do
+    let column := query.columns[i]!
+    if column.logicalType.isNone then
+      if let some check := characterTypmodCheck? column.ty s!"value.{columnNames[i]!}"
+          column.nullable s!"query {query.name}.{column.name} character type modifier" then
+        checks := checks.push check
   let mut lines : List String := [
     generatedHeader,
     s!"import {plan.modulePrefix}.Schema",
@@ -719,12 +1317,14 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
   for i in [0:query.params.size] do
     let param := query.params[i]!
     lines := lines ++ [s!"  {paramNames[i]!} : {← fieldType plan db param.ty param.nullable}"]
-  lines := lines ++ ["", "structure Row where"]
+  lines := lines ++ ["", "structure RowData where"]
   for i in [0:query.columns.size] do
     let column := query.columns[i]!
-    lines := lines ++ [s!"  {columnNames[i]!} : {← fieldType plan db column.ty column.nullable}"]
+    let logical := column.logicalType.getD column.ty
+    lines := lines ++ [s!"  {columnNames[i]!} : {← fieldType plan db logical column.nullable}"]
+  lines := lines ++ [""]
+  lines := lines ++ emitValidator "RowData" "Row" checks
   lines := lines ++ [
-    "",
     "private def encodeParams",
     s!"    (catalog : Pgx.Typed.ResolvedCatalog {plan.modulePrefix}.database)",
     "    (params : Params) : Except Pgx.Typed.Error Pgx.Typed.EncodedParams := do",
@@ -754,15 +1354,28 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
   ]
   let mut decodedNames : Array String := #[]
   for i in [0:query.columns.size] do
-    let decodedName := s!"decoded{i}"
-    decodedNames := decodedNames.push decodedName
-    lines := lines ++ [s!"  let {decodedName} ← {← decodeValueExpr plan db query.columns[i]!.ty query.columns[i]!.nullable i}"]
+    let column := query.columns[i]!
+    let wireName := s!"decodedWire{i}"
+    lines := lines ++ [s!"  let {wireName} ← {← decodeValueExpr plan db column.ty column.nullable i}"]
+    match column.logicalType with
+    | none => decodedNames := decodedNames.push wireName
+    | some _ =>
+        let decodedName := s!"decoded{i}"
+        decodedNames := decodedNames.push decodedName
+        let refined ← refineLogicalColumnExpression plan db column wireName
+          s!"query {query.name} result {column.name}"
+        lines := lines ++ [s!"  let {decodedName} ← {refined}"]
   if query.columns.isEmpty then
-    lines := lines ++ ["  pure Row.mk"]
+    lines := lines ++ ["  let rowData : RowData := RowData.mk"]
   else
     let assignments := Array.range query.columns.size |>.map fun i =>
       columnNames[i]! ++ " := " ++ decodedNames[i]!
-    lines := lines ++ ["  pure { " ++ commaSep assignments ++ " }"]
+    lines := lines ++ ["  let rowData : RowData := { " ++ commaSep assignments ++ " }"]
+  lines := lines ++ [
+    "  match validate rowData with",
+    "  | .ok refined => pure refined",
+    "  | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)"
+  ]
   lines := lines ++ [
     "",
     "def spec :",
@@ -797,7 +1410,7 @@ private def emitRoot (plan : NamingPlan) : String :=
     s!"import {plan.modulePrefix}.Queries.{query.moduleName}")
   sourceText ([generatedHeader] ++ imports)
 
-/-- Validate and deterministically emit the complete Milestone-1 API.
+/-- Validate and deterministically emit the complete local-refinement API.
 
 `modulePrefix` is normalized component-by-component to safe Lean module names;
 the normalized value is returned in `GeneratedSources.modulePrefix` so a build

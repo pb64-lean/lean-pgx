@@ -52,7 +52,10 @@ lean_library(
     name = "emit",
     srcs = ["Emit.lean"],
     deps = [
+        ":constraint_parser",
         ":identifier",
+        ":projection",
+        "//lean/Pgx/Constraint:semantics",
         "//lean/Pgx:pg_typed",
         "//lean/Pgx:type_mapping",
     ],
