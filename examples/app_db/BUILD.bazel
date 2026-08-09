@@ -1,4 +1,4 @@
-"""End-to-end Milestone-1 checked-query fixture."""
+"""End-to-end checked-query and local-refinement fixture."""
 
 load(
     "//bazel:defs.bzl",
@@ -19,6 +19,7 @@ pg_query_set(
         "queries/get_user_by_id.sql",
         "queries/list_users.sql",
         "queries/list_users_with_profile.sql",
+        "queries/mix_user_rows.sql",
     ],
     manifest = "queries/queries.json",
 )

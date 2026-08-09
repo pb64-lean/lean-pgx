@@ -59,6 +59,22 @@
       }
     ]
   },
+  "mix_user_rows.sql": {
+    "leanName": "MixUserRows",
+    "cardinality": "exactlyOne",
+    "parameters": [
+      {
+        "position": 1,
+        "name": "leftEmail",
+        "nullable": false
+      },
+      {
+        "position": 2,
+        "name": "rightEmail",
+        "nullable": false
+      }
+    ]
+  },
   "list_users_with_profile.sql": {
     "leanName": "ListUsersWithProfile",
     "cardinality": "many",

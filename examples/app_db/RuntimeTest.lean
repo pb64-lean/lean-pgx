@@ -203,6 +203,24 @@ private def exerciseNullableCheck
       found.val.displayName.isNone do
     fail "nullable CHECK row decoded unexpected field values"
 
+private def exerciseSelfJoinProvenance
+    (conn : Pgx.Typed.CheckedConnection AppDb.database)
+    (organizationId : Int64) : Async Unit := do
+  let leftEmail := "self-join-left@example.com"
+  let rightEmail := "nullable-check@example.com"
+  let refinedEmail ← validatedEmail! "validate self-join email" leftEmail
+  let _ ← typed! "CreateUser.execute for self-join provenance"
+    (← AppDb.Queries.CreateUser.run conn {
+      organizationId
+      email := refinedEmail
+      status := .disabled
+      displayName := some "Disabled User"
+    })
+  let mixed ← typed! "decode self-join fields from distinct source rows"
+    (← AppDb.Queries.MixUserRows.run conn { leftEmail, rightEmail })
+  unless mixed.val.leftStatus == .disabled && mixed.val.rightDisplayName.isNone do
+    fail "self-join projection decoded unexpected field values"
+
 private def exerciseStoredConstraintViolations
     (raw : Pg.Connection)
     (conn : Pgx.Typed.CheckedConnection AppDb.database)
@@ -280,6 +298,7 @@ private def runAcceptance (options : Options) : Async Unit := do
     let organizationId ← insertOrganization raw
     exerciseGeneratedQueries checked organizationId
     exerciseNullableCheck checked organizationId
+    exerciseSelfJoinProvenance checked organizationId
     exerciseStoredConstraintViolations raw checked organizationId
 
     -- This physical connection is attached before the DDL change, but its

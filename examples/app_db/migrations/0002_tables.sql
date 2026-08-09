@@ -42,5 +42,6 @@ CREATE TABLE app.user_profiles (
   CONSTRAINT user_profiles_pkey PRIMARY KEY (user_id),
   CONSTRAINT user_profiles_user_fk FOREIGN KEY (user_id)
     REFERENCES app.users (id) ON DELETE CASCADE,
+  CONSTRAINT user_profiles_avatar_present CHECK (avatar_url IS NOT NULL),
   CONSTRAINT user_profiles_bio_length CHECK (char_length(bio) <= 500)
 );

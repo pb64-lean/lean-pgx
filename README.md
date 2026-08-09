@@ -151,6 +151,21 @@ used to construct the subtype proof. Unique, primary-key uniqueness,
 foreign-key, exclusion, and index properties remain metadata because they are
 not predicates of one value.
 
+The executable subset covers null tests, Boolean connectives, fixed-width
+integer comparisons, Boolean and enum equality, character length, one-argument
+`btrim`, `POSITION`, nested domains, and casts whose modeled values are proved
+unchanged. Generation reports a categorized source-offset diagnostic for
+unsupported constructs. In particular, user-defined functions/operators,
+`NO INHERIT`, `bpchar` check semantics, numeric arithmetic, and casts into a
+constrained or type-modified domain are rejected instead of approximated.
+
+Table checks propagate to a query row only when result descriptors establish
+every referenced identity projection and generic-plan inspection establishes
+exactly one non-outer occurrence of that relation. This prevents synthetic
+outer-join nulls and columns from different self-join aliases from being
+treated as one source row. Domain validation remains value-local, so present
+domain values can still be refined in nullable outer-join results.
+
 The generated runners map cardinality to results as follows:
 
 | Manifest value | Lean result |
