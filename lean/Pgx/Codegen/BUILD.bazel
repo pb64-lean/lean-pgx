@@ -21,6 +21,8 @@ lean_library(
     name = "probe",
     srcs = ["Probe.lean"],
     deps = [
+        "//lean/Pgx/Codegen/Probe:pg17",
+        "//lean/Pgx/Codegen/Probe:pg18",
         "//lean/Pgx:type_mapping",
         "@pg_lean//:pg_lean",
     ],

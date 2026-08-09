@@ -1,0 +1,26 @@
+"""Version-specific PostgreSQL catalog probe adapters."""
+
+load("@rules_lean//lean:defs.bzl", "lean_library")
+
+package(default_visibility = ["//visibility:public"])
+
+lean_library(
+    name = "adapter",
+    srcs = ["Adapter.lean"],
+    deps = ["//lean/Pgx:ir"],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
+    name = "pg17",
+    srcs = ["Pg17.lean"],
+    deps = [":adapter"],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
+    name = "pg18",
+    srcs = ["Pg18.lean"],
+    deps = [":adapter"],
+    strip_module_prefix = "lean",
+)

@@ -1,4 +1,6 @@
 import Pgx.TypeMapping
+import Pgx.Codegen.Probe.Pg17
+import Pgx.Codegen.Probe.Pg18
 import Pg.Connection
 import Lean.Data.Json
 
@@ -49,6 +51,12 @@ def normalizedSupportedServerMajors (config : Config) : Array Nat :=
   config.supportedServerMajors.toList.mergeSort (· < ·) |>.toArray
 
 end Config
+
+/-- Select the catalog adapter from the live server's reported major. -/
+def adapterForServerMajor? : Nat → Option Adapter
+  | 17 => some Pg17.adapter
+  | 18 => some Pg18.adapter
+  | _ => none
 
 inductive Error where
   | invalidConfig (message : String)
@@ -178,13 +186,13 @@ private def parseRelationKind (context : String) : String → Except Error Pgx.R
   | "f" => pure .foreignTable
   | value => throw (.catalog s!"{context}: unknown relation kind {value}")
 
-private def parseConstraintKind (context : String) : String → Except Error Pgx.ConstraintKind
-  | "c" => pure .check
-  | "p" => pure .primaryKey
-  | "u" => pure .unique
-  | "f" => pure .foreignKey
-  | "x" => pure .exclusion
-  | value => throw (.catalog s!"{context}: unknown constraint kind {value}")
+private def parseConstraintKind (adapter : Adapter) (context value : String) :
+    Except Error Pgx.ConstraintKind :=
+  match adapter.constraintKind? value with
+  | some kind => pure kind
+  | none => throw (.catalog
+      s!"{context}: PostgreSQL {adapter.serverMajor} adapter does not support \
+        constraint kind {value}")
 
 private def kindSql (alias : String) : String :=
   s!"CASE WHEN {alias}.typcategory = 'A' AND {alias}.typelem <> 0 THEN 'array' \
@@ -312,6 +320,9 @@ def validateConfig (config : Config) : Except Error Unit := do
     throw (.invalidConfig "supportedServerMajors must not be empty")
   if hasDuplicates config.supportedServerMajors then
     throw (.invalidConfig "supportedServerMajors contains duplicates")
+  for major in config.supportedServerMajors do
+    if (adapterForServerMajor? major).isNone then
+      throw (.invalidConfig s!"PostgreSQL major {major} has no probe adapter")
   if config.requiredExtensions.any isBlank then
     throw (.invalidConfig "required extension names must not be empty")
   if hasDuplicates config.requiredExtensions then
@@ -640,42 +651,11 @@ private def loadRelations (conn : Pg.Connection) (schemas : Array String)
             }
       pure (.ok relations)
 
-private def constraintCatalogSql : String :=
-  "SELECT con.oid::text, ns.nspname, c.relname, con.conname, con.contype::text, " ++
-  "rns.nspname, rc.relname, " ++
-  "CASE WHEN con.contype IN ('c', 'x') " ++
-  "THEN pg_catalog.pg_get_constraintdef(con.oid, true) ELSE NULL END, " ++
-  "con.convalidated::text " ++
-  "FROM pg_catalog.pg_constraint AS con " ++
-  "JOIN pg_catalog.pg_class AS c ON c.oid = con.conrelid " ++
-  "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = c.relnamespace " ++
-  "LEFT JOIN pg_catalog.pg_class AS rc ON rc.oid = NULLIF(con.confrelid, 0) " ++
-  "LEFT JOIN pg_catalog.pg_namespace AS rns ON rns.oid = rc.relnamespace " ++
-  "WHERE con.conrelid <> 0 AND con.contype IN ('c', 'p', 'u', 'f', 'x') " ++
-  "ORDER BY con.oid"
-
-private def constraintColumnSql : String :=
-  "SELECT con.oid::text, false::text, key.ordinality::text, a.attname " ++
-  "FROM pg_catalog.pg_constraint AS con " ++
-  "CROSS JOIN LATERAL pg_catalog.unnest(con.conkey) " ++
-  "WITH ORDINALITY AS key(attnum, ordinality) " ++
-  "JOIN pg_catalog.pg_attribute AS a " ++
-  "ON a.attrelid = con.conrelid AND a.attnum = key.attnum " ++
-  "WHERE con.conrelid <> 0 AND con.contype IN ('c', 'p', 'u', 'f', 'x') " ++
-  "UNION ALL " ++
-  "SELECT con.oid::text, true::text, key.ordinality::text, a.attname " ++
-  "FROM pg_catalog.pg_constraint AS con " ++
-  "CROSS JOIN LATERAL pg_catalog.unnest(con.confkey) " ++
-  "WITH ORDINALITY AS key(attnum, ordinality) " ++
-  "JOIN pg_catalog.pg_attribute AS a " ++
-  "ON a.attrelid = con.confrelid AND a.attnum = key.attnum " ++
-  "WHERE con.conrelid <> 0 AND con.contype = 'f' " ++
-  "ORDER BY 1, 2, 3"
-
 private def loadConstraints (conn : Pg.Connection)
+    (adapter : Adapter)
     (relations : Array CatalogRelation) :
     Async (Except Error (Array Pgx.ConstraintIR)) := do
-  match ← queryOne conn "read pg_constraint" constraintCatalogSql with
+  match ← queryOne conn "read pg_constraint" adapter.constraintCatalogSql with
   | .error error => pure (.error error)
   | .ok rows =>
     let mut constraints : Array CatalogConstraint := #[]
@@ -688,7 +668,7 @@ private def loadConstraints (conn : Pg.Connection)
           name := ← cell "read pg_constraint" row 2
         }
         let name ← cell "read pg_constraint" row 3
-        let kind ← parseConstraintKind "read pg_constraint"
+        let kind ← parseConstraintKind adapter "read pg_constraint"
           (← cell "read pg_constraint" row 4)
         let referencedSchema ← cell? "read pg_constraint" row 5
         let referencedName ← cell? "read pg_constraint" row 6
@@ -708,7 +688,7 @@ private def loadConstraints (conn : Pg.Connection)
       | .ok value =>
         if (relationByKey? relations value.ir.relation).isSome then
           constraints := constraints.push value
-    match ← queryOne conn "read constraint columns" constraintColumnSql with
+    match ← queryOne conn "read constraint columns" adapter.constraintColumnSql with
     | .error error => pure (.error error)
     | .ok columnRows =>
       for row in columnRows.rows do
@@ -731,21 +711,18 @@ private def loadConstraints (conn : Pg.Connection)
             else
               { value.ir with columns := value.ir.columns.push name }
             constraints := constraints.set! index { value with ir }
-      -- PostgreSQL 17 does not expose relation NOT NULL constraints in
-      -- pg_constraint.  Normalize both majors from pg_attribute instead of
-      -- retaining the PostgreSQL-18-only catalog representation.
-      let mut result := constraints.map (·.ir)
+      let mut attributeNotNull : Array AttributeNotNull := #[]
       for relation in relations do
         for index in [:relation.ir.columns.size] do
           if relation.attributeNotNull[index]! then
             let column := relation.ir.columns[index]!
-            result := result.push {
+            attributeNotNull := attributeNotNull.push {
               relation := relation.ir.key
-              name := s!"<not-null:{column.name}>"
-              kind := .notNull
-              columns := #[column.name]
+              column := column.name
             }
-      pure (.ok result)
+      match adapter.normalizeConstraints (constraints.map (·.ir)) attributeNotNull with
+      | .ok result => pure (.ok result)
+      | .error message => pure (.error (.catalog message))
 
 private def indexCatalogSql : String :=
   "SELECT i.indexrelid::text, ns.nspname, c.relname, ic.relname, " ++
@@ -1088,6 +1065,8 @@ private def loadSnapshot (conn : Pg.Connection) (config : Config) :
   unless config.supportedServerMajors.contains serverMajor do
     return .error (.catalog s!"PostgreSQL major {serverMajor} is not in the configured \
       supported set {repr config.supportedServerMajors}")
+  let some adapter := adapterForServerMajor? serverMajor
+    | return .error (.catalog s!"PostgreSQL major {serverMajor} has no probe adapter")
   let schemas ← match ← loadSchemas conn config.schemas with
     | .error error => return .error error
     | .ok value => pure value
@@ -1103,7 +1082,7 @@ private def loadSnapshot (conn : Pg.Connection) (config : Config) :
   let relations ← match ← loadRelations conn config.schemas types with
     | .error error => return .error error
     | .ok value => pure value
-  let constraints ← match ← loadConstraints conn relations with
+  let constraints ← match ← loadConstraints conn adapter relations with
     | .error error => return .error error
     | .ok value => pure value
   let indexes ← match ← loadIndexes conn relations with

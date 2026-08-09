@@ -20,6 +20,27 @@ private def isError : Except Error α → Bool
   | .error _ => true
   | .ok _ => false
 
+private def relation : Pgx.RelationKey := { schema := "app", name := "users" }
+
+private def commonConstraint : Pgx.ConstraintIR := {
+  relation
+  name := "users_pkey"
+  kind := .primaryKey
+  columns := #["id"]
+}
+
+private def nativeNotNull : Pgx.ConstraintIR := {
+  relation
+  name := "users_email_required"
+  kind := .notNull
+  columns := #["email"]
+}
+
+private def attributeNotNull : Array AttributeNotNull := #[
+  { relation, column := "email" },
+  { relation, column := "id" }
+]
+
 private def innerPlan : String :=
   "[{\"Plan\":{\"Node Type\":\"Hash Join\",\"Join Type\":\"Inner\"," ++
   "\"Plans\":[{\"Node Type\":\"Seq Scan\"},{\"Node Type\":\"Hash\"," ++
@@ -37,8 +58,40 @@ private def fullPlan : String :=
 def main : IO UInt32 := do
   assert! (validateConfig validConfig).isOk
   assert! validConfig.normalizedSupportedServerMajors == #[17, 18]
+  assert! (adapterForServerMajor? 17).map (·.serverMajor) == some 17
+  assert! (adapterForServerMajor? 18).map (·.serverMajor) == some 18
+  assert! (adapterForServerMajor? 16).isNone
+  assert! !Pg17.adapter.supportsNativeNotNull
+  assert! Pg18.adapter.supportsNativeNotNull
+  assert! !Pg17.adapter.constraintTypeTags.contains "n"
+  assert! Pg18.adapter.constraintTypeTags.contains "n"
+  let normalized17 := Pg17.adapter.normalizeConstraints
+    #[commonConstraint] attributeNotNull
+  let normalized18 := Pg18.adapter.normalizeConstraints
+    #[commonConstraint, nativeNotNull] attributeNotNull
+  let constraints17 ← match normalized17 with
+    | .error message => panic! message
+    | .ok constraints => pure constraints
+  let constraints18 ← match normalized18 with
+    | .error message => panic! message
+    | .ok constraints => pure constraints
+  assert! constraints17 == constraints18
+  let some email := constraints18.find? fun (constraint : Pgx.ConstraintIR) =>
+      constraint.kind == .notNull && constraint.columns == #["email"]
+    | panic! "normalized email NOT NULL constraint is missing"
+  assert! email.name == "<not-null:email>"
+  match Pg17.adapter.normalizeConstraints
+      #[commonConstraint, nativeNotNull] attributeNotNull with
+  | .error _ => pure ()
+  | .ok _ => panic! "PostgreSQL 17 accepted a native NOT NULL catalog row"
+  match Pg18.adapter.normalizeConstraints #[nativeNotNull] #[] with
+  | .error _ => pure ()
+  | .ok _ => panic! "PostgreSQL 18 accepted a native NOT NULL row missing from pg_attribute"
   assert! isError (validateConfig { validConfig with schemas := #["app", "app"] })
   assert! isError (validateConfig { validConfig with schemas := #[""] })
+  assert! isError (validateConfig {
+    validConfig with supportedServerMajors := #[17, 18, 19]
+  })
   let sparse := validConfig.queries.map fun query => {
     query with parameters := #[
       { position := 1, name := "first", nullable := false },
