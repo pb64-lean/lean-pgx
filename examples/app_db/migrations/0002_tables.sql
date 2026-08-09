@@ -22,7 +22,6 @@ CREATE TABLE app.users (
   CONSTRAINT users_organization_email_key UNIQUE (organization_id, email),
   CONSTRAINT users_organization_fk FOREIGN KEY (organization_id)
     REFERENCES app.organizations (id),
-  CONSTRAINT users_organization_id_positive CHECK (organization_id > 0),
   CONSTRAINT users_disabled_name_required CHECK (
     status <> 'disabled'::app.user_status OR display_name IS NOT NULL
   ),
@@ -30,6 +29,10 @@ CREATE TABLE app.users (
     char_length(btrim(display_name)) > 0
   )
 );
+
+ALTER TABLE app.users
+  ADD CONSTRAINT users_organization_id_positive
+  CHECK (organization_id > 0) NOT VALID;
 
 CREATE TABLE app.user_profiles (
   user_id bigint NOT NULL,

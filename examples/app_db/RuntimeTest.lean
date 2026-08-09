@@ -69,6 +69,13 @@ private def expectConstraintViolation (context expectedConstraint : String)
   | .error error => fail s!"{context}: returned the wrong error: {error}"
   | .ok _ => fail s!"{context}: unexpectedly decoded successfully"
 
+private def verifyGeneratedNotValidMetadata : Async Unit := do
+  let some constraint := AppDb.Constraints.all.find?
+      (fun constraint => constraint.name == "users_organization_id_positive")
+    | fail "generated metadata omitted the NOT VALID table constraint"
+  unless constraint.kind == .check && !constraint.validated do
+    fail "generated metadata did not preserve the NOT VALID table constraint"
+
 private def withConnection (config : Pg.ConnectConfig)
     (body : Pg.Connection → Async α) : Async α := do
   let conn ← Pg.connect config
@@ -200,6 +207,22 @@ private def exerciseStoredConstraintViolations
     (raw : Pg.Connection)
     (conn : Pgx.Typed.CheckedConnection AppDb.database)
     (organizationId : Int64) : Async Unit := do
+  let _ ← pg! "drop NOT VALID CHECK for invalid-row fixture" (← raw.exec
+    "ALTER TABLE app.users DROP CONSTRAINT users_organization_id_positive")
+  let _ ← pg! "insert negative organization key fixture" (← raw.exec
+    "INSERT INTO app.organizations (id, slug, display_name) \
+     OVERRIDING SYSTEM VALUE \
+     VALUES (-1, 'negative-organization', 'Negative Organization')")
+  let _ ← pg! "insert row violating generated NOT VALID CHECK" (← raw.exec
+    "INSERT INTO app.users (organization_id, email, status, display_name) \
+     VALUES (-1, 'invalid-positive@example.com', \
+       'active'::app.user_status, 'Invalid Positive')")
+  expectConstraintViolation "decode row violating generated NOT VALID CHECK"
+    "users_organization_id_positive"
+    (← AppDb.Queries.FindUserByEmail.run conn {
+      email := "invalid-positive@example.com"
+    })
+
   let _ ← pg! "drop table CHECK for invalid-row fixture" (← raw.exec
     "ALTER TABLE app.users DROP CONSTRAINT users_display_name_not_blank")
   let _ ← pg! "insert row violating generated table CHECK" (← raw.exec
@@ -252,6 +275,7 @@ private def runAcceptance (options : Options) : Async Unit := do
   withConnection config fun raw => do
     installOidFillers raw
     replayMigrations raw options.migrations
+    verifyGeneratedNotValidMetadata
     let checked ← attach! "attach generated AppDb" raw
     let organizationId ← insertOrganization raw
     exerciseGeneratedQueries checked organizationId
