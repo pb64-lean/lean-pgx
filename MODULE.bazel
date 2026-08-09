@@ -1,0 +1,47 @@
+"""Bazel module definition for lean-pgx."""
+
+module(
+    name = "lean-pgx",
+    version = "0.1.0",
+    compatibility_level = 1,
+)
+
+# Base Lean build rules.
+bazel_dep(name = "rules_lean", version = "0.1.0")
+local_path_override(
+    module_name = "rules_lean",
+    path = "../rules_lean",
+)
+
+# PostgreSQL client foundation.
+bazel_dep(name = "pg-lean", version = "0.1.0", repo_name = "pg_lean")
+local_path_override(
+    module_name = "pg-lean",
+    path = "../pg-lean",
+)
+
+# pg-lean's sibling override is not inherited by downstream root modules.
+bazel_dep(name = "tls13-lean", version = "0.1.0", repo_name = "tls13_lean")
+local_path_override(
+    module_name = "tls13-lean",
+    path = "../tls13-lean",
+)
+
+# Development-only Lean toolchain; consumers remain free to register theirs.
+lean = use_extension(
+    "@rules_lean//lean:extensions.bzl",
+    "lean",
+    dev_dependency = True,
+)
+lean.nix_toolchain(
+    name = "lean4",
+    attr = "lean4_upstream_std",
+    nix_file = "@rules_lean//:nixpkgs.nix",
+    nix_file_deps = ["@rules_lean//:nixpkgs.json"],
+)
+use_repo(lean, "lean4_toolchain")
+
+register_toolchains(
+    "@lean4_toolchain//:all",
+    dev_dependency = True,
+)

@@ -1,0 +1,12 @@
+"""Primary lean-pgx library target."""
+
+load("@rules_lean//lean:defs.bzl", "lean_library")
+
+package(default_visibility = ["//visibility:public"])
+
+lean_library(
+    name = "pgx",
+    srcs = ["Pgx.lean"],
+    deps = ["//lean/Pgx:core"],
+    strip_module_prefix = "lean",
+)

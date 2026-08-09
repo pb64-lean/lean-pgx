@@ -1,0 +1,7 @@
+"""Root package for lean-pgx."""
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "lean-toolchain",
+])

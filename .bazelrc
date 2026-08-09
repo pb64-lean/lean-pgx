@@ -1,0 +1,10 @@
+try-import %workspace%/.bazelrc.user
+
+common --enable_bzlmod
+common --lockfile_mode=update
+
+# Required by Bazel's host C/C++ toolchain on macOS.
+build --macos_minimum_os=13.0
+build --host_macos_minimum_os=13.0
+
+test --test_output=errors
