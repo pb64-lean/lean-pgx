@@ -49,6 +49,26 @@ private def typed! (context : String) (result : Except Pgx.Typed.Error α) : Asy
   | .ok value => pure value
   | .error error => fail s!"{context}: {error}"
 
+private def validatedEmail! (context value : String) :
+    Async AppDb.Types.AppEmailAddress :=
+  match AppDb.Types.AppEmailAddress.validate { toBase := value } with
+  | .ok refined => pure refined
+  | .error violation => fail s!"{context}: {violation}"
+
+private def emailBase (email : AppDb.Types.AppEmailAddress) : String :=
+  AppDb.Types.AppEmailAddress.toBase email
+
+private def expectConstraintViolation (context expectedConstraint : String)
+    (result : Except Pgx.Typed.Error α) : Async Unit :=
+  match result with
+  | .error (.constraintViolation (.checkFailed constraint)) =>
+    unless constraint == expectedConstraint do
+      fail s!"{context}: expected {expectedConstraint}, got {constraint}"
+  | .error (.constraintViolation violation) =>
+    fail s!"{context}: returned the wrong constraint violation: {violation}"
+  | .error error => fail s!"{context}: returned the wrong error: {error}"
+  | .ok _ => fail s!"{context}: unexpectedly decoded successfully"
+
 private def withConnection (config : Pg.ConnectConfig)
     (body : Pg.Connection → Async α) : Async α := do
   let conn ← Pg.connect config
@@ -99,9 +119,10 @@ private def exerciseGeneratedQueries
     (conn : Pgx.Typed.CheckedConnection AppDb.database)
     (organizationId : Int64) : Async Unit := do
   let email := "runtime@example.com"
+  let refinedEmail ← validatedEmail! "validate CreateUser email" email
   let command ← typed! "CreateUser.execute" (← AppDb.Queries.CreateUser.run conn {
     organizationId
-    email := { toBase := email }
+    email := refinedEmail
     status := .active
     displayName := some "Runtime User"
   })
@@ -115,21 +136,24 @@ private def exerciseGeneratedQueries
     fail s!"ListUsers.many returned {listed.size} rows; expected 1"
   let some listedUser := listed[0]?
     | fail "ListUsers.many returned no first row"
-  unless listedUser.organizationId == organizationId && listedUser.email == email &&
-      listedUser.status == .active && listedUser.displayName == some "Runtime User" do
+  unless listedUser.val.organizationId == organizationId &&
+      emailBase listedUser.val.email == email && listedUser.val.status == .active &&
+      listedUser.val.displayName == some "Runtime User" do
     fail "ListUsers.many decoded unexpected field values"
 
   let found? ← typed! "FindUserByEmail.zeroOrOne"
     (← AppDb.Queries.FindUserByEmail.run conn { email })
   let some found := found?
     | fail "FindUserByEmail.zeroOrOne returned none for the inserted user"
-  unless found.organizationId == organizationId && found.email == email &&
-      found.status == .active && found.displayName == some "Runtime User" do
+  unless found.val.organizationId == organizationId &&
+      emailBase found.val.email == email && found.val.status == .active &&
+      found.val.displayName == some "Runtime User" do
     fail "FindUserByEmail.zeroOrOne decoded unexpected field values"
 
   let exact ← typed! "GetUserById.exactlyOne"
-    (← AppDb.Queries.GetUserById.run conn { id := found.id })
-  unless exact.id == found.id && exact.email == email && exact.status == .active do
+    (← AppDb.Queries.GetUserById.run conn { id := found.val.id })
+  unless exact.val.id == found.val.id && emailBase exact.val.email == email &&
+      exact.val.status == .active do
     fail "GetUserById.exactlyOne decoded unexpected field values"
 
   let joined ← typed! "ListUsersWithProfile.many"
@@ -138,16 +162,75 @@ private def exerciseGeneratedQueries
     fail s!"ListUsersWithProfile.many returned {joined.size} rows; expected 1"
   let some joinedUser := joined[0]?
     | fail "ListUsersWithProfile.many returned no first row"
-  unless joinedUser.userId == some found.id && joinedUser.email == some email &&
-      joinedUser.profileBio.isNone && joinedUser.avatarUrl.isNone do
+  unless joinedUser.val.userId == some found.val.id &&
+      joinedUser.val.email.map emailBase == some email &&
+      joinedUser.val.profileBio.isNone && joinedUser.val.avatarUrl.isNone do
     fail "LEFT JOIN nullable decode produced unexpected field values"
 
-  match ← AppDb.Queries.GetUserById.run conn { id := found.id + 1000000 } with
+  match ← AppDb.Queries.GetUserById.run conn { id := found.val.id + 1000000 } with
   | .error (.cardinality _ _) => pure ()
   | .error error =>
     fail s!"missing exactlyOne row returned the wrong error: {error}"
   | .ok _ =>
     fail "missing exactlyOne row unexpectedly decoded successfully"
+
+private def exerciseNullableCheck
+    (conn : Pgx.Typed.CheckedConnection AppDb.database)
+    (organizationId : Int64) : Async Unit := do
+  let email := "nullable-check@example.com"
+  let refinedEmail ← validatedEmail! "validate nullable-check email" email
+  let command ← typed! "CreateUser.execute with nullable CHECK input"
+    (← AppDb.Queries.CreateUser.run conn {
+      organizationId
+      email := refinedEmail
+      status := .active
+      displayName := none
+    })
+  unless command.tag == "INSERT 0 1" do
+    fail s!"nullable CHECK insert returned unexpected command tag {command.tag}"
+  let found? ← typed! "decode row whose nullable CHECK evaluates to unknown"
+    (← AppDb.Queries.FindUserByEmail.run conn { email })
+  let some found := found?
+    | fail "nullable CHECK row was not returned"
+  unless emailBase found.val.email == email && found.val.status == .active &&
+      found.val.displayName.isNone do
+    fail "nullable CHECK row decoded unexpected field values"
+
+private def exerciseStoredConstraintViolations
+    (raw : Pg.Connection)
+    (conn : Pgx.Typed.CheckedConnection AppDb.database)
+    (organizationId : Int64) : Async Unit := do
+  let _ ← pg! "drop table CHECK for invalid-row fixture" (← raw.exec
+    "ALTER TABLE app.users DROP CONSTRAINT users_display_name_not_blank")
+  let _ ← pg! "insert row violating generated table CHECK" (← raw.exec
+    ("INSERT INTO app.users (organization_id, email, status, display_name) " ++
+     "VALUES (" ++ toString organizationId ++
+     ", 'invalid-row@example.com', 'active'::app.user_status, '   ')"))
+  expectConstraintViolation "decode row violating generated table CHECK"
+    "users_display_name_not_blank"
+    (← AppDb.Queries.FindUserByEmail.run conn { email := "invalid-row@example.com" })
+
+  let _ ← pg! "drop multi-column CHECK for invalid-row fixture" (← raw.exec
+    "ALTER TABLE app.users DROP CONSTRAINT users_disabled_name_required")
+  let _ ← pg! "insert row violating generated multi-column CHECK" (← raw.exec
+    ("INSERT INTO app.users (organization_id, email, status, display_name) " ++
+     "VALUES (" ++ toString organizationId ++
+     ", 'invalid-multicol@example.com', 'disabled'::app.user_status, NULL)"))
+  expectConstraintViolation "decode row violating generated multi-column CHECK"
+    "users_disabled_name_required"
+    (← AppDb.Queries.FindUserByEmail.run conn {
+      email := "invalid-multicol@example.com"
+    })
+
+  let _ ← pg! "drop domain CHECK for invalid-domain fixture" (← raw.exec
+    "ALTER DOMAIN app.email_address DROP CONSTRAINT email_address_shape")
+  let _ ← pg! "insert row violating generated domain CHECK" (← raw.exec
+    ("INSERT INTO app.users (organization_id, email, status, display_name) " ++
+     "VALUES (" ++ toString organizationId ++
+     ", 'x', 'active'::app.user_status, 'Invalid Domain')"))
+  expectConstraintViolation "decode row violating generated domain CHECK"
+    "email_address_shape"
+    (← AppDb.Queries.FindUserByEmail.run conn { email := "x" })
 
 private def expectQueryDrift
     (conn : Pgx.Typed.CheckedConnection AppDb.database) : Async Unit := do
@@ -172,6 +255,8 @@ private def runAcceptance (options : Options) : Async Unit := do
     let checked ← attach! "attach generated AppDb" raw
     let organizationId ← insertOrganization raw
     exerciseGeneratedQueries checked organizationId
+    exerciseNullableCheck checked organizationId
+    exerciseStoredConstraintViolations raw checked organizationId
 
     -- This physical connection is attached before the DDL change, but its
     -- prepared cache is intentionally untouched.  The next generated call
@@ -180,7 +265,7 @@ private def runAcceptance (options : Options) : Async Unit := do
     withConnection config fun driftRaw => do
       let driftChecked ← attach! "attach query-drift connection" driftRaw
       let _ ← pg! "alter selected result column" (← raw.exec
-        "ALTER TABLE app.users ALTER COLUMN display_name TYPE varchar(100)")
+        "ALTER TABLE app.users ALTER COLUMN display_name TYPE varchar(80)")
       expectQueryDrift driftChecked
 
       withConnection config fun freshRaw => do

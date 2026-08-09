@@ -19,19 +19,57 @@ def statusLabel (status : AppDb.Types.AppUserStatus) : String :=
   status.toLabel
 
 def emailBase (email : AppDb.Types.AppEmailAddress) : String :=
-  email.toBase
+  AppDb.Types.AppEmailAddress.toBase email
+
+def validateEmail
+    (value : AppDb.Types.AppEmailAddress.Data) :
+    Except Pgx.ConstraintViolation AppDb.Types.AppEmailAddress :=
+  AppDb.Types.AppEmailAddress.validate value
+
+theorem validateEmailSound
+    {value : AppDb.Types.AppEmailAddress.Data}
+    {refined : AppDb.Types.AppEmailAddress}
+    (accepted : AppDb.Types.AppEmailAddress.validate value = .ok refined) :
+    refined.val = value ∧ AppDb.Types.AppEmailAddress.ValidPred value :=
+  AppDb.Types.AppEmailAddress.validate_sound accepted
+
+theorem validateEmailComplete
+    {value : AppDb.Types.AppEmailAddress.Data}
+    (valid : AppDb.Types.AppEmailAddress.ValidPred value) :
+    ∃ refined : AppDb.Types.AppEmailAddress,
+      AppDb.Types.AppEmailAddress.validate value = .ok refined :=
+  AppDb.Types.AppEmailAddress.validate_complete valid
 
 def schemaUserEmail
     (user : AppDb.Schema.App.Users.Row) : AppDb.Types.AppEmailAddress :=
-  user.email
+  user.val.email
 
 def schemaUserStatus
     (user : AppDb.Schema.App.Users.Row) : AppDb.Types.AppUserStatus :=
-  user.status
+  user.val.status
 
 def schemaUserDisplayName
     (user : AppDb.Schema.App.Users.Row) : Option String :=
-  user.displayName
+  user.val.displayName
+
+def validateSchemaUser
+    (value : AppDb.Schema.App.Users.Data) :
+    Except Pgx.ConstraintViolation AppDb.Schema.App.Users.Row :=
+  AppDb.Schema.App.Users.validate value
+
+theorem validateSchemaUserSound
+    {value : AppDb.Schema.App.Users.Data}
+    {refined : AppDb.Schema.App.Users.Row}
+    (accepted : AppDb.Schema.App.Users.validate value = .ok refined) :
+    refined.val = value ∧ AppDb.Schema.App.Users.ValidPred value :=
+  AppDb.Schema.App.Users.validate_sound accepted
+
+theorem validateSchemaUserComplete
+    {value : AppDb.Schema.App.Users.Data}
+    (valid : AppDb.Schema.App.Users.ValidPred value) :
+    ∃ refined : AppDb.Schema.App.Users.Row,
+      AppDb.Schema.App.Users.validate value = .ok refined :=
+  AppDb.Schema.App.Users.validate_complete valid
 
 /-! `execute`: branded and nullable parameter fields, with no result row. -/
 
@@ -51,8 +89,9 @@ def createDisplayName
     (params : AppDb.Queries.CreateUser.Params) : Option String :=
   params.displayName
 
-def createEmptyRow : AppDb.Queries.CreateUser.Row :=
-  AppDb.Queries.CreateUser.Row.mk
+def createEmptyRow :
+    Except Pgx.ConstraintViolation AppDb.Queries.CreateUser.Row :=
+  AppDb.Queries.CreateUser.validate .mk
 
 def createSpec :
     Pgx.Typed.QuerySpec AppDb.database
@@ -74,25 +113,26 @@ def getUserIdParam
   params.id
 
 def getUserId (row : AppDb.Queries.GetUserById.Row) : Int64 :=
-  row.id
+  row.val.id
 
 def getUserOrganizationId (row : AppDb.Queries.GetUserById.Row) : Int64 :=
-  row.organizationId
+  row.val.organizationId
 
-def getUserEmail (row : AppDb.Queries.GetUserById.Row) : String :=
-  row.email
+def getUserEmail
+    (row : AppDb.Queries.GetUserById.Row) : AppDb.Types.AppEmailAddress :=
+  row.val.email
 
 def getUserStatus
     (row : AppDb.Queries.GetUserById.Row) : AppDb.Types.AppUserStatus :=
-  row.status
+  row.val.status
 
 def getUserDisplayName
     (row : AppDb.Queries.GetUserById.Row) : Option String :=
-  row.displayName
+  row.val.displayName
 
 def getUserCreatedAt
     (row : AppDb.Queries.GetUserById.Row) : Std.Time.Timestamp :=
-  row.createdAt
+  row.val.createdAt
 
 def getUserSpec :
     Pgx.Typed.QuerySpec AppDb.database
@@ -114,26 +154,46 @@ def findUserEmailParam
   params.email
 
 def foundUserId (row : AppDb.Queries.FindUserByEmail.Row) : Int64 :=
-  row.id
+  row.val.id
 
 def foundUserOrganizationId
     (row : AppDb.Queries.FindUserByEmail.Row) : Int64 :=
-  row.organizationId
+  row.val.organizationId
 
-def foundUserEmail (row : AppDb.Queries.FindUserByEmail.Row) : String :=
-  row.email
+def foundUserEmail
+    (row : AppDb.Queries.FindUserByEmail.Row) : AppDb.Types.AppEmailAddress :=
+  row.val.email
 
 def foundUserStatus
     (row : AppDb.Queries.FindUserByEmail.Row) : AppDb.Types.AppUserStatus :=
-  row.status
+  row.val.status
 
 def foundUserDisplayName
     (row : AppDb.Queries.FindUserByEmail.Row) : Option String :=
-  row.displayName
+  row.val.displayName
 
 def foundUserCreatedAt
     (row : AppDb.Queries.FindUserByEmail.Row) : Std.Time.Timestamp :=
-  row.createdAt
+  row.val.createdAt
+
+def validateFoundUser
+    (value : AppDb.Queries.FindUserByEmail.RowData) :
+    Except Pgx.ConstraintViolation AppDb.Queries.FindUserByEmail.Row :=
+  AppDb.Queries.FindUserByEmail.validate value
+
+theorem validateFoundUserSound
+    {value : AppDb.Queries.FindUserByEmail.RowData}
+    {refined : AppDb.Queries.FindUserByEmail.Row}
+    (accepted : AppDb.Queries.FindUserByEmail.validate value = .ok refined) :
+    refined.val = value ∧ AppDb.Queries.FindUserByEmail.ValidPred value :=
+  AppDb.Queries.FindUserByEmail.validate_sound accepted
+
+theorem validateFoundUserComplete
+    {value : AppDb.Queries.FindUserByEmail.RowData}
+    (valid : AppDb.Queries.FindUserByEmail.ValidPred value) :
+    ∃ refined : AppDb.Queries.FindUserByEmail.Row,
+      AppDb.Queries.FindUserByEmail.validate value = .ok refined :=
+  AppDb.Queries.FindUserByEmail.validate_complete valid
 
 def findUserSpec :
     Pgx.Typed.QuerySpec AppDb.database
@@ -157,25 +217,26 @@ def listUsersStatusParam
   params.status
 
 def listedUserId (row : AppDb.Queries.ListUsers.Row) : Int64 :=
-  row.id
+  row.val.id
 
 def listedUserOrganizationId (row : AppDb.Queries.ListUsers.Row) : Int64 :=
-  row.organizationId
+  row.val.organizationId
 
-def listedUserEmail (row : AppDb.Queries.ListUsers.Row) : String :=
-  row.email
+def listedUserEmail
+    (row : AppDb.Queries.ListUsers.Row) : AppDb.Types.AppEmailAddress :=
+  row.val.email
 
 def listedUserStatus
     (row : AppDb.Queries.ListUsers.Row) : AppDb.Types.AppUserStatus :=
-  row.status
+  row.val.status
 
 def listedUserDisplayName
     (row : AppDb.Queries.ListUsers.Row) : Option String :=
-  row.displayName
+  row.val.displayName
 
 def listedUserCreatedAt
     (row : AppDb.Queries.ListUsers.Row) : Std.Time.Timestamp :=
-  row.createdAt
+  row.val.createdAt
 
 def listUsersSpec :
     Pgx.Typed.QuerySpec AppDb.database
@@ -199,19 +260,20 @@ def profileListParams : AppDb.Queries.ListUsersWithProfile.Params :=
 
 def profileUserId
     (row : AppDb.Queries.ListUsersWithProfile.Row) : Option Int64 :=
-  row.userId
+  row.val.userId
 
 def profileUserEmail
-    (row : AppDb.Queries.ListUsersWithProfile.Row) : Option String :=
-  row.email
+    (row : AppDb.Queries.ListUsersWithProfile.Row) :
+    Option AppDb.Types.AppEmailAddress :=
+  row.val.email
 
 def profileBio
     (row : AppDb.Queries.ListUsersWithProfile.Row) : Option String :=
-  row.profileBio
+  row.val.profileBio
 
 def profileAvatarUrl
     (row : AppDb.Queries.ListUsersWithProfile.Row) : Option String :=
-  row.avatarUrl
+  row.val.avatarUrl
 
 def listProfilesSpec :
     Pgx.Typed.QuerySpec AppDb.database

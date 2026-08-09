@@ -15,15 +15,19 @@ CREATE TABLE app.users (
   organization_id bigint NOT NULL,
   email app.email_address NOT NULL,
   status app.user_status NOT NULL DEFAULT 'pending'::app.user_status,
-  display_name text,
+  display_name varchar(100),
   created_at timestamp with time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT users_pkey PRIMARY KEY (id),
   CONSTRAINT users_email_key UNIQUE (email),
   CONSTRAINT users_organization_email_key UNIQUE (organization_id, email),
   CONSTRAINT users_organization_fk FOREIGN KEY (organization_id)
     REFERENCES app.organizations (id),
+  CONSTRAINT users_organization_id_positive CHECK (organization_id > 0),
+  CONSTRAINT users_disabled_name_required CHECK (
+    status <> 'disabled'::app.user_status OR display_name IS NOT NULL
+  ),
   CONSTRAINT users_display_name_not_blank CHECK (
-    display_name IS NULL OR char_length(btrim(display_name)) > 0
+    char_length(btrim(display_name)) > 0
   )
 );
 
