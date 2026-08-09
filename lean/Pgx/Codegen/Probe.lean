@@ -466,6 +466,42 @@ def Config.resolvedExtensionCodecPackages (config : Config)
       left.importModule < right.importModule
     else left.extension < right.extension) |>.toArray
 
+/-- Symbolic extension membership recovered from `pg_depend`.  The physical
+type OID used during probing is deliberately absent from the public value. -/
+structure ExtensionTypeOwnership where
+  key : Pgx.TypeKey
+  extension : String
+  deriving Repr, BEq, Inhabited
+
+/-- Require every configured override to resolve to exactly one live symbolic
+type.  This prevents an override from bypassing support checks for a missing
+or incorrectly classified type. -/
+def validateLiveTypeOverrides (overrides : Array Pgx.TypeOverrideIR)
+    (liveKeys : Array Pgx.TypeKey) : Except Error Unit := do
+  for override in overrides do
+    let candidates := liveKeys.filter (· == override.key)
+    if candidates.isEmpty then
+      throw (.catalog s!"type override {override.key} does not exist in pg_type")
+    unless candidates.size == 1 do
+      throw (.catalog s!"type override {override.key} is ambiguous in pg_type")
+
+/-- Require each packaged codec type to be an extension member owned by the
+claimed extension.  Other extension-owned types, notably generated array
+wrappers, remain eligible for ordinary generated codecs. -/
+def validateExtensionCodecOwnership
+    (packages : Array ExtensionCodecPackageInput)
+    (ownership : Array ExtensionTypeOwnership) : Except Error Unit := do
+  for package in packages do
+    for key in package.types do
+      let candidates := ownership.filter (fun value => value.key == key)
+      let some owner := candidates[0]?
+        | throw (.catalog s!"extension codec type {key} is not an extension member")
+      unless candidates.size == 1 do
+        throw (.catalog s!"extension codec type {key} has ambiguous extension ownership")
+      unless owner.extension == package.extension do
+        throw (.catalog s!"extension codec type {key} belongs to extension \
+          {owner.extension}, not {package.extension}")
+
 private structure CatalogType where
   oid : UInt32
   key : Pgx.TypeKey
@@ -519,6 +555,7 @@ private structure CatalogSnapshot where
   constraints : Array Pgx.ConstraintIR
   indexes : Array Pgx.IndexIR
   extensions : Array (String × String)
+  extensionTypeOwnership : Array ExtensionTypeOwnership
 
 private def typeByOid? (types : Array CatalogType) (oid : UInt32) : Option CatalogType :=
   types.find? (fun value => value.oid == oid)
@@ -656,6 +693,39 @@ private def loadTypes (conn : Pg.Connection) :
           return .error (.catalog s!"duplicate pg_type OID {value.oid}")
         values := values.push value
     pure (.ok values)
+
+/-- Catalog query used to prove extension ownership of packaged codec types.
+Array types created with an extension type may also appear; callers validate
+only the explicitly packaged keys and leave those wrappers generated. -/
+def extensionTypeOwnershipSql : String :=
+  "SELECT dep.objid::text, ext.extname " ++
+  "FROM pg_catalog.pg_depend AS dep " ++
+  "JOIN pg_catalog.pg_extension AS ext ON ext.oid = dep.refobjid " ++
+  "WHERE dep.classid = 'pg_catalog.pg_type'::pg_catalog.regclass " ++
+  "AND dep.objsubid = 0 " ++
+  "AND dep.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass " ++
+  "AND dep.refobjsubid = 0 " ++
+  "AND dep.deptype = 'e' " ++
+  "ORDER BY dep.objid, ext.extname"
+
+private def loadExtensionTypeOwnership (conn : Pg.Connection)
+    (types : Array CatalogType) :
+    Async (Except Error (Array ExtensionTypeOwnership)) := do
+  match ← queryOne conn "read extension type ownership" extensionTypeOwnershipSql with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    let mut ownership : Array ExtensionTypeOwnership := #[]
+    for row in rows.rows do
+      let parsed : Except Error ExtensionTypeOwnership := do
+        let oid ← parseUInt32 "read extension type ownership"
+          (← cell "read extension type ownership" row 0)
+        let some ty := typeByOid? types oid
+          | throw (.catalog s!"extension dependency refers to missing type OID {oid}")
+        pure { key := ty.key, extension := ← cell "read extension type ownership" row 1 }
+      match parsed with
+      | .error error => return .error error
+      | .ok value => ownership := ownership.push value
+    pure (.ok ownership)
 
 private def loadArrays (schemas : Array String) (types : Array CatalogType) :
     Except Error (Array Pgx.ArrayIR) := do
@@ -1754,6 +1824,9 @@ private def loadSnapshot (conn : Pg.Connection) (config : Config) :
   let types ← match ← loadTypes conn with
     | .error error => return .error error
     | .ok value => pure value
+  let extensionTypeOwnership ← match ← loadExtensionTypeOwnership conn types with
+    | .error error => return .error error
+    | .ok value => pure value
   let arrays ← match loadArrays config.schemas types with
     | .error error => return .error error
     | .ok value => pure value
@@ -1794,7 +1867,7 @@ private def loadSnapshot (conn : Pg.Connection) (config : Config) :
     routines := catalogRoutines.filter (fun value =>
       config.schemas.contains value.ir.key.schema && !value.extensionOwned)
       |>.map (fun value => value.ir)
-    constraints, indexes, extensions
+    constraints, indexes, extensions, extensionTypeOwnership
   })
 
 /-- Probe a migrated live server and return a fully symbolic, normalized
@@ -1811,6 +1884,13 @@ def probeDatabase (conn : Pg.Connection) (config : Config) :
   let snapshot ← match ← loadSnapshot conn config with
     | .error error => return .error error
     | .ok value => pure value
+  match validateLiveTypeOverrides config.typeOverrides (snapshot.types.map (·.key)) with
+  | .error error => return .error error
+  | .ok () => pure ()
+  match validateExtensionCodecOwnership config.extensionCodecPackages
+      snapshot.extensionTypeOwnership with
+  | .error error => return .error error
+  | .ok () => pure ()
   match validateCatalogTypes config snapshot with
   | .error error => return .error error
   | .ok () => pure ()

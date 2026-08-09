@@ -28,6 +28,10 @@ private def halfvecKey : Pgx.TypeKey := {
   schema := "public", name := "halfvec", kind := .base
 }
 
+private def citextArrayKey : Pgx.TypeKey := {
+  schema := "public", name := "_citext", kind := .array
+}
+
 private def overrideFor (key : Pgx.TypeKey) (leanType codec moduleName : String) :
     Pgx.TypeOverrideIR := {
   key, leanType, codec, importModule := some moduleName
@@ -281,6 +285,41 @@ def main : IO UInt32 := do
   | .error error => panic! toString error
   assert! isError (packageConfig.resolvedExtensionCodecPackages #[
     ("citext", "1.6")])
+
+  let liveOverrideKeys := #[vectorKey, halfvecKey, citextKey, citextArrayKey]
+  assert! (validateLiveTypeOverrides packageConfig.typeOverrides liveOverrideKeys).isOk
+  assert! isError (validateLiveTypeOverrides packageConfig.typeOverrides
+    #[vectorKey, citextKey, citextArrayKey])
+  assert! isError (validateLiveTypeOverrides packageConfig.typeOverrides
+    (liveOverrideKeys.push citextKey))
+
+  let ownership : Array ExtensionTypeOwnership := #[
+    { key := vectorKey, extension := "vector" },
+    { key := halfvecKey, extension := "vector" },
+    { key := citextKey, extension := "citext" },
+    -- Extension-owned array wrappers are intentionally not package entries;
+    -- their ordinary generated container codecs remain available.
+    { key := citextArrayKey, extension := "citext" }
+  ]
+  assert! (validateExtensionCodecOwnership
+    packageConfig.extensionCodecPackages ownership).isOk
+  assert! isError (validateExtensionCodecOwnership
+    packageConfig.extensionCodecPackages
+    (ownership.filter fun value => value.key != citextKey))
+  assert! isError (validateExtensionCodecOwnership
+    packageConfig.extensionCodecPackages
+    (ownership.map fun value =>
+      if value.key == citextKey then { value with extension := "other" } else value))
+  assert! isError (validateExtensionCodecOwnership
+    packageConfig.extensionCodecPackages
+    (ownership.push { key := citextKey, extension := "citext" }))
+  assert! extensionTypeOwnershipSql.contains
+    "dep.classid = 'pg_catalog.pg_type'::pg_catalog.regclass"
+  assert! extensionTypeOwnershipSql.contains
+    "dep.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass"
+  assert! extensionTypeOwnershipSql.contains "dep.objsubid = 0"
+  assert! extensionTypeOwnershipSql.contains "dep.refobjsubid = 0"
+  assert! extensionTypeOwnershipSql.contains "dep.deptype = 'e'"
 
   assert! isError (validateConfig {
     packageConfig with
