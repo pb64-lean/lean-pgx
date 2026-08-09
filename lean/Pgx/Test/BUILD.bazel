@@ -17,6 +17,13 @@ lean_test(
 )
 
 lean_test(
+    name = "containers_test",
+    srcs = ["Containers.lean"],
+    deps = ["//lean/Pgx/Typed:containers"],
+    strip_module_prefix = "lean",
+)
+
+lean_test(
     name = "manifest_test",
     srcs = ["Manifest.lean"],
     deps = ["//lean/Pgx/Codegen:manifest"],

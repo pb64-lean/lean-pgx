@@ -9,6 +9,7 @@ lean_library(
     srcs = ["Typed.lean"],
     deps = [
         "//lean/Pgx/Typed:catalog",
+        "//lean/Pgx/Typed:containers",
         "//lean/Pgx/Typed:descriptors",
         "//lean/Pgx/Typed:query",
     ],

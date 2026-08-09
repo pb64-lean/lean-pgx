@@ -1,4 +1,5 @@
 import Pgx.Typed.Descriptors
+import Pgx.Typed.Containers
 import Pgx.Typed.Catalog
 import Pgx.Typed.Query
 
