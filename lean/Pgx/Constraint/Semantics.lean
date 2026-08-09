@@ -1,4 +1,6 @@
 import Pgx.Constraint.IR
+import Pg.Types.Numeric
+import Pg.Types.Interval
 
 /-!
 # Executable local-constraint semantics
@@ -207,12 +209,248 @@ def evaluateCharacterTypmod (typmod : Option Int32) (value : Option String) :
     Except EvaluationError SqlTruth := do
   pure (characterLengthBound (← decodeCharacterTypmod typmod) value)
 
-/-- Numeric precision/scale typmods do not yet have a sound local
-proposition.  Code generation can use this stable diagnostic instead of
-silently treating them as character-style bounds. -/
+/-! ## Exact numeric type modifiers
+
+PostgreSQL packs `numeric(precision, scale)` into the type modifier after a
+four-byte varlena offset.  Precision occupies the upper sixteen bits and
+scale is an eleven-bit two's-complement integer.  PostgreSQL 18 accepts
+precision `1..1000` and scale `-1000..1000`.
+
+The predicate below recognizes values which already have the declared scale;
+it deliberately does not model PostgreSQL's coercive rounding.  Consequently
+a value accepted here can be sent without losing information, while a value
+which would need server-side rounding is rejected locally.
+-/
+
+structure NumericTypmod where
+  precision : Nat
+  scale : Int
+  deriving Repr, BEq, Inhabited
+
+/-- Decode PostgreSQL's catalog/wire representation of a numeric typmod. -/
+def decodeRawNumericTypmod (typmod : Int32) :
+    Except EvaluationError (Option NumericTypmod) :=
+  if typmod == -1 then
+    .ok none
+  else
+    let raw := typmod.toInt
+    if raw < 4 then
+      .error (.invalidValue "numeric typmod"
+        s!"expected -1 or a stored typmod of at least 4, got {raw}")
+    else
+      let packed := raw - 4
+      let precision := ((packed / 65536) % 65536).toNat
+      let encodedScale := packed % 2048
+      let scale := if encodedScale ≥ 1024 then encodedScale - 2048 else encodedScale
+      if precision = 0 ∨ precision > 1000 then
+        .error (.invalidValue "numeric typmod"
+          s!"precision must be between 1 and 1000, got {precision}")
+      else if scale < -1000 ∨ scale > 1000 then
+        .error (.invalidValue "numeric typmod"
+          s!"scale must be between -1000 and 1000, got {scale}")
+      else
+        .ok (some { precision, scale })
+
+/-- Decode the canonical optional type modifier carried by `Pgx.TypeRef`. -/
+def decodeNumericTypmod : Option Int32 →
+    Except EvaluationError (Option NumericTypmod)
+  | none => .ok none
+  | some typmod => decodeRawNumericTypmod typmod
+
+private structure DecimalExtents where
+  /-- Exponent of the highest nonzero base-ten digit (`ones = 0`). -/
+  highest : Int
+  /-- Exponent of the lowest nonzero base-ten digit (`tenths = -1`). -/
+  lowest : Int
+
+private def highestDigitOffset (digit : Nat) : Int :=
+  if digit ≥ 1000 then 3
+  else if digit ≥ 100 then 2
+  else if digit ≥ 10 then 1
+  else 0
+
+private def lowestDigitOffset (digit : Nat) : Int :=
+  if digit % 10 != 0 then 0
+  else if digit % 100 != 0 then 1
+  else if digit % 1000 != 0 then 2
+  else 3
+
+/-- Locate the nonzero decimal digits without converting through a bounded
+integer or floating-point representation. -/
+private def numericDecimalExtents (groupWeight : Int) :
+    List UInt16 → Except EvaluationError (Option DecimalExtents)
+  | [] => .ok none
+  | digit :: rest => do
+      let raw := digit.toNat
+      if raw ≥ 10000 then
+        throw (.invalidValue "numeric value"
+          s!"base-10000 digit is out of range: {raw}")
+      let tail ← numericDecimalExtents (groupWeight - 1) rest
+      if raw = 0 then
+        pure tail
+      else
+        let base := 4 * groupWeight
+        let current : DecimalExtents := {
+          highest := base + highestDigitOffset raw
+          lowest := base + lowestDigitOffset raw
+        }
+        match tail with
+        | none => pure (some current)
+        | some following => pure (some {
+            highest := max current.highest following.highest
+            lowest := min current.lowest following.lowest
+          })
+
+private def finiteNumericFits (modifier : NumericTypmod)
+    (value : Pg.PgNumeric) : Except EvaluationError Bool := do
+  let extents ← numericDecimalExtents value.weight value.digits.toList
+  match extents with
+  | none => pure true
+  | some extents =>
+      -- A forged `PgNumeric` must not hide physical fractional digits behind
+      -- a smaller display scale: its text encoder would otherwise lose them.
+      if extents.lowest < -(Int.ofNat value.dscale) then
+        throw (.invalidValue "numeric value"
+          "display scale hides nonzero fractional digits")
+      let maximumWeight := Int.ofNat modifier.precision - modifier.scale
+      pure (extents.highest < maximumWeight ∧
+        extents.lowest ≥ -modifier.scale)
+
+/-- Evaluate a decoded numeric precision/scale bound.  SQL null is unknown.
+For a constrained numeric, PostgreSQL accepts NaN but rejects either infinity;
+the same distinction is made here. -/
+def numericPrecisionScaleBound (modifier : Option NumericTypmod) :
+    Option Pg.PgNumeric → Except EvaluationError SqlTruth
+  | none => .ok .unknown
+  | some value =>
+      match modifier, value.special with
+      | none, _ => .ok .true
+      | some _, some .nan => .ok .true
+      | some _, some .posInf | some _, some .negInf => .ok .false
+      | some modifier, none => do
+          pure (if ← finiteNumericFits modifier value then .true else .false)
+
+/-- Decode and evaluate a `numeric(precision, scale)` refinement. -/
+def evaluateNumericTypmod (typmod : Option Int32) (value : Option Pg.PgNumeric) :
+    Except EvaluationError SqlTruth := do
+  numericPrecisionScaleBound (← decodeNumericTypmod typmod) value
+
+/-- Compatibility diagnostic for callers which have not yet adopted the
+executable numeric refinement. -/
 def unsupportedNumericTypmod (typmod : Option Int32) : EvaluationError :=
   .invalidValue "numeric typmod"
     s!"local numeric precision/scale propositions are unsupported ({repr typmod})"
+
+/-! ## Temporal precision type modifiers
+
+`time`, `timestamp`, and `timestamptz` store their modifier directly as a
+fractional-second precision from zero through six.  Lean's temporal values
+carry nanoseconds, whereas PostgreSQL stores microseconds, so even an
+unmodified value must be aligned to 1000 nanoseconds.  `interval` stores its
+precision in the low sixteen bits of a packed range/precision modifier and
+its time field is already measured in microseconds.
+-/
+
+/-- Decode the raw modifier shared by `time`, `timestamp`, and `timestamptz`. -/
+def decodeRawTemporalPrecisionTypmod (typmod : Int32) :
+    Except EvaluationError (Option Nat) :=
+  if typmod == -1 then
+    .ok none
+  else
+    let raw := typmod.toInt
+    if raw < 0 ∨ raw > 6 then
+      .error (.invalidValue "temporal typmod"
+        s!"fractional-second precision must be between 0 and 6, got {raw}")
+    else
+      .ok (some raw.toNat)
+
+def decodeTemporalPrecisionTypmod : Option Int32 →
+    Except EvaluationError (Option Nat)
+  | none => .ok none
+  | some typmod => decodeRawTemporalPrecisionTypmod typmod
+
+/-- Decode the precision component of PostgreSQL's packed interval typmod.
+`0xffff` denotes full/default precision; the upper bits contain its field
+range and do not affect this precision predicate. -/
+def decodeRawIntervalPrecisionTypmod (typmod : Int32) :
+    Except EvaluationError (Option Nat) :=
+  if typmod == -1 then
+    .ok none
+  else
+    let raw := typmod.toInt
+    if raw < 0 then
+      .error (.invalidValue "interval typmod"
+        s!"expected -1 or a nonnegative packed typmod, got {raw}")
+    else
+      let precision := raw % 65536
+      if precision = 65535 then
+        .ok none
+      else if precision > 6 then
+        .error (.invalidValue "interval typmod"
+          s!"fractional-second precision must be between 0 and 6, got {precision}")
+      else
+        .ok (some precision.toNat)
+
+def decodeIntervalPrecisionTypmod : Option Int32 →
+    Except EvaluationError (Option Nat)
+  | none => .ok none
+  | some typmod => decodeRawIntervalPrecisionTypmod typmod
+
+private def tenPower : Nat → Nat
+  | 0 => 1
+  | exponent + 1 => 10 * tenPower exponent
+
+/-- Check a nanosecond field against PostgreSQL's effective temporal
+precision.  An absent modifier means PostgreSQL's maximum precision of six. -/
+def temporalNanosecondPrecisionBound (precision : Option Nat) :
+    Option Int → SqlTruth
+  | none => .unknown
+  | some nanoseconds =>
+      let effective := precision.getD 6
+      if effective > 6 then
+        .false
+      else
+        let quantum := Int.ofNat (tenPower (9 - effective))
+        if nanoseconds % quantum = 0 then .true else .false
+
+/-- Check an interval's microsecond field against its fractional precision. -/
+def intervalMicrosecondPrecisionBound (precision : Option Nat) :
+    Option Int → SqlTruth
+  | none => .unknown
+  | some microseconds =>
+      let effective := precision.getD 6
+      if effective > 6 then
+        .false
+      else
+        let quantum := Int.ofNat (tenPower (6 - effective))
+        if microseconds % quantum = 0 then .true else .false
+
+def evaluateTemporalPrecisionTypmod (typmod : Option Int32)
+    (nanoseconds : Option Int) : Except EvaluationError SqlTruth := do
+  pure (temporalNanosecondPrecisionBound
+    (← decodeTemporalPrecisionTypmod typmod) nanoseconds)
+
+/-- `time` specialization; `nanoseconds` is the value's nanosecond field. -/
+def evaluateTimeTypmod := evaluateTemporalPrecisionTypmod
+
+/-- `timestamp` specialization; `nanoseconds` is the value's epoch-relative
+nanosecond field. -/
+def evaluateTimestampTypmod := evaluateTemporalPrecisionTypmod
+
+/-- `timestamptz` specialization; `nanoseconds` is the value's UTC
+epoch-relative nanosecond field. -/
+def evaluateTimestamptzTypmod := evaluateTemporalPrecisionTypmod
+
+def evaluateIntervalPrecisionTypmod (typmod : Option Int32)
+    (microseconds : Option Int) : Except EvaluationError SqlTruth := do
+  pure (intervalMicrosecondPrecisionBound
+    (← decodeIntervalPrecisionTypmod typmod) microseconds)
+
+/-- Apply the interval precision refinement directly to `Pg.PgInterval`. -/
+def evaluatePgIntervalPrecisionTypmod (typmod : Option Int32) :
+    Option Pg.PgInterval → Except EvaluationError SqlTruth
+  | none => .ok .unknown
+  | some value => evaluateIntervalPrecisionTypmod typmod (some value.micros)
 
 /-- One independently named PostgreSQL check over a decoded Lean value. -/
 structure Check (α : Type u) where
