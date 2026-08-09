@@ -5,8 +5,29 @@ load("@rules_lean//lean:defs.bzl", "lean_library")
 package(default_visibility = ["//visibility:public"])
 
 lean_library(
+    name = "ir",
+    srcs = ["IR.lean"],
+    deps = ["@pg_lean//:pg_lean"],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
+    name = "type_mapping",
+    srcs = ["TypeMapping.lean"],
+    deps = [
+        ":ir",
+        "@pg_lean//:pg_lean",
+    ],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
     name = "core",
     srcs = ["Core.lean"],
-    deps = ["@pg_lean//:pg_lean"],
+    deps = [
+        ":ir",
+        ":type_mapping",
+        "@pg_lean//:pg_lean",
+    ],
     strip_module_prefix = "lean",
 )

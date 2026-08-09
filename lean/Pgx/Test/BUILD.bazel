@@ -1,0 +1,10 @@
+"""Pure lean-pgx tests."""
+
+load("@rules_lean//lean:defs.bzl", "lean_test")
+
+lean_test(
+    name = "ir_test",
+    srcs = ["IR.lean"],
+    deps = ["//lean/Pgx:type_mapping"],
+    strip_module_prefix = "lean",
+)

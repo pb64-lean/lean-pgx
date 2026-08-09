@@ -1,3 +1,5 @@
+import Pgx.IR
+import Pgx.TypeMapping
 import Pg.Config
 
 namespace Pgx
