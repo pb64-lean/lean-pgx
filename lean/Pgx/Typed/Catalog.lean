@@ -209,6 +209,12 @@ private structure LiveType where
   base : Option Pgx.TypeRef
   enumLabels : Array String := #[]
   notNull : Bool
+  arrayElement : Option Pgx.TypeRef := none
+  arrayDelimiter : Option String := none
+  compositeFields : Array Pgx.CompositeFieldIR := #[]
+  rangeSubtype : Option Pgx.TypeRef := none
+  rangeMultirange : Option Pgx.TypeKey := none
+  multirangeRange : Option Pgx.TypeKey := none
 
 private def kindSql (alias : String) : String :=
   s!"CASE WHEN {alias}.typcategory = 'A' AND {alias}.typelem <> 0 THEN 'array' \
@@ -226,11 +232,28 @@ private def typeCatalogSql : String :=
   "bns.nspname, bt.typname, CASE WHEN bt.oid IS NULL THEN NULL ELSE " ++
   kindSql "bt" ++ " END, " ++
   "CASE WHEN t.typtype = 'd' AND t.typtypmod <> -1 THEN t.typtypmod::text ELSE NULL END, " ++
-  "t.typnotnull::text " ++
+  "t.typnotnull::text, ens.nspname, et.typname, " ++
+  "CASE WHEN et.oid IS NULL THEN NULL ELSE " ++ kindSql "et" ++ " END, " ++
+  "CASE WHEN et.oid IS NULL THEN NULL ELSE t.typdelim::text END, " ++
+  "rsns.nspname, rst.typname, CASE WHEN rst.oid IS NULL THEN NULL ELSE " ++
+  kindSql "rst" ++ " END, rmns.nspname, rmt.typname, " ++
+  "CASE WHEN rmt.oid IS NULL THEN NULL ELSE " ++ kindSql "rmt" ++ " END, " ++
+  "rrns.nspname, rrt.typname, CASE WHEN rrt.oid IS NULL THEN NULL ELSE " ++
+  kindSql "rrt" ++ " END " ++
   "FROM pg_catalog.pg_type AS t " ++
   "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = t.typnamespace " ++
   "LEFT JOIN pg_catalog.pg_type AS bt ON bt.oid = NULLIF(t.typbasetype, 0) " ++
   "LEFT JOIN pg_catalog.pg_namespace AS bns ON bns.oid = bt.typnamespace " ++
+  "LEFT JOIN pg_catalog.pg_type AS et ON et.oid = NULLIF(t.typelem, 0) " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS ens ON ens.oid = et.typnamespace " ++
+  "LEFT JOIN pg_catalog.pg_range AS rg ON rg.rngtypid = t.oid " ++
+  "LEFT JOIN pg_catalog.pg_type AS rst ON rst.oid = rg.rngsubtype " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS rsns ON rsns.oid = rst.typnamespace " ++
+  "LEFT JOIN pg_catalog.pg_type AS rmt ON rmt.oid = rg.rngmultitypid " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS rmns ON rmns.oid = rmt.typnamespace " ++
+  "LEFT JOIN pg_catalog.pg_range AS mrg ON mrg.rngmultitypid = t.oid " ++
+  "LEFT JOIN pg_catalog.pg_type AS rrt ON rrt.oid = mrg.rngtypid " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS rrns ON rrns.oid = rrt.typnamespace " ++
   "ORDER BY ns.nspname, t.typname"
 
 private def enumCatalogSql : String :=
@@ -239,6 +262,34 @@ private def enumCatalogSql : String :=
   "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = t.typnamespace " ++
   "JOIN pg_catalog.pg_enum AS e ON e.enumtypid = t.oid " ++
   "ORDER BY ns.nspname, t.typname, e.enumsortorder"
+
+private def compositeCatalogSql : String :=
+  "SELECT ns.nspname, t.typname, a.attname, a.attnum::text, " ++
+  "fns.nspname, ft.typname, " ++ kindSql "ft" ++ ", " ++
+  "CASE WHEN a.atttypmod = -1 THEN NULL ELSE a.atttypmod::text END, " ++
+  "cns.nspname, coll.collname " ++
+  "FROM pg_catalog.pg_type AS t " ++
+  "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = t.typnamespace " ++
+  "JOIN pg_catalog.pg_class AS c ON c.oid = t.typrelid AND c.reltype = t.oid " ++
+  "JOIN pg_catalog.pg_attribute AS a ON a.attrelid = c.oid " ++
+  "JOIN pg_catalog.pg_type AS ft ON ft.oid = a.atttypid " ++
+  "JOIN pg_catalog.pg_namespace AS fns ON fns.oid = ft.typnamespace " ++
+  "LEFT JOIN pg_catalog.pg_collation AS coll ON coll.oid = NULLIF(a.attcollation, 0) " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS cns ON cns.oid = coll.collnamespace " ++
+  "WHERE t.typtype = 'c' AND t.typisdefined " ++
+  "AND a.attnum > 0 AND NOT a.attisdropped " ++
+  "ORDER BY ns.nspname, t.typname, a.attnum"
+
+private def optionalTypeRef (context : String) (row : Array (Option ByteArray))
+    (offset : Nat) : Except Error (Option Pgx.TypeRef) := do
+  let schema ← cell? context row offset
+  let name ← cell? context row (offset + 1)
+  let kind ← cell? context row (offset + 2)
+  match schema, name, kind with
+  | none, none, none => pure none
+  | some schema, some name, some kind =>
+    pure (some { key := { schema, name, kind := ← parseTypeKind context kind } })
+  | _, _, _ => throw (drift s!"{context}: incomplete component type identity")
 
 private def parseLiveType (row : Array (Option ByteArray)) : Except Error LiveType := do
   let context := "read pg_type"
@@ -266,7 +317,17 @@ private def parseLiveType (row : Array (Option ByteArray)) : Except Error LiveTy
       })
     | _, _, _ => throw (drift s!"{context}: incomplete domain base identity")
   let notNull ← parseBool context (← cell context row 9)
-  pure { key := { schema, name, kind }, oid, arrayOid, base, notNull }
+  let arrayElement ← optionalTypeRef context row 10
+  let arrayDelimiter ← cell? context row 13
+  if arrayElement.isSome != arrayDelimiter.isSome then
+    throw (drift s!"{context}: incomplete array component metadata for {schema}.{name}")
+  let rangeSubtype ← optionalTypeRef context row 14
+  let rangeMultirange := (← optionalTypeRef context row 17).map (·.key)
+  let multirangeRange := (← optionalTypeRef context row 20).map (·.key)
+  pure {
+    key := { schema, name, kind }, oid, arrayOid, base, notNull,
+    arrayElement, arrayDelimiter, rangeSubtype, rangeMultirange, multirangeRange
+  }
 
 private def loadTypes (conn : Pg.Connection) :
     Async (Except Error (Array LiveType)) := do
@@ -295,7 +356,46 @@ private def loadTypes (conn : Pg.Connection) :
           let some value := types[index]?
             | return .error (drift s!"pg_enum type index disappeared for {key}")
           types := types.set! index { value with enumLabels := value.enumLabels.push label }
-      pure (.ok types)
+      match ← queryOne conn "read composite pg_attribute" compositeCatalogSql with
+      | .error error => pure (.error error)
+      | .ok compositeRows =>
+        for row in compositeRows.rows do
+          let parsed : Except Error (Pgx.TypeKey × Pgx.CompositeFieldIR) := do
+            let ownerSchema ← cell "read composite pg_attribute" row 0
+            let ownerName ← cell "read composite pg_attribute" row 1
+            let name ← cell "read composite pg_attribute" row 2
+            let ordinal ← parseNat "read composite pg_attribute"
+              (← cell "read composite pg_attribute" row 3)
+            let typeSchema ← cell "read composite pg_attribute" row 4
+            let typeName ← cell "read composite pg_attribute" row 5
+            let typeKind ← parseTypeKind "read composite pg_attribute"
+              (← cell "read composite pg_attribute" row 6)
+            let typmod ← match ← cell? "read composite pg_attribute" row 7 with
+              | none => pure none
+              | some value => some <$> parseInt32 "read composite pg_attribute" value
+            let collationSchema ← cell? "read composite pg_attribute" row 8
+            let collationName ← cell? "read composite pg_attribute" row 9
+            let collation ← match collationSchema, collationName with
+              | none, none => pure none
+              | some schema, some name => pure (some { schema, name })
+              | _, _ => throw (drift
+                  "read composite pg_attribute: incomplete collation identity")
+            pure ({ schema := ownerSchema, name := ownerName, kind := .composite }, {
+              name, ordinal
+              ty := { key := { schema := typeSchema, name := typeName, kind := typeKind }, typmod }
+              collation
+            })
+          match parsed with
+          | .error error => return .error error
+          | .ok (key, field) =>
+            let some index := types.findIdx? (fun value => value.key == key)
+              | return .error (drift s!"composite field refers to missing type {key}")
+            let some value := types[index]?
+              | return .error (drift s!"composite type index disappeared for {key}")
+            types := types.set! index {
+              value with compositeFields := value.compositeFields.push field
+            }
+        pure (.ok types)
 
 private structure LiveColumn where
   name : String
@@ -402,6 +502,24 @@ private def checkTypes (db : DatabaseDesc) (live : Array LiveType) :
     unless actual.notNull == expected.notNull do
       throw (drift s!"domain nullability drift for {expected.key}: expected \
         {expected.notNull}, received {actual.notNull}")
+    unless actual.arrayElement == expected.arrayElement do
+      throw (drift s!"array element drift for {expected.key}: expected \
+        {repr expected.arrayElement}, received {repr actual.arrayElement}")
+    unless actual.arrayDelimiter == expected.arrayDelimiter do
+      throw (drift s!"array delimiter drift for {expected.key}: expected \
+        {repr expected.arrayDelimiter}, received {repr actual.arrayDelimiter}")
+    unless actual.compositeFields == expected.compositeFields do
+      throw (drift s!"composite fields drift for {expected.key}: expected \
+        {repr expected.compositeFields}, received {repr actual.compositeFields}")
+    unless actual.rangeSubtype == expected.rangeSubtype do
+      throw (drift s!"range subtype drift for {expected.key}: expected \
+        {repr expected.rangeSubtype}, received {repr actual.rangeSubtype}")
+    unless actual.rangeMultirange == expected.rangeMultirange do
+      throw (drift s!"range multirange drift for {expected.key}: expected \
+        {repr expected.rangeMultirange}, received {repr actual.rangeMultirange}")
+    unless actual.multirangeRange == expected.multirangeRange do
+      throw (drift s!"multirange range drift for {expected.key}: expected \
+        {repr expected.multirangeRange}, received {repr actual.multirangeRange}")
     resolved := resolved.push {
       expected
       oid := actual.oid

@@ -46,6 +46,12 @@ structure StaticTypeDesc where
   base : Option Pgx.TypeRef := none
   enumLabels : Array String := #[]
   notNull : Bool := false
+  arrayElement : Option Pgx.TypeRef := none
+  arrayDelimiter : Option String := none
+  compositeFields : Array Pgx.CompositeFieldIR := #[]
+  rangeSubtype : Option Pgx.TypeRef := none
+  rangeMultirange : Option Pgx.TypeKey := none
+  multirangeRange : Option Pgx.TypeKey := none
   deriving Repr, BEq, Inhabited
 
 structure StaticColumnDesc where
