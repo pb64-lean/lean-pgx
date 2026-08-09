@@ -128,6 +128,7 @@ private def shuffledFixture : DatabaseIR := {
       key := { schema := "ext", name := "first", kind := .base }
       leanType := "First"
       codec := "firstCodec"
+      importModule := some "Ext.First"
     },
     {
       key := { schema := "ext", name := "second", kind := .base }
@@ -189,6 +190,15 @@ def main : IO UInt32 := do
       { query with columns := query.columns.reverse }
   }
   assert! sample.contractHash != changedColumnOrder.contractHash
+  let changedOverrideImport : DatabaseIR := {
+    shuffledFixture with
+    typeOverrides := shuffledFixture.typeOverrides.map fun value =>
+      if value.key.name == "first" then
+        { value with importModule := some "Ext.First.V2" }
+      else value
+  }
+  assert! shuffledFixture.contractHash != changedOverrideImport.contractHash
+  assert! shuffledFixture.compatibilityHash != changedOverrideImport.compatibilityHash
   let oidText := reprStr sample
   assert! !(oidText.contains "tableOid")
   return 0

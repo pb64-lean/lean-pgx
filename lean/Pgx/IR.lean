@@ -226,12 +226,14 @@ structure SessionContract where
   deriving Repr, BEq, Inhabited
 
 /-- Escape hatch for an extension/user type.  `codec` names a Lean declaration
-of type `Pgx.Typed.ResolvedCodec leanType`; the Bazel target containing it is a
-normal dependency of the generated library. -/
+of type `Pgx.Typed.ResolvedCodec leanType`.  When that declaration is not
+already exported by the runtime, `importModule` names the Lean module that
+makes both declarations visible to generated code. -/
 structure TypeOverrideIR where
   key : TypeKey
   leanType : String
   codec : String
+  importModule : Option String := none
   deriving Repr, BEq, Inhabited
 
 structure DatabaseIR where
@@ -305,7 +307,8 @@ private def indexAtom (value : IndexIR) : String :=
     optionAtom atom value.predicate ++ optionAtom atom value.expression
 
 private def overrideAtom (value : TypeOverrideIR) : String :=
-  typeKeyAtom value.key ++ atom value.leanType ++ atom value.codec
+  typeKeyAtom value.key ++ atom value.leanType ++ atom value.codec ++
+    optionAtom atom value.importModule
 
 private def queryColumnAtom (column : QueryColumnIR) : String :=
   atom column.name ++ typeRefAtom column.ty ++ boolAtom column.nullable ++

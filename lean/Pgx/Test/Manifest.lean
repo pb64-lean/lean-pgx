@@ -101,6 +101,7 @@ private def sampleDatabase : DatabaseIR := {
     key := { schema := "ext", name := "vector", kind := .base }
     leanType := "Vector"
     codec := "vectorCodec"
+    importModule := some "Ext.Vector"
   }]
 }
 
@@ -109,7 +110,8 @@ private def validManifest : String :=
   "\"supportedServerMajors\":[18,17]," ++
   "\"typeOverrides\":[{" ++
     "\"key\":{\"schema\":\"ext\",\"name\":\"vector\",\"kind\":\"base\"}," ++
-    "\"leanType\":\"Vector\",\"codec\":\"vectorCodec\"}]," ++
+    "\"leanType\":\"Vector\",\"codec\":\"vectorCodec\"," ++
+    "\"importModule\":\"Ext.Vector\"}]," ++
   "\"get_user.sql\":{" ++
     "\"leanName\":\"GetUser\"," ++
     "\"cardinality\":\"zeroOrOne\"," ++
@@ -155,6 +157,17 @@ def main : IO UInt32 := do
   assert! roundTrips sampleDatabase.queries[0]!
   assert! roundTrips sampleDatabase.session
   assert! roundTrips sampleDatabase.typeOverrides[0]!
+  let legacyOverrideJson ← match Json.parse
+      ("{\"key\":{\"schema\":\"ext\",\"name\":\"legacy\",\"kind\":\"base\"}," ++
+        "\"leanType\":\"Legacy\",\"codec\":\"legacyCodec\"}") with
+    | .ok value => pure value
+    | .error error => throw (IO.userError error)
+  let legacyOverride ← match
+      (fromJson? legacyOverrideJson : Except String TypeOverrideIR) with
+    | .ok value => pure value
+    | .error error => throw (IO.userError error)
+  assert! legacyOverride.importModule.isNone
+  assert! !((toJson legacyOverride).compress.contains "importModule")
 
   let snapshot := sampleDatabase.renderSnapshot
   assert! snapshot == sampleDatabase.renderSnapshot
@@ -173,6 +186,7 @@ def main : IO UInt32 := do
     | .error error => throw (IO.userError error)
   assert! manifest.supportedServerMajors == #[17, 18]
   assert! manifest.typeOverrides.size == 1
+  assert! manifest.typeOverrides[0]!.importModule == some "Ext.Vector"
   assert! manifest.queries.size == 1
   let query := manifest.queries[0]!
   assert! query.sqlBasename == "get_user.sql"
@@ -205,6 +219,10 @@ def main : IO UInt32 := do
   assert! isError (Pgx.Codegen.Manifest.parse
     ("{\"queries/get_user.sql\":{" ++
       "\"leanName\":\"GetUser\",\"cardinality\":\"many\",\"parameters\":[]}}"))
+  assert! isError (Pgx.Codegen.Manifest.parse
+    (validManifest.replace "Ext.Vector" " Ext.Vector"))
+  assert! isError (Pgx.Codegen.Manifest.parse
+    (validManifest.replace "Ext.Vector" ""))
   return 0
 
 end Pgx.Test.Manifest

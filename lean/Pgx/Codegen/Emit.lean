@@ -228,6 +228,12 @@ private def checkOverride (value : Pgx.TypeOverrideIR) : Except CodegenError Uni
     throw (.malformedIR s!"type override {value.key}" "Lean type declaration is empty")
   if value.codec.trimAscii.toString.isEmpty then
     throw (.malformedIR s!"type override {value.key}" "codec declaration is empty")
+  match value.importModule with
+  | none => pure ()
+  | some moduleName =>
+      if moduleName.isEmpty || moduleName.trimAscii.toString != moduleName then
+        throw (.malformedIR s!"type override {value.key}"
+          "import module is empty or contains surrounding whitespace")
 
 private def checkTypeSupportedAux (db : Pgx.DatabaseIR) (key : Pgx.TypeKey)
     (context : String) (seen : Array Pgx.TypeKey) : Nat → Except CodegenError Unit
@@ -539,8 +545,16 @@ private def emitDomain (plan : NamingPlan) (db : Pgx.DatabaseIR)
 
 private def emitTypes (plan : NamingPlan) (db : Pgx.DatabaseIR) :
     Except CodegenError String := do
-  let mut lines : List String := [
-    generatedHeader,
+  let importModules := Id.run do
+    let mut values : Array String := #[]
+    for value in db.typeOverrides do
+      if let some moduleName := value.importModule then
+        if moduleName != "Pgx.Typed" then values := pushUnique values moduleName
+    return sortStrings values
+  let mut lines : List String := [generatedHeader]
+  for moduleName in importModules do
+    lines := lines ++ ["import " ++ moduleName]
+  lines := lines ++ [
     "import Pgx.Typed",
     "",
     s!"namespace {plan.modulePrefix}.Types",

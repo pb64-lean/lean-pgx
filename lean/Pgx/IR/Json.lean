@@ -390,11 +390,16 @@ instance : FromJson SessionContract where
     }
 
 instance : ToJson TypeOverrideIR where
-  toJson value := Json.mkObj [
-    ("key", toJson value.key),
-    ("leanType", toJson value.leanType),
-    ("codec", toJson value.codec)
-  ]
+  toJson value :=
+    let fields := [
+      ("key", toJson value.key),
+      ("leanType", toJson value.leanType),
+      ("codec", toJson value.codec)
+    ]
+    let fields := match value.importModule with
+      | none => fields
+      | some moduleName => fields ++ [("importModule", toJson moduleName)]
+    Json.mkObj fields
 
 instance : FromJson TypeOverrideIR where
   fromJson? json := do
@@ -402,6 +407,7 @@ instance : FromJson TypeOverrideIR where
       key := ← requiredField json "key"
       leanType := ← requiredField json "leanType"
       codec := ← requiredField json "codec"
+      importModule := ← optionalField json "importModule" none
     }
 
 private def extensionToJson (value : String × String) : Json :=

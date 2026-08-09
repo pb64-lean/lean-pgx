@@ -196,6 +196,11 @@ private def validateTypeOverrides
       throw s!"type override for '{override.key}' has an empty or untrimmed leanType"
     if override.codec.isEmpty || override.codec.trimAscii.toString != override.codec then
       throw s!"type override for '{override.key}' has an empty or untrimmed codec"
+    match override.importModule with
+    | none => pure ()
+    | some moduleName =>
+        if moduleName.isEmpty || moduleName.trimAscii.toString != moduleName then
+          throw s!"type override for '{override.key}' has an empty or untrimmed importModule"
   for index in [0 : overrides.size] do
     for otherIndex in [index + 1 : overrides.size] do
       if overrides[index]!.key == overrides[otherIndex]!.key then
