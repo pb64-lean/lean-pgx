@@ -6,8 +6,8 @@ import Lean.Data.Json
 
 The manifest follows the query-object shape from `discussion.md`: every query
 is keyed by the basename of its literal `.sql` file.  Two reserved root keys,
-`supportedServerMajors` and `typeOverrides`, carry optional generation-wide
-configuration.
+`supportedServerMajors`, `typeOverrides`, and `extensionCodecPackages`, carry
+optional generation-wide configuration.
 -/
 
 namespace Pgx.Codegen
@@ -30,11 +30,22 @@ structure ManifestQuery where
   parameters : Array ManifestParameter
   deriving Repr, BEq, Inhabited
 
+/-- A reusable group of codecs supplied by one PostgreSQL extension.  The
+package owns the Lean import so individual overrides cannot accidentally
+disagree about where their codec declarations come from. -/
+structure ManifestExtensionCodecPackage where
+  extension : String
+  importModule : String
+  typeOverrides : Array TypeOverrideIR
+  deriving Repr, BEq, Inhabited
+
 /-- Fully validated contents of a query manifest. -/
 structure Manifest where
   queries : Array ManifestQuery
   supportedServerMajors : Array Nat := #[17, 18]
+  /-- Overrides declared directly at the manifest root. -/
   typeOverrides : Array TypeOverrideIR := #[]
+  extensionCodecPackages : Array ManifestExtensionCodecPackage := #[]
   deriving Repr, BEq, Inhabited
 
 namespace Manifest
@@ -190,8 +201,11 @@ private def validateMajors (majors : Array Nat) : Except String (Array Nat) := d
 private def validateTypeOverrides
     (overrides : Array TypeOverrideIR) : Except String Unit := do
   for override in overrides do
-    if override.key.schema.isEmpty || override.key.name.isEmpty then
-      throw "type override schema and name must not be empty"
+    if override.key.schema.isEmpty ||
+        override.key.schema.trimAscii.toString != override.key.schema ||
+        override.key.name.isEmpty ||
+        override.key.name.trimAscii.toString != override.key.name then
+      throw "type override schema and name must not be empty or untrimmed"
     if override.leanType.isEmpty || override.leanType.trimAscii.toString != override.leanType then
       throw s!"type override for '{override.key}' has an empty or untrimmed leanType"
     if override.codec.isEmpty || override.codec.trimAscii.toString != override.codec then
@@ -213,6 +227,54 @@ private def sortTypeOverrides
     let rightKey := s!"{right.key.schema}\u0000{right.key.name}\u0000{right.key.kind.tag}"
     leftKey < rightKey) |>.toArray
 
+private def resolvedPackageOverrides
+    (package : ManifestExtensionCodecPackage) : Array TypeOverrideIR :=
+  package.typeOverrides.map fun override =>
+    { override with importModule := some package.importModule }
+
+private def validateExtensionCodecPackages
+    (direct : Array TypeOverrideIR)
+    (packages : Array ManifestExtensionCodecPackage) : Except String Unit := do
+  for package in packages do
+    if package.extension.isEmpty ||
+        package.extension.trimAscii.toString != package.extension then
+      throw "extension codec package extension must not be empty or untrimmed"
+    if package.importModule.isEmpty ||
+        package.importModule.trimAscii.toString != package.importModule then
+      throw s!"extension codec package '{package.extension}' has an empty or untrimmed importModule"
+    if package.typeOverrides.isEmpty then
+      throw s!"extension codec package '{package.extension}' must contain at least one type override"
+    for override in package.typeOverrides do
+      if override.importModule.isSome then
+        throw s!"extension codec package '{package.extension}' type override for \
+          '{override.key}' must omit importModule; the package supplies it"
+    validateTypeOverrides (resolvedPackageOverrides package)
+  match firstDuplicate? (packages.map (fun package => package.extension)) with
+  | some duplicate =>
+      throw s!"duplicate extension codec package for extension '{duplicate}'"
+  | none => pure ()
+  let packaged := packages.flatMap resolvedPackageOverrides
+  for override in packaged do
+    if direct.any (fun directOverride => directOverride.key == override.key) then
+      throw s!"type override for '{override.key}' is declared both directly and by an extension codec package"
+  validateTypeOverrides packaged
+
+private def sortExtensionCodecPackages
+    (packages : Array ManifestExtensionCodecPackage) :
+    Array ManifestExtensionCodecPackage :=
+  packages.map (fun package =>
+      { package with typeOverrides := sortTypeOverrides package.typeOverrides })
+    |>.toList.mergeSort (fun left right => left.extension < right.extension)
+    |>.toArray
+
+private def parseExtensionCodecPackage
+    (json : Json) : Except String ManifestExtensionCodecPackage := do
+  pure {
+    extension := ← requiredField json "extension"
+    importModule := ← requiredField json "importModule"
+    typeOverrides := ← requiredField json "typeOverrides"
+  }
+
 /-- Decode and validate a manifest JSON value. -/
 def fromJson (json : Json) : Except String Manifest := do
   let object ← json.getObj?
@@ -221,9 +283,13 @@ def fromJson (json : Json) : Except String Manifest := do
   let supportedServerMajors ← validateMajors configuredMajors
   let typeOverrides : Array TypeOverrideIR ← optionalField json "typeOverrides" #[]
   validateTypeOverrides typeOverrides
+  let packageJson : Array Json ← optionalField json "extensionCodecPackages" #[]
+  let extensionCodecPackages ← packageJson.mapM parseExtensionCodecPackage
+  validateExtensionCodecPackages typeOverrides extensionCodecPackages
   let mut queries := #[]
   for (sqlBasename, value) in object.toList do
-    if sqlBasename != "supportedServerMajors" && sqlBasename != "typeOverrides" then
+    if sqlBasename != "supportedServerMajors" && sqlBasename != "typeOverrides" &&
+        sqlBasename != "extensionCodecPackages" then
       let query ← parseQuery sqlBasename value
       queries := queries.push query
   let sortedQueries := sortQueries queries
@@ -234,12 +300,30 @@ def fromJson (json : Json) : Except String Manifest := do
     queries := sortedQueries
     supportedServerMajors
     typeOverrides := sortTypeOverrides typeOverrides
+    extensionCodecPackages := sortExtensionCodecPackages extensionCodecPackages
   }
 
 /-- Parse and validate a manifest document. -/
 def parse (document : String) : Except String Manifest := do
   let json ← Json.parse document
   fromJson json
+
+/-- All overrides used by probing and generation, including codecs supplied by
+extension packages.  The result is canonical regardless of manifest order. -/
+def resolvedTypeOverrides (manifest : Manifest) : Array TypeOverrideIR :=
+  sortTypeOverrides <|
+    manifest.typeOverrides ++
+      manifest.extensionCodecPackages.flatMap resolvedPackageOverrides
+
+/-- Extensions which must be installed for the declared codec packages. -/
+def requiredExtensionNames (manifest : Manifest) : Array String :=
+  manifest.extensionCodecPackages.map (fun package => package.extension)
+
+/-- Package declarations in their validated canonical order.  This accessor
+keeps provenance available to the catalog probe without coupling manifest
+parsing to the probe implementation. -/
+def codecPackages (manifest : Manifest) : Array ManifestExtensionCodecPackage :=
+  manifest.extensionCodecPackages
 
 /-- Find a manifest entry using exactly the SQL basename stored at the root. -/
 def queryForBasename? (manifest : Manifest) (sqlBasename : String) :

@@ -216,6 +216,11 @@ private def validManifest : String :=
     "\"key\":{\"schema\":\"ext\",\"name\":\"vector\",\"kind\":\"base\"}," ++
     "\"leanType\":\"Vector\",\"codec\":\"vectorCodec\"," ++
     "\"importModule\":\"Ext.Vector\"}]," ++
+  "\"extensionCodecPackages\":[{" ++
+    "\"extension\":\"citext\",\"importModule\":\"Ext.Citext\"," ++
+    "\"typeOverrides\":[{" ++
+      "\"key\":{\"schema\":\"public\",\"name\":\"citext\",\"kind\":\"base\"}," ++
+      "\"leanType\":\"String\",\"codec\":\"citextCodec\"}]}]," ++
   "\"get_user.sql\":{" ++
     "\"leanName\":\"GetUser\"," ++
     "\"cardinality\":\"zeroOrOne\"," ++
@@ -224,6 +229,20 @@ private def validManifest : String :=
       "{\"position\":1,\"name\":\"id\",\"nullable\":false}" ++
     "]}" ++
   "}"
+
+private def packagedOverride
+    (schema name leanType codec : String) : String :=
+  "{\"key\":{\"schema\":\"" ++ schema ++ "\",\"name\":\"" ++ name ++
+    "\",\"kind\":\"base\"},\"leanType\":\"" ++ leanType ++
+    "\",\"codec\":\"" ++ codec ++ "\"}"
+
+private def codecPackage
+    (extension importModule overrides : String) : String :=
+  "{\"extension\":\"" ++ extension ++ "\",\"importModule\":\"" ++
+    importModule ++ "\",\"typeOverrides\":" ++ overrides ++ "}"
+
+private def packageOnlyDocument (packages : String) : String :=
+  "{\"extensionCodecPackages\":" ++ packages ++ "}"
 
 private def queryDocument
     (leanName cardinality parameters : String) : String :=
@@ -326,6 +345,13 @@ def main : IO UInt32 := do
   assert! manifest.supportedServerMajors == #[17, 18]
   assert! manifest.typeOverrides.size == 1
   assert! manifest.typeOverrides[0]!.importModule == some "Ext.Vector"
+  assert! manifest.extensionCodecPackages.size == 1
+  assert! manifest.requiredExtensionNames == #["citext"]
+  assert! manifest.resolvedTypeOverrides.size == 2
+  let some packagedCitext := manifest.resolvedTypeOverrides.find? fun override =>
+      override.key.name == "citext"
+    | throw (IO.userError "resolved package override is missing")
+  assert! packagedCitext.importModule == some "Ext.Citext"
   assert! manifest.queries.size == 1
   let query := manifest.queries[0]!
   assert! query.sqlBasename == "get_user.sql"
@@ -362,6 +388,76 @@ def main : IO UInt32 := do
     (validManifest.replace "Ext.Vector" " Ext.Vector"))
   assert! isError (Pgx.Codegen.Manifest.parse
     (validManifest.replace "Ext.Vector" ""))
+
+  -- Package keys are generation configuration, never query basenames.
+  let packageOnly ← match Pgx.Codegen.Manifest.parse
+      (packageOnlyDocument ("[" ++ codecPackage "citext" "Ext.Citext"
+        ("[" ++ packagedOverride "public" "citext" "String" "citextCodec" ++ "]") ++
+        "]")) with
+    | .ok value => pure value
+    | .error error => throw (IO.userError error)
+  assert! packageOnly.queries.isEmpty
+  assert! packageOnly.requiredExtensionNames == #["citext"]
+
+  -- Package and override order is canonical, including the combined view.
+  let orderedDocument := packageOnlyDocument <|
+    "[" ++
+      codecPackage "zeta" "Ext.Zeta"
+        ("[" ++ packagedOverride "z" "z_type" "Z" "zCodec" ++ "," ++
+          packagedOverride "z" "a_type" "A" "aCodec" ++ "]") ++ "," ++
+      codecPackage "alpha" "Ext.Alpha"
+        ("[" ++ packagedOverride "a" "only_type" "Only" "onlyCodec" ++ "]") ++
+    "]"
+  let ordered ← match Pgx.Codegen.Manifest.parse orderedDocument with
+    | .ok value => pure value
+    | .error error => throw (IO.userError error)
+  assert! ordered.requiredExtensionNames == #["alpha", "zeta"]
+  assert! ordered.codecPackages.map (fun package => package.extension) ==
+    #["alpha", "zeta"]
+  assert! ordered.codecPackages[1]!.typeOverrides.map (fun override => override.key.name) ==
+    #["a_type", "z_type"]
+  assert! ordered.resolvedTypeOverrides.map (fun override => override.key.name) ==
+    #["only_type", "a_type", "z_type"]
+  assert! ordered.resolvedTypeOverrides.all fun override => override.importModule.isSome
+
+  let oneOverride := packagedOverride "public" "citext" "String" "citextCodec"
+  assert! isError (Pgx.Codegen.Manifest.parse
+    (packageOnlyDocument ("[" ++ codecPackage "" "Ext.Citext"
+      ("[" ++ oneOverride ++ "]") ++ "]")))
+  assert! isError (Pgx.Codegen.Manifest.parse
+    (packageOnlyDocument ("[" ++ codecPackage " citext" "Ext.Citext"
+      ("[" ++ oneOverride ++ "]") ++ "]")))
+  assert! isError (Pgx.Codegen.Manifest.parse
+    (packageOnlyDocument ("[" ++ codecPackage "citext" ""
+      ("[" ++ oneOverride ++ "]") ++ "]")))
+  assert! isError (Pgx.Codegen.Manifest.parse
+    (packageOnlyDocument ("[" ++ codecPackage "citext" " Ext.Citext"
+      ("[" ++ oneOverride ++ "]") ++ "]")))
+  assert! isError (Pgx.Codegen.Manifest.parse
+    (packageOnlyDocument ("[" ++ codecPackage "citext" "Ext.Citext" "[]" ++ "]")))
+  assert! isError (Pgx.Codegen.Manifest.parse
+    (packageOnlyDocument ("[" ++ codecPackage "citext" "Ext.Citext"
+      ("[" ++ oneOverride.dropEnd 1 ++ ",\"importModule\":\"Other\"}]" ) ++ "]")))
+
+  -- Duplicate extension identities and duplicate PostgreSQL type identities
+  -- are rejected within packages, across packages, and against direct entries.
+  assert! isError (Pgx.Codegen.Manifest.parse
+    (packageOnlyDocument ("[" ++ codecPackage "citext" "Ext.One"
+      ("[" ++ oneOverride ++ "]") ++ "," ++
+      codecPackage "citext" "Ext.Two"
+        ("[" ++ packagedOverride "public" "other" "Other" "otherCodec" ++ "]") ++
+      "]")))
+  assert! isError (Pgx.Codegen.Manifest.parse
+    (packageOnlyDocument ("[" ++ codecPackage "citext" "Ext.Citext"
+      ("[" ++ oneOverride ++ "," ++ oneOverride ++ "]") ++ "]")))
+  assert! isError (Pgx.Codegen.Manifest.parse
+    (packageOnlyDocument ("[" ++ codecPackage "citext" "Ext.Citext"
+      ("[" ++ oneOverride ++ "]") ++ "," ++ codecPackage "other" "Ext.Other"
+      ("[" ++ oneOverride ++ "]") ++ "]")))
+  let directCollision :=
+    "{\"typeOverrides\":[" ++ oneOverride ++ "],\"extensionCodecPackages\":[" ++
+      codecPackage "citext" "Ext.Citext" ("[" ++ oneOverride ++ "]") ++ "]}"
+  assert! isError (Pgx.Codegen.Manifest.parse directCollision)
   return 0
 
 end Pgx.Test.Manifest

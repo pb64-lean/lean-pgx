@@ -242,7 +242,8 @@ private def probe (options : Options) (loaded : LoadedInput) :
         session := { searchPath := options.schemas }
         queries := loaded.queries
         supportedServerMajors := options.serverMajors
-        typeOverrides := loaded.manifest.typeOverrides
+        requiredExtensions := loaded.manifest.requiredExtensionNames
+        typeOverrides := loaded.manifest.resolvedTypeOverrides
       }
       match ← Probe.probeDatabase conn probeConfig with
       | .ok database => pure (.ok database)
