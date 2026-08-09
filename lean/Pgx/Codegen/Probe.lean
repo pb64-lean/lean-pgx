@@ -122,6 +122,15 @@ inductive OuterJoinAnalysis where
   | uncertain
   deriving Repr, BEq, DecidableEq, Inhabited
 
+/-- Conservative facts recovered from one fully recognized generic plan.
+`rowPreservedRelations` contains only base relations with exactly one scan
+occurrence and is empty whenever an outer join is present or analysis is
+uncertain. -/
+structure QueryPlanAnalysis where
+  outerJoins : OuterJoinAnalysis
+  rowPreservedRelations : Array Pgx.RelationKey := #[]
+  deriving Repr, BEq, Inhabited
+
 private def sqlLiteral (value : String) : String :=
   "'" ++ value.replace "'" "''" ++ "'"
 
@@ -1009,67 +1018,102 @@ private def classifyJoinType : Option Lean.Json → OuterJoinAnalysis
       .uncertain
   | some _ => .uncertain
 
-private partial def analyzePlanNode : Lean.Json → OuterJoinAnalysis
+private def relationScanNodeTypes : Array String := #[
+  "Bitmap Heap Scan", "Foreign Scan", "Index Only Scan", "Index Scan",
+  "Sample Scan", "Seq Scan", "Tid Range Scan", "Tid Scan"
+]
+
+private def planRelation? (fields : Std.TreeMap.Raw String Lean.Json) (kind : String) :
+    Option Pgx.RelationKey := do
+  guard (relationScanNodeTypes.contains kind)
+  let .str schema ← fields.get? "Schema" | none
+  let .str name ← fields.get? "Relation Name" | none
+  some { schema, name }
+
+private partial def analyzePlanNode : Lean.Json →
+    OuterJoinAnalysis × Array Pgx.RelationKey
   | .obj fields =>
     let join := classifyJoinType (fields.get? "Join Type")
     if join == .outerJoin then
-      .outerJoin
+      (.outerJoin, #[])
     else
-      let shape := match fields.get? "Node Type" with
-        | some (.str kind) =>
+      let kind := match fields.get? "Node Type" with
+        | some (.str kind) => some kind
+        | _ => none
+      let shape := match kind with
+        | some kind =>
           if knownPlanNodeTypes.contains kind then .noOuterJoin else .uncertain
         | _ => .uncertain
-      let children := match fields.get? "Plans" with
-        | none => .noOuterJoin
+      let ownRelations := match kind with
+        | some kind => (planRelation? fields kind).map (fun key => #[key]) |>.getD #[]
+        | none => #[]
+      let children : OuterJoinAnalysis × Array Pgx.RelationKey :=
+        match fields.get? "Plans" with
+        | none => (.noOuterJoin, #[])
         | some (.arr plans) => plans.foldl
-            (fun result plan => combineAnalysis result (analyzePlanNode plan))
-            .noOuterJoin
-        | some _ => .uncertain
-      combineAnalysis join (combineAnalysis shape children)
-  | _ => .uncertain
+            (fun result plan =>
+              let child := analyzePlanNode plan
+              (combineAnalysis result.1 child.1, result.2 ++ child.2))
+            (.noOuterJoin, #[])
+        | some _ => (.uncertain, #[])
+      (combineAnalysis join (combineAnalysis shape children.1),
+        ownRelations ++ children.2)
+  | _ => (.uncertain, #[])
+
+private def preservedRelations (analysis : OuterJoinAnalysis)
+    (scans : Array Pgx.RelationKey) : Array Pgx.RelationKey :=
+  if analysis != .noOuterJoin then #[]
+  else scans.filter fun key => (scans.filter (fun found => found == key)).size == 1
+
+/-- Pure conservative classifier for the nullability and same-row facts used
+by local refinement propagation. -/
+def analyzeQueryPlanJson (json : String) : QueryPlanAnalysis :=
+  match Lean.Json.parse json with
+  | .error _ => { outerJoins := .uncertain }
+  | .ok (.arr plans) =>
+    if plans.size != 1 then { outerJoins := .uncertain }
+    else match plans[0]! with
+      | .obj root => match root.get? "Plan" with
+        | some plan =>
+          let (outerJoins, scans) := analyzePlanNode plan
+          { outerJoins, rowPreservedRelations := preservedRelations outerJoins scans }
+        | none => { outerJoins := .uncertain }
+      | _ => { outerJoins := .uncertain }
+  | .ok _ => { outerJoins := .uncertain }
 
 /-- Pure classifier for PostgreSQL's `EXPLAIN (VERBOSE, FORMAT JSON)` output.
 Malformed JSON, an unknown node/join kind, or an unexpected root shape is
 uncertain and therefore cannot justify a non-optional generated field. -/
 def analyzeOuterJoinPlanJson (json : String) : OuterJoinAnalysis :=
-  match Lean.Json.parse json with
-  | .error _ => .uncertain
-  | .ok (.arr plans) =>
-    if plans.size != 1 then .uncertain
-    else match plans[0]! with
-      | .obj root => match root.get? "Plan" with
-        | some plan => analyzePlanNode plan
-        | none => .uncertain
-      | _ => .uncertain
-  | .ok _ => .uncertain
+  (analyzeQueryPlanJson json).outerJoins
 
-private def inspectExplainRows (rows : Pg.Rows) : OuterJoinAnalysis :=
+private def inspectExplainRows (rows : Pg.Rows) : QueryPlanAnalysis :=
   if rows.rows.size != 1 || rows.columns.size != 1 then
-    .uncertain
+    { outerJoins := .uncertain }
   else match rows.rows[0]? with
-    | none => .uncertain
+    | none => { outerJoins := .uncertain }
     | some row => match row[0]? with
-      | none | some none => .uncertain
+      | none | some none => { outerJoins := .uncertain }
       | some (some bytes) => match String.fromUTF8? bytes with
-        | none => .uncertain
-        | some json => analyzeOuterJoinPlanJson json
+        | none => { outerJoins := .uncertain }
+        | some json => analyzeQueryPlanJson json
 
 /-- Inspect a prepared statement under a forced generic plan.  A server-side
 EXPLAIN failure or an unrecognized JSON shape is deliberately reported as
 `uncertain`; failure to restore a setting changed by this function is a hard
 probe error. -/
-def analyzeOuterJoins (conn : Pg.Connection) (statement : Pg.Statement) :
-    Async (Except Error OuterJoinAnalysis) := do
+def analyzeQueryPlan (conn : Pg.Connection) (statement : Pg.Statement) :
+    Async (Except Error QueryPlanAnalysis) := do
   let previous ← match ← currentSetting conn "plan_cache_mode" with
     | .ok value => pure value
-    | .error _ => return .ok .uncertain
+    | .error _ => return .ok { outerJoins := .uncertain }
   match ← setConfig conn "plan_cache_mode" "force_generic_plan" with
-  | .error _ => return .ok .uncertain
+  | .error _ => return .ok { outerJoins := .uncertain }
   | .ok () => pure ()
   let analysis ← match ← queryOne conn
       s!"inspect query plan for {statement.name}" (explainSql statement) with
     | .ok rows => pure (inspectExplainRows rows)
-    | .error _ => pure .uncertain
+    | .error _ => pure { outerJoins := .uncertain }
   match ← setConfig conn "plan_cache_mode" previous with
   | .error error => pure (.error error)
   | .ok () => pure (.ok analysis)
@@ -1154,20 +1198,28 @@ private def analyzePrepared (conn : Pg.Connection) (config : Config)
       origin
       collation := sourceColumn.bind (·.collation)
     }
-  let columns ← if directColumns.isEmpty then
-      pure directColumns
+  let (columns, rowPreservedRelations) ← if directColumns.isEmpty then
+      pure (directColumns, #[])
     else
-      match ← analyzeOuterJoins conn statement with
+      match ← analyzeQueryPlan conn statement with
       | .error error => return .error error
-      | .ok .noOuterJoin => pure directColumns
-      | .ok .outerJoin | .ok .uncertain =>
-        pure (directColumns.map fun column => { column with nullable := true })
+      | .ok analysis =>
+        let preserved := analysis.rowPreservedRelations.filter fun key =>
+          directColumns.any fun column =>
+            column.origin.map (fun origin => origin.relation == key) |>.getD false
+        match analysis.outerJoins with
+        | .noOuterJoin => pure (directColumns, preserved)
+        | .outerJoin | .uncertain =>
+          pure (directColumns.map (fun column => {
+            column with nullable := true, nullWidened := true
+          }), #[])
   pure (.ok {
     name := query.name
     sql := query.sql
     sqlHash := queryHash query.sql
     params
     columns
+    rowPreservedRelations
     cardinality := query.cardinality
   })
 

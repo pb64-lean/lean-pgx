@@ -160,6 +160,10 @@ structure QueryColumnIR where
   value and then locally validated/refined. -/
   logicalType : Option TypeRef := none
   nullable : Bool
+  /-- The result was conservatively made nullable because plan inspection
+  found an outer join or could not rule one out.  Such a cell does not prove
+  that any source row exists, even when its catalog column was nullable. -/
+  nullWidened : Bool := false
   origin : Option ColumnKey := none
   collation : Option CollationKey := none
   deriving Repr, BEq, Inhabited
@@ -178,6 +182,10 @@ structure QueryIR where
   sqlHash : String
   params : Array ParamIR
   columns : Array QueryColumnIR
+  /-- Relations for which plan inspection proved exactly one non-outer scan
+  occurrence.  Only these relations can contribute same-row table checks;
+  base relation/column OIDs alone cannot distinguish self-join aliases. -/
+  rowPreservedRelations : Array RelationKey := #[]
   /-- Value-local source-row constraints whose complete identity projections
   are present in this result contract. -/
   localConstraints : Array QueryConstraintIR := #[]
@@ -368,6 +376,7 @@ private def overrideAtom (value : TypeOverrideIR) : String :=
 private def queryColumnAtom (column : QueryColumnIR) : String :=
   atom column.name ++ typeRefAtom column.ty ++
     optionAtom typeRefAtom column.logicalType ++ boolAtom column.nullable ++
+    boolAtom column.nullWidened ++
     optionAtom (fun origin => relationKeyAtom origin.relation ++ atom origin.name) column.origin
 
 private def queryConstraintAtom (constraint : QueryConstraintIR) : String :=
@@ -381,6 +390,7 @@ private def paramAtom (param : ParamIR) : String :=
 private def queryAtom (query : QueryIR) : String :=
   atom query.name ++ atom query.sqlHash ++ arrayAtom paramAtom query.params ++
     arrayAtom queryColumnAtom query.columns ++
+    arrayAtom relationKeyAtom query.rowPreservedRelations ++
     arrayAtom queryConstraintAtom query.localConstraints ++ atom query.cardinality.tag
 
 private def sortByAtom (f : α → String) (values : Array α) : Array α :=
@@ -422,6 +432,7 @@ private def normalizeRelation (relation : RelationIR) : RelationIR :=
 private def normalizeQuery (query : QueryIR) : QueryIR :=
   { query with
     params := query.params.toList.mergeSort paramLess |>.toArray
+    rowPreservedRelations := sortByAtom relationKeyAtom query.rowPreservedRelations
     localConstraints := sortByAtom queryConstraintAtom query.localConstraints }
 
 /-- Put every unordered IR collection in a stable order before serialization.

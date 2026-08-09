@@ -614,6 +614,7 @@ instance : ToJson QueryColumnIR where
     ("type", toJson value.ty),
     ("logicalType", toJson value.logicalType),
     ("nullable", toJson value.nullable),
+    ("nullWidened", toJson value.nullWidened),
     ("origin", toJson value.origin),
     ("collation", toJson value.collation)
   ]
@@ -625,6 +626,7 @@ instance : FromJson QueryColumnIR where
       ty := ← requiredField json "type"
       logicalType := ← optionalField json "logicalType" none
       nullable := ← requiredField json "nullable"
+      nullWidened := ← optionalField json "nullWidened" false
       origin := ← optionalField json "origin" none
       collation := ← optionalField json "collation" none
     }
@@ -655,6 +657,7 @@ instance : ToJson QueryIR where
     ("sqlHash", toJson value.sqlHash),
     ("params", toJson value.params),
     ("columns", toJson value.columns),
+    ("rowPreservedRelations", toJson value.rowPreservedRelations),
     ("localConstraints", toJson value.localConstraints),
     ("cardinality", toJson value.cardinality)
   ]
@@ -667,6 +670,7 @@ instance : FromJson QueryIR where
       sqlHash := ← requiredField json "sqlHash"
       params := ← requiredField json "params"
       columns := ← requiredField json "columns"
+      rowPreservedRelations := ← optionalField json "rowPreservedRelations" #[]
       localConstraints := ← optionalField json "localConstraints" #[]
       cardinality := ← requiredField json "cardinality"
     }

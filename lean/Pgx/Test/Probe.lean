@@ -83,6 +83,25 @@ private def fullPlan : String :=
   "\"Node Type\":\"Merge Join\",\"Join Type\":\"Full\"," ++
   "\"Plans\":[{\"Node Type\":\"Sort\"},{\"Node Type\":\"Sort\"}]}]}}]"
 
+private def singleRelationPlan : String :=
+  "[{\"Plan\":{\"Node Type\":\"Seq Scan\",\"Schema\":\"app\"," ++
+  "\"Relation Name\":\"users\",\"Alias\":\"u\"}}]"
+
+private def selfJoinPlan : String :=
+  "[{\"Plan\":{\"Node Type\":\"Nested Loop\",\"Join Type\":\"Inner\"," ++
+  "\"Plans\":[{\"Node Type\":\"Seq Scan\",\"Schema\":\"app\"," ++
+  "\"Relation Name\":\"users\",\"Alias\":\"left_user\"}," ++
+  "{\"Node Type\":\"Index Scan\",\"Schema\":\"app\"," ++
+  "\"Relation Name\":\"users\",\"Alias\":\"right_user\"}]}}]"
+
+private def twoRelationPlan : String :=
+  "[{\"Plan\":{\"Node Type\":\"Hash Join\",\"Join Type\":\"Inner\"," ++
+  "\"Plans\":[{\"Node Type\":\"Seq Scan\",\"Schema\":\"app\"," ++
+  "\"Relation Name\":\"users\",\"Alias\":\"u\"}," ++
+  "{\"Node Type\":\"Hash\",\"Plans\":[{\"Node Type\":\"Seq Scan\"," ++
+  "\"Schema\":\"app\",\"Relation Name\":\"profiles\"," ++
+  "\"Alias\":\"p\"}]}]}}]"
+
 def main : IO UInt32 := do
   assert! (validateConfig validConfig).isOk
   assert! validConfig.normalizedSupportedServerMajors == #[17, 18]
@@ -193,6 +212,17 @@ def main : IO UInt32 := do
   assert! analyzeOuterJoinPlanJson innerPlan == .noOuterJoin
   assert! analyzeOuterJoinPlanJson leftPlan == .outerJoin
   assert! analyzeOuterJoinPlanJson fullPlan == .outerJoin
+  let single := analyzeQueryPlanJson singleRelationPlan
+  assert! single.outerJoins == .noOuterJoin
+  assert! single.rowPreservedRelations == #[relation]
+  let selfJoin := analyzeQueryPlanJson selfJoinPlan
+  assert! selfJoin.outerJoins == .noOuterJoin
+  assert! selfJoin.rowPreservedRelations.isEmpty
+  let twoRelations := analyzeQueryPlanJson twoRelationPlan
+  assert! twoRelations.outerJoins == .noOuterJoin
+  assert! twoRelations.rowPreservedRelations == #[relation,
+    { schema := "app", name := "profiles" }]
+  assert! (analyzeQueryPlanJson leftPlan).rowPreservedRelations.isEmpty
   assert! analyzeOuterJoinPlanJson
     "[{\"Plan\":{\"Node Type\":\"Future Scan\"}}]" == .uncertain
   assert! analyzeOuterJoinPlanJson

@@ -490,11 +490,30 @@ private def validateIR (db : Pgx.DatabaseIR) : Except CodegenError Unit := do
     if query.cardinality != .execute && query.columns.isEmpty then
       throw (.malformedIR s!"query {query.name}"
         "row-returning cardinality must have at least one result column")
+    if let some relation := firstDuplicate? query.rowPreservedRelations then
+      throw (.malformedIR s!"query {query.name}"
+        s!"duplicate row-preserved relation {relation}")
+    for key in query.rowPreservedRelations do
+      unless (relation? db key).isSome do
+        throw (.malformedIR s!"query {query.name}"
+          s!"row-preserved relation {key} is not present")
+      unless query.columns.any (fun column =>
+          column.origin.map (fun origin => origin.relation == key) |>.getD false) do
+        throw (.malformedIR s!"query {query.name}"
+          s!"row-preserved relation {key} has no direct result column")
+      if query.columns.any (fun column =>
+          column.nullWidened &&
+            (column.origin.map (fun origin => origin.relation == key) |>.getD false)) then
+        throw (.malformedIR s!"query {query.name}"
+          s!"row-preserved relation {key} has a null-widened result")
     for param in query.params do
       checkTypeSupported db param.ty.key s!"parameter {query.name}.${param.position}"
     for column in query.columns do
       if column.name.isEmpty then
         throw (.malformedIR s!"query {query.name}" "result column name is empty")
+      if column.nullWidened && !column.nullable then
+        throw (.malformedIR s!"result {query.name}.{column.name}"
+          "a null-widened result must be nullable")
       checkTypeSupported db column.ty.key s!"result {query.name}.{column.name}"
       if let some logical := column.logicalType then
         checkTypeSupported db logical.key s!"logical result {query.name}.{column.name}"

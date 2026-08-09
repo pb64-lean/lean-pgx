@@ -36,6 +36,8 @@ private def directProjection? (relation : Pgx.RelationIR) (query : Pgx.QueryIR)
   let source ← sourceColumn? relation sourceName
   let result ← resultColumn? query { relation := relation.key, name := sourceName }
   guard (result.logicalType.getD result.ty == source.ty)
+  -- A synthetic outer-join null does not establish that a source row exists.
+  guard (!result.nullWidened)
   guard (!result.nullable || source.nullable)
   pure (source, result)
 
@@ -97,6 +99,10 @@ private def projectConstraint? (relations : Array Pgx.RelationIR)
   guard (constraint.kind == .check)
   let expression ← constraint.localExpression
   let relation ← sourceRelation? relations constraint.relation
+  -- RowDescription identifies only the base relation and attribute.  The
+  -- plan-level witness rules out mixing columns from different self-join
+  -- aliases and rules out synthetic outer-join rows.
+  guard (query.rowPreservedRelations.contains relation.key)
   -- A constant check still needs descriptor provenance tying this query to
   -- the relation; otherwise the vacuous column traversal would attach every
   -- constant check in the database to every query.

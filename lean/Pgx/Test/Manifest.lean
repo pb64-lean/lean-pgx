@@ -134,6 +134,7 @@ private def sampleDatabase : DatabaseIR := {
       origin := some { relation := relationKey, name := "id" }
       collation := some collation
     }]
+    rowPreservedRelations := #[relationKey]
     localConstraints := #[localQueryConstraint]
     cardinality := .zeroOrOne
   }]
@@ -219,6 +220,8 @@ def main : IO UInt32 := do
   assert! snapshot == sampleDatabase.renderSnapshot
   assert! snapshot.contains "\"supportedServerMajors\""
   assert! snapshot.contains "\"logicalType\""
+  assert! snapshot.contains "\"nullWidened\""
+  assert! snapshot.contains "\"rowPreservedRelations\""
   assert! snapshot.contains "\"localConstraints\""
   assert! match DatabaseIR.parseSnapshot snapshot with
     | .ok decoded => decoded == sampleDatabase.normalize

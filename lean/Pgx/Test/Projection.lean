@@ -71,12 +71,14 @@ private def constraint (name source : String) (expression : TruthExpr)
   validated
 }
 
-private def query (columns : Array QueryColumnIR) : QueryIR := {
+private def query (columns : Array QueryColumnIR)
+    (rowPreservedRelations : Array RelationKey := #[usersKey]) : QueryIR := {
   name := "ProjectionFixture"
   sql := "SELECT fixture"
   sqlHash := "fixture"
   params := #[]
   columns
+  rowPreservedRelations
   cardinality := .many
 }
 
@@ -84,12 +86,14 @@ private def origin (relation : RelationKey) (name : String) : Option ColumnKey :
   some { relation, name }
 
 private def resultColumn (name : String) (ty : TypeRef) (nullable : Bool)
-    (columnOrigin : Option ColumnKey) (logicalType : Option TypeRef := none) :
+    (columnOrigin : Option ColumnKey) (logicalType : Option TypeRef := none)
+    (nullWidened : Bool := false) :
     QueryColumnIR := {
   name
   ty
   logicalType
   nullable
+  nullWidened
   origin := columnOrigin
 }
 
@@ -112,6 +116,15 @@ def main : IO UInt32 := do
   assert! complete[0]!.name == "users_age_quota"
   assert! complete[0]!.expression == multiCheckExpr "years" "limit" false true
   assert! complete[0]!.expression.referencedColumns == #["years", "limit", "years"]
+
+  -- Base table OIDs do not distinguish self-join aliases.  Without a plan
+  -- witness that the relation occurs exactly once, independently projected
+  -- columns cannot establish a same-row check.
+  let mixedSelfJoin := project #[multi] <| query #[
+    resultColumn "years" int4 false (origin usersKey "age"),
+    resultColumn "limit" int4 true (origin usersKey "quota")
+  ] #[]
+  assert! mixedSelfJoin.isEmpty
 
   -- Every referenced source field must be projected.
   let incomplete := project #[multi] <| query #[
@@ -152,6 +165,19 @@ def main : IO UInt32 := do
     resultColumn "age" int4 true (origin usersKey "age")
   ]
   assert! widenedNull.isEmpty
+
+  -- Even an already-nullable source loses row-local checks when an outer
+  -- join (or uncertain plan) can synthesize its result null.
+  let nullableCheck := constraint "users_quota_present" "CHECK (quota IS NOT NULL)"
+    (.isNotNull (intColumn "quota" true))
+  let ordinaryNullable := project #[nullableCheck] <| query #[
+    resultColumn "quota" int4 true (origin usersKey "quota")
+  ]
+  assert! ordinaryNullable.size == 1
+  let outerNullable := project #[nullableCheck] <| query #[
+    resultColumn "quota" int4 true (origin usersKey "quota") none true
+  ]
+  assert! outerNullable.isEmpty
 
   -- A domain may travel over its base wire type only with an explicit logical
   -- type proving that the direct result still represents the domain column.

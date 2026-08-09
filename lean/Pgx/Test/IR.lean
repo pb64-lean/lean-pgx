@@ -93,6 +93,7 @@ private def sample : DatabaseIR := {
         }
       }
     ]
+    rowPreservedRelations := #[{ schema := "app", name := "users" }]
     localConstraints := #[
       queryConstraint "users_id_positive" "CHECK (id > 0)"
         (idComparison .gt 0),
@@ -183,6 +184,7 @@ private def shuffled (db : DatabaseIR) : DatabaseIR := {
   queries := db.queries.reverse.map fun query =>
     { query with
       params := query.params.reverse
+      rowPreservedRelations := query.rowPreservedRelations.reverse
       localConstraints := query.localConstraints.reverse }
   requiredExtensions := db.requiredExtensions.reverse
   typeOverrides := db.typeOverrides.reverse
@@ -200,6 +202,13 @@ def main : IO UInt32 := do
         { c with nullable := true }) }
   let changed : DatabaseIR := { sample with queries := changedQueries }
   assert! sample.contractHash != changed.contractHash
+  let nullWidened : DatabaseIR := {
+    sample with queries := sample.queries.map fun query => {
+      query with columns := query.columns.map fun column =>
+        { column with nullWidened := true }
+    }
+  }
+  assert! sample.contractHash != nullWidened.contractHash
   let withoutLogicalType : DatabaseIR := {
     sample with queries := sample.queries.map fun query => {
       query with columns := query.columns.map fun column =>
@@ -212,6 +221,11 @@ def main : IO UInt32 := do
       { query with localConstraints := #[] }
   }
   assert! sample.contractHash != withoutQueryConstraints.contractHash
+  let withoutRowPreservation : DatabaseIR := {
+    sample with queries := sample.queries.map fun query =>
+      { query with rowPreservedRelations := #[] }
+  }
+  assert! sample.contractHash != withoutRowPreservation.contractHash
   let reordered := shuffled shuffledFixture
   assert! shuffledFixture.normalize == reordered.normalize
   assert! shuffledFixture.contractHash == reordered.contractHash

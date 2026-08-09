@@ -160,6 +160,7 @@ private def fixtureBase : DatabaseIR := {
           logicalType := some (ref reviewedStatusKey), nullable := false,
           origin := some { relation := usersKey, name := "status" } }
       ]
+      rowPreservedRelations := #[usersKey]
       cardinality := .many
     },
     {
@@ -184,6 +185,7 @@ private def fixtureBase : DatabaseIR := {
           logicalType := some (ref reviewedStatusKey), nullable := false,
           origin := some { relation := usersKey, name := "status" } }
       ]
+      rowPreservedRelations := #[usersKey]
       cardinality := .zeroOrOne
     },
     {
@@ -282,6 +284,33 @@ private def forgedQueryPlan : DatabaseIR := {
   fixture with
   queries := fixture.queries.map fun query =>
     if query.name == "GetUser" then { query with localConstraints := #[] } else query
+}
+
+private def forgedRowPreservedRelation : DatabaseIR := {
+  fixture with
+  queries := fixture.queries.map fun query =>
+    if query.name == "GetUser" then
+      { query with rowPreservedRelations := #[{ schema := "app", name := "missing" }] }
+    else query
+}
+
+private def forgedRowPreservedWidening : DatabaseIR := {
+  fixture with
+  queries := fixture.queries.map fun query =>
+    if query.name == "GetUser" then
+      { query with columns := query.columns.map fun column =>
+          if column.name == "id" then
+            { column with nullable := true, nullWidened := true }
+          else column }
+    else query
+}
+
+private def forgedRowPreservedWithoutOrigin : DatabaseIR := {
+  fixture with
+  queries := fixture.queries.map fun query =>
+    if query.name == "CountUsers" then
+      { query with rowPreservedRelations := #[usersKey] }
+    else query
 }
 
 private def forgedLogicalWire : DatabaseIR := {
@@ -456,6 +485,9 @@ def main : IO UInt32 := do
   assert! isError (emitDatabase "AppDb" forgedDomainValidation)
   assert! isError (emitDatabase "AppDb" forgedRelationValidation)
   assert! isError (emitDatabase "AppDb" forgedQueryPlan)
+  assert! isError (emitDatabase "AppDb" forgedRowPreservedRelation)
+  assert! isError (emitDatabase "AppDb" forgedRowPreservedWidening)
+  assert! isError (emitDatabase "AppDb" forgedRowPreservedWithoutOrigin)
   assert! isError (emitDatabase "AppDb" forgedLogicalWire)
   assert! isError (emitDatabase "AppDb" invalidCharacterTypmod)
   assert! isError (emitDatabase "AppDb" constrainedOverride)
