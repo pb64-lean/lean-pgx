@@ -45,3 +45,46 @@ register_toolchains(
     "@lean4_toolchain//:all",
     dev_dependency = True,
 )
+
+# Pinned PostgreSQL distributions used only by code-generation actions and
+# cross-major compatibility tests.  Generated libraries have no PostgreSQL
+# server runtime dependency.
+bazel_dep(name = "rules_nixpkgs_core", version = "0.13.0")
+
+postgres_nix = use_extension(
+    "@rules_nixpkgs_core//extensions:repository.bzl",
+    "nix_repo",
+)
+postgres_nix.file(
+    name = "postgres_nixpkgs",
+    file = "//:postgres.nix",
+    file_deps = ["//:postgres.json"],
+)
+use_repo(postgres_nix, "postgres_nixpkgs")
+
+postgres_pkg = use_extension(
+    "@rules_nixpkgs_core//extensions:package.bzl",
+    "nix_pkg",
+)
+
+_POSTGRES_BUILD = """\
+filegroup(
+    name = "toolchain",
+    srcs = glob(["bin/**", "lib/**", "share/**"]),
+    visibility = ["//visibility:public"],
+)
+"""
+
+postgres_pkg.attr(
+    name = "postgresql_17",
+    attr = "postgresql_17",
+    build_file_content = _POSTGRES_BUILD,
+    repo = "@postgres_nixpkgs",
+)
+postgres_pkg.attr(
+    name = "postgresql_18",
+    attr = "postgresql_18",
+    build_file_content = _POSTGRES_BUILD,
+    repo = "@postgres_nixpkgs",
+)
+use_repo(postgres_pkg, "postgresql_17", "postgresql_18")
