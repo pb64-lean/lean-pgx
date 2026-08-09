@@ -279,12 +279,13 @@ private def verifyColumns (catalog : ResolvedCatalog db)
     unless got.typeOid == oid do
       throw (.queryDrift
         s!"result column {want.name} changed PostgreSQL type")
-    match want.ty.typmod with
-    | some typmod =>
-      unless got.typeMod == typmod do
-        throw (.queryDrift
-          s!"result column {want.name} changed type modifier")
-    | none => pure ()
+    -- PostgreSQL encodes the absence of a type modifier as `-1` on the
+    -- wire.  Compare that sentinel as well: changing an unbounded value to a
+    -- bounded one must be query drift, not an unchecked descriptor change.
+    let expectedTypeMod := want.ty.typmod.getD (-1)
+    unless got.typeMod == expectedTypeMod do
+      throw (.queryDrift
+        s!"result column {want.name} changed type modifier")
     match want.origin with
     | some origin =>
       unless catalog.origin? got.tableOid got.attnum == some origin do

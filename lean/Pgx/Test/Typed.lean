@@ -107,6 +107,10 @@ def main : IO UInt32 := do
     { statement with columns := #[{ idResult with typeOid := 25 }] })
   assert! failed (verifyStatement catalog #[param] #[column]
     { statement with columns := #[{ idResult with typeMod := 42 }] })
+  let columnWithoutTypmod : ColumnSpec := { column with ty := { int4 with typmod := none } }
+  assert! (verifyStatement catalog #[param] #[columnWithoutTypmod] statement).isOk
+  assert! failed (verifyStatement catalog #[param] #[columnWithoutTypmod]
+    { statement with columns := #[{ idResult with typeMod := 42 }] })
   assert! failed (verifyStatement catalog #[param] #[column]
     { statement with columns := #[{ idResult with tableOid := 90002 }] })
   assert! okEq (decodeBuiltin (α := Int32) catalog int4 0 (some "42".toUTF8)) 42
