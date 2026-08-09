@@ -210,23 +210,107 @@ def QueryResult (cardinality : Pgx.Cardinality) (row : Type) : Type :=
   | .zeroOrOne => Option row
   | .many => Array row
 
+abbrev TypeResolver := Pgx.TypeKey → Except Error ResolvedType
+
+/-- A codec whose symbolic descriptor has been attached to a live catalog.
+The resolver is explicit because generated container and domain codecs must
+resolve their component types without retaining a connection-specific OID. -/
 structure ResolvedCodec (α : Type) where
   expected : StaticTypeDesc
-  encode : ResolvedType → α → Except Error EncodedValue
-  decode : ResolvedType → UInt16 → Option ByteArray → Except Error α
+  encode : TypeResolver → ResolvedType → α → Except Error EncodedValue
+  decode : TypeResolver → ResolvedType → UInt16 → Option ByteArray → Except Error α
 
 namespace ResolvedCodec
 
 def option (codec : ResolvedCodec α) : ResolvedCodec (Option α) where
   expected := codec.expected
-  encode resolved
+  encode resolve resolved
     | none => pure { format := 0, value := none }
-    | some value => codec.encode resolved value
-  decode resolved format
+    | some value => codec.encode resolve resolved value
+  decode resolve resolved format
     | none => pure none
-    | some bytes => some <$> codec.decode resolved format (some bytes)
+    | some bytes => some <$> codec.decode resolve resolved format (some bytes)
+
+private def checkedResolved (codec : ResolvedCodec α) (resolve : TypeResolver)
+    (ty : Pgx.TypeRef) : Except Error ResolvedType := do
+  let resolved ← resolve ty.key
+  unless resolved.expected == codec.expected do
+    throw (.schemaDrift s!"codec does not describe {ty.key}")
+  pure resolved
+
+/-- Render a non-NULL value through a resolved codec for embedding in a
+container's text representation.  A binary-only extension codec is rejected
+instead of having its bytes reinterpreted as text. -/
+def encodeText (codec : ResolvedCodec α) (resolve : TypeResolver)
+    (ty : Pgx.TypeRef) (value : α) : Except Error String := do
+  let resolved ← checkedResolved codec resolve ty
+  let encoded ← codec.encode resolve resolved value
+  unless encoded.format == 0 do
+    throw (.encode s!"codec for {ty.key} cannot encode container text")
+  let some bytes := encoded.value
+    | throw (.encode s!"codec for non-NULL {ty.key} encoded NULL")
+  let some text := String.fromUTF8? bytes
+    | throw (.encode s!"codec for {ty.key} produced non-UTF-8 text")
+  pure text
+
+/-- Decode a non-NULL text component through a resolved codec. -/
+def decodeText (codec : ResolvedCodec α) (resolve : TypeResolver)
+    (ty : Pgx.TypeRef) (value : String) : Except Error α := do
+  let resolved ← checkedResolved codec resolve ty
+  codec.decode resolve resolved 0 (some value.toUTF8)
+
+/-- Decode a non-NULL binary component through a resolved codec after
+checking the OID supplied by its enclosing binary value. -/
+def decodeBinary (codec : ResolvedCodec α) (resolve : TypeResolver)
+    (ty : Pgx.TypeRef) (actualOid : UInt32) (value : ByteArray) : Except Error α := do
+  let resolved ← checkedResolved codec resolve ty
+  unless actualOid == resolved.oid do
+    throw (.decode s!"component OID mismatch for {ty.key}: expected \
+      {resolved.oid}, got {actualOid}")
+  codec.decode resolve resolved 1 (some value)
 
 end ResolvedCodec
+
+/-- Convert a typed runtime error into the callback error expected by the
+pure container parsers. -/
+def asStringError : Except Error α → Except String α
+  | .ok value => .ok value
+  | .error error => .error error.toMessage
+
+def fromEncodeStringError : Except String α → Except Error α
+  | .ok value => .ok value
+  | .error message => .error (.encode message)
+
+def fromDecodeStringError : Except String α → Except Error α
+  | .ok value => .ok value
+  | .error message => .error (.decode message)
+
+/-- Render a built-in non-NULL value as text for a generated container codec. -/
+def encodeBuiltinText [Pg.PgEncode α] (value : α) : Except Error String := do
+  unless Pg.PgEncode.format α == 0 do
+    throw (.encode "built-in codec has no text encoder")
+  let some bytes := Pg.PgEncode.encode value
+    | throw (.encode "built-in codec encoded a non-NULL value as NULL")
+  let some text := String.fromUTF8? bytes
+    | throw (.encode "built-in text codec produced non-UTF-8 data")
+  pure text
+
+/-- Decode a built-in text component using the component's resolved OID. -/
+def decodeBuiltinText [Pg.PgDecode α] (resolved : ResolvedType)
+    (value : String) : Except Error α :=
+  match Pg.decodeValue (α := α) resolved.oid 0 (some value.toUTF8) with
+  | .ok decoded => pure decoded
+  | .error message => throw (.decode message)
+
+/-- Decode a built-in binary component after validating its enclosing OID. -/
+def decodeBuiltinBinary [Pg.PgDecode α] (resolved : ResolvedType)
+    (actualOid : UInt32) (value : ByteArray) : Except Error α := do
+  unless actualOid == resolved.oid do
+    throw (.decode s!"component OID mismatch for {resolved.expected.key}: expected \
+      {resolved.oid}, got {actualOid}")
+  match Pg.decodeValue (α := α) resolved.oid 1 (some value) with
+  | .ok decoded => pure decoded
+  | .error message => throw (.decode message)
 
 def encodeBuiltin [Pg.PgEncode α] (catalog : ResolvedCatalog db)
     (ty : Pgx.TypeRef) (value : α) : Except Error EncodedValue := do
@@ -248,14 +332,14 @@ def encodeResolved (codec : ResolvedCodec α) (catalog : ResolvedCatalog db)
   let resolved ← catalog.resolveType ty.key
   unless resolved.expected == codec.expected do
     throw (.schemaDrift s!"codec does not describe {ty.key}")
-  codec.encode resolved value
+  codec.encode (fun key => catalog.resolveType key) resolved value
 
 def decodeResolved (codec : ResolvedCodec α) (catalog : ResolvedCatalog db)
     (ty : Pgx.TypeRef) (format : UInt16) (value : Option ByteArray) : Except Error α := do
   let resolved ← catalog.resolveType ty.key
   unless resolved.expected == codec.expected do
     throw (.schemaDrift s!"codec does not describe {ty.key}")
-  codec.decode resolved format value
+  codec.decode (fun key => catalog.resolveType key) resolved format value
 
 structure QuerySpec (db : DatabaseDesc) (Params Row : Type)
     (cardinality : Pgx.Cardinality) where

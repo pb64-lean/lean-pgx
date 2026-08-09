@@ -245,6 +245,7 @@ private def typeCatalogSql : String :=
   "LEFT JOIN pg_catalog.pg_type AS bt ON bt.oid = NULLIF(t.typbasetype, 0) " ++
   "LEFT JOIN pg_catalog.pg_namespace AS bns ON bns.oid = bt.typnamespace " ++
   "LEFT JOIN pg_catalog.pg_type AS et ON et.oid = NULLIF(t.typelem, 0) " ++
+  "AND t.typcategory = 'A' " ++
   "LEFT JOIN pg_catalog.pg_namespace AS ens ON ens.oid = et.typnamespace " ++
   "LEFT JOIN pg_catalog.pg_range AS rg ON rg.rngtypid = t.oid " ++
   "LEFT JOIN pg_catalog.pg_type AS rst ON rst.oid = rg.rngsubtype " ++
