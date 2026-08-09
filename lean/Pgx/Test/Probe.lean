@@ -16,6 +16,45 @@ private def validConfig : Config := {
   }]
 }
 
+private def citextKey : Pgx.TypeKey := {
+  schema := "public", name := "citext", kind := .base
+}
+
+private def vectorKey : Pgx.TypeKey := {
+  schema := "public", name := "vector", kind := .base
+}
+
+private def halfvecKey : Pgx.TypeKey := {
+  schema := "public", name := "halfvec", kind := .base
+}
+
+private def overrideFor (key : Pgx.TypeKey) (leanType codec moduleName : String) :
+    Pgx.TypeOverrideIR := {
+  key, leanType, codec, importModule := some moduleName
+}
+
+private def packageConfig : Config := {
+  validConfig with
+  requiredExtensions := #["vector", "citext"]
+  typeOverrides := #[
+    overrideFor vectorKey "Vector" "vectorCodec" "Ext.Vector",
+    overrideFor halfvecKey "HalfVector" "halfvecCodec" "Ext.Vector",
+    overrideFor citextKey "String" "citextCodec" "Ext.Citext"
+  ]
+  extensionCodecPackages := #[
+    {
+      extension := "vector"
+      importModule := "Ext.Vector"
+      types := #[vectorKey, halfvecKey]
+    },
+    {
+      extension := "citext"
+      importModule := "Ext.Citext"
+      types := #[citextKey]
+    }
+  ]
+}
+
 private def isError : Except Error α → Bool
   | .error _ => true
   | .ok _ => false
@@ -104,6 +143,7 @@ private def twoRelationPlan : String :=
 
 def main : IO UInt32 := do
   assert! (validateConfig validConfig).isOk
+  assert! (validateConfig packageConfig).isOk
   assert! validConfig.normalizedSupportedServerMajors == #[17, 18]
   assert! (adapterForServerMajor? 17).map (·.serverMajor) == some 17
   assert! (adapterForServerMajor? 18).map (·.serverMajor) == some 18
@@ -208,6 +248,112 @@ def main : IO UInt32 := do
   assert! isError (validateConfig { validConfig with queries := sparse })
   let emptySql := validConfig.queries.map fun query => { query with sql := " \n\t" }
   assert! isError (validateConfig { validConfig with queries := emptySql })
+
+  let installed := #[("vector", "0.8.0"), ("citext", "1.6")]
+  let resolvedPackages ← match packageConfig.resolvedExtensionCodecPackages installed with
+    | .ok value => pure value
+    | .error error => panic! toString error
+  assert! resolvedPackages == #[
+    {
+      extension := "citext"
+      version := "1.6"
+      importModule := "Ext.Citext"
+      types := #[citextKey]
+    },
+    {
+      extension := "vector"
+      version := "0.8.0"
+      importModule := "Ext.Vector"
+      types := #[halfvecKey, vectorKey]
+    }
+  ]
+  let reorderedPackages : Config := {
+    packageConfig with
+    requiredExtensions := packageConfig.requiredExtensions.reverse
+    typeOverrides := packageConfig.typeOverrides.reverse
+    extensionCodecPackages := packageConfig.extensionCodecPackages.reverse.map
+      fun (package : ExtensionCodecPackageInput) =>
+      { package with types := package.types.reverse }
+  }
+  assert! (validateConfig reorderedPackages).isOk
+  match reorderedPackages.resolvedExtensionCodecPackages installed.reverse with
+  | .ok value => assert! value == resolvedPackages
+  | .error error => panic! toString error
+  assert! isError (packageConfig.resolvedExtensionCodecPackages #[
+    ("citext", "1.6")])
+
+  assert! isError (validateConfig {
+    packageConfig with
+    extensionCodecPackages := packageConfig.extensionCodecPackages.map
+      (fun (package : ExtensionCodecPackageInput) =>
+      if package.extension == "citext" then
+        { package with extension := " citext" }
+      else package)
+  })
+  assert! isError (validateConfig {
+    packageConfig with
+    extensionCodecPackages := packageConfig.extensionCodecPackages.map
+      (fun (package : ExtensionCodecPackageInput) =>
+      if package.extension == "citext" then
+        { package with importModule := "" }
+      else package)
+  })
+  assert! isError (validateConfig {
+    packageConfig with
+    extensionCodecPackages := packageConfig.extensionCodecPackages.map
+      (fun (package : ExtensionCodecPackageInput) =>
+      if package.extension == "citext" then
+        { package with types := #[] }
+      else package)
+  })
+  assert! isError (validateConfig {
+    packageConfig with requiredExtensions := #["vector"]
+  })
+  assert! isError (validateConfig {
+    packageConfig with
+    extensionCodecPackages := packageConfig.extensionCodecPackages.map
+      (fun (package : ExtensionCodecPackageInput) =>
+      if package.extension == "citext" then
+        { package with types := #[{
+            schema := "public", name := "missing", kind := .base
+          }] }
+      else package)
+  })
+  assert! isError (validateConfig {
+    packageConfig with
+    extensionCodecPackages := packageConfig.extensionCodecPackages.map
+      (fun (package : ExtensionCodecPackageInput) =>
+      if package.extension == "citext" then
+        { package with importModule := "Ext.Other" }
+      else package)
+  })
+  assert! isError (validateConfig {
+    packageConfig with extensionCodecPackages :=
+      packageConfig.extensionCodecPackages.push {
+        extension := "vector"
+        importModule := "Ext.Vector"
+        types := #[vectorKey]
+      }
+  })
+  assert! isError (validateConfig {
+    packageConfig with
+    extensionCodecPackages := packageConfig.extensionCodecPackages.map
+      (fun (package : ExtensionCodecPackageInput) =>
+      if package.extension == "citext" then
+        { package with types := #[vectorKey] }
+      else package)
+  })
+  assert! isError (validateConfig {
+    packageConfig with
+    typeOverrides := packageConfig.typeOverrides.push
+      (overrideFor { schema := " ", name := "blank", kind := .base }
+        "Blank" "blankCodec" "Ext.Citext")
+    extensionCodecPackages := packageConfig.extensionCodecPackages.map
+      (fun (package : ExtensionCodecPackageInput) =>
+      if package.extension == "citext" then
+        { package with types := #[{ schema := " ", name := "blank", kind := .base }] }
+      else package)
+  })
 
   assert! analyzeOuterJoinPlanJson innerPlan == .noOuterJoin
   assert! analyzeOuterJoinPlanJson leftPlan == .outerJoin

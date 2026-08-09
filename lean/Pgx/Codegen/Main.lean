@@ -244,6 +244,11 @@ private def probe (options : Options) (loaded : LoadedInput) :
         supportedServerMajors := options.serverMajors
         requiredExtensions := loaded.manifest.requiredExtensionNames
         typeOverrides := loaded.manifest.resolvedTypeOverrides
+        extensionCodecPackages := loaded.manifest.codecPackages.map fun package => ({
+          extension := package.extension
+          importModule := package.importModule
+          types := package.typeOverrides.map (·.key)
+        } : Probe.ExtensionCodecPackageInput)
       }
       match ← Probe.probeDatabase conn probeConfig with
       | .ok database => pure (.ok database)

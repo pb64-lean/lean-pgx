@@ -35,6 +35,15 @@ structure QueryInput where
   parameters : Array ParameterInput := #[]
   deriving Repr, BEq, Inhabited
 
+/-- Manifest-neutral provenance for a reusable extension codec package.
+Installed extension versions are deliberately absent here and are resolved
+from `pg_extension` while probing the migrated database. -/
+structure ExtensionCodecPackageInput where
+  extension : String
+  importModule : String
+  types : Array Pgx.TypeKey
+  deriving Repr, BEq, Inhabited
+
 /-- Inputs which affect the normalized database contract.  The connection is
 expected to point at an empty-cluster migration result owned by the caller. -/
 structure Config where
@@ -44,6 +53,7 @@ structure Config where
   supportedServerMajors : Array Nat := #[17, 18]
   requiredExtensions : Array String := #[]
   typeOverrides : Array Pgx.TypeOverrideIR := #[]
+  extensionCodecPackages : Array ExtensionCodecPackageInput := #[]
   deriving Repr, BEq, Inhabited
 
 namespace Config
@@ -391,6 +401,31 @@ def validateConfig (config : Config) : Except Error Unit := do
   for override in config.typeOverrides do
     if isBlank override.leanType || isBlank override.codec then
       throw (.invalidConfig s!"type override {override.key} has an empty Lean type or codec")
+  if hasDuplicates (config.extensionCodecPackages.map (·.extension)) then
+    throw (.invalidConfig "extension codec package names contain duplicates")
+  let packagedTypes := config.extensionCodecPackages.flatMap (·.types)
+  if hasDuplicates packagedTypes then
+    throw (.invalidConfig "extension codec package type keys contain duplicates")
+  for package in config.extensionCodecPackages do
+    if isBlank package.extension ||
+        package.extension.trimAscii.toString != package.extension then
+      throw (.invalidConfig
+        "extension codec package names must not be empty or untrimmed")
+    if isBlank package.importModule ||
+        package.importModule.trimAscii.toString != package.importModule then
+      throw (.invalidConfig s!"extension codec package {package.extension} has an empty or untrimmed import module")
+    if package.types.isEmpty then
+      throw (.invalidConfig s!"extension codec package {package.extension} has no type overrides")
+    unless config.requiredExtensions.contains package.extension do
+      throw (.invalidConfig s!"extension codec package {package.extension} is not a required extension")
+    for key in package.types do
+      if isBlank key.schema || key.schema.trimAscii.toString != key.schema ||
+          isBlank key.name || key.name.trimAscii.toString != key.name then
+        throw (.invalidConfig s!"extension codec package {package.extension} has an empty or untrimmed type key")
+      let some override := config.typeOverrides.find? (fun value => value.key == key)
+        | throw (.invalidConfig s!"extension codec package {package.extension} type {key} has no resolved override")
+      unless override.importModule == some package.importModule do
+        throw (.invalidConfig s!"extension codec package {package.extension} type {key} does not use import module {package.importModule}")
   let mut queryNames : Array String := #[]
   for query in config.queries do
     if isBlank query.name then
@@ -401,6 +436,31 @@ def validateConfig (config : Config) : Except Error Unit := do
       throw (.invalidQuery query.name "SQL source is empty")
     validateParameterInput query
     queryNames := queryNames.push query.name
+
+private def typeKeyLess (left right : Pgx.TypeKey) : Bool :=
+  let leftKey := s!"{left.schema}\u0000{left.name}\u0000{left.kind.tag}"
+  let rightKey := s!"{right.schema}\u0000{right.name}\u0000{right.kind.tag}"
+  leftKey < rightKey
+
+/-- Attach live installed versions to validated package declarations.  The
+result is canonical even when callers supply package or type keys in a
+different order. -/
+def Config.resolvedExtensionCodecPackages (config : Config)
+    (installed : Array (String × String)) : Except Error (Array Pgx.ExtensionCodecPackageIR) := do
+  let mut result : Array Pgx.ExtensionCodecPackageIR := #[]
+  for package in config.extensionCodecPackages do
+    let some extension := installed.find? (fun value => value.1 == package.extension)
+      | throw (.catalog s!"required extension {package.extension} is not installed")
+    result := result.push {
+      extension := package.extension
+      version := extension.2
+      importModule := package.importModule
+      types := package.types.toList.mergeSort typeKeyLess |>.toArray
+    }
+  pure <| result.toList.mergeSort (fun left right =>
+    if left.extension == right.extension then
+      left.importModule < right.importModule
+    else left.extension < right.extension) |>.toArray
 
 private structure CatalogType where
   oid : UInt32
@@ -1741,6 +1801,10 @@ def probeDatabase (conn : Pg.Connection) (config : Config) :
     match ← analyzeQuery conn config snapshot query with
     | .error error => return .error error
     | .ok value => queries := queries.push value
+  let extensionCodecPackages ← match
+      config.resolvedExtensionCodecPackages snapshot.extensions with
+    | .error error => return .error error
+    | .ok value => pure value
   let database : Pgx.DatabaseIR := {
     serverMajor := snapshot.serverMajor
     supportedServerMajors := config.normalizedSupportedServerMajors
@@ -1760,6 +1824,7 @@ def probeDatabase (conn : Pg.Connection) (config : Config) :
     queries
     requiredExtensions := snapshot.extensions
     typeOverrides := config.typeOverrides
+    extensionCodecPackages
   }
   pure (.ok (Projection.planDatabase database).normalize)
 
