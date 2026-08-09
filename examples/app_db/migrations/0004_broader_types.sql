@@ -1,3 +1,5 @@
+CREATE EXTENSION citext WITH SCHEMA app;
+
 CREATE TYPE app.contact_card AS (
   label text,
   status app.user_status,
@@ -18,6 +20,8 @@ CREATE TABLE app.type_samples (
   scores app.score_multirange NOT NULL,
   amount numeric(6, 2) NOT NULL,
   observed_at time(3) NOT NULL,
+  nickname app.citext NOT NULL,
+  aliases app.citext[] NOT NULL,
   CONSTRAINT type_samples_pkey PRIMARY KEY (id)
 );
 

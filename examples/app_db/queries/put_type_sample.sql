@@ -5,9 +5,11 @@ INSERT INTO app.type_samples (
   score,
   scores,
   amount,
-  observed_at
+  observed_at,
+  nickname,
+  aliases
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 RETURNING
   id,
   statuses,
@@ -16,4 +18,6 @@ RETURNING
   score,
   scores,
   amount,
-  observed_at;
+  observed_at,
+  nickname,
+  aliases;

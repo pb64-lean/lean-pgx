@@ -1,5 +1,18 @@
 {
   "supportedServerMajors": [17, 18],
+  "extensionCodecPackages": [
+    {
+      "extension": "citext",
+      "importModule": "AppDb.ExtensionCodecs",
+      "typeOverrides": [
+        {
+          "key": {"schema": "app", "name": "citext", "kind": "base"},
+          "leanType": "String",
+          "codec": "AppDb.ExtensionCodecs.Citext.codec"
+        }
+      ]
+    }
+  ],
   "call_type_sample_tvf.sql": {
     "leanName": "CallTypeSampleTvf",
     "cardinality": "many",
@@ -133,6 +146,16 @@
       {
         "position": 7,
         "name": "observedAt",
+        "nullable": false
+      },
+      {
+        "position": 8,
+        "name": "nickname",
+        "nullable": false
+      },
+      {
+        "position": 9,
+        "name": "aliases",
         "nullable": false
       }
     ]

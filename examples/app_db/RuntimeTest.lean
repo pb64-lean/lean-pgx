@@ -253,10 +253,13 @@ private def exerciseBroaderTypes
   let scores : AppDb.Types.AppScoreMultirange := #[score, otherScore]
   let amount ← numeric! "parse numeric(6,2) fixture" "1234.50"
   let observedAt ← plainTime! "parse time(3) fixture" "12:34:56.789"
+  let nickname := "MiXeD-Case"
+  let aliases : AppDb.Types.AppCitext :=
+    #[some "Primary", none, some "SECONDARY"]
 
   let stored ← typed! "PutTypeSample.exactlyOne" (←
     AppDb.Queries.PutTypeSample.run conn {
-      statuses, emails, card, score, scores, amount, observedAt
+      statuses, emails, card, score, scores, amount, observedAt, nickname, aliases
     })
   unless stored.val.statuses == statuses do
     fail "enum array did not round-trip, including its NULL element"
@@ -272,6 +275,8 @@ private def exerciseBroaderTypes
   unless stored.val.amount.toString == "1234.50" &&
       stored.val.observedAt.toNanoseconds == observedAt.toNanoseconds do
     fail "numeric/time type-modifier values did not round-trip"
+  unless stored.val.nickname == nickname && stored.val.aliases == aliases do
+    fail "extension package scalar or nested array codec did not round-trip"
 
   let summaries ← typed! "ListTypeSampleView.many" (←
     AppDb.Queries.ListTypeSampleView.run conn {})
@@ -300,6 +305,10 @@ private def exerciseBroaderTypes
       routine.key.name == "list_type_sample_summaries" &&
       routine.returnsSet && routine.resultColumns.size == 3) do
     fail "generated metadata omitted the table-valued function shape"
+  unless AppDb.Constraints.extensionCodecPackages.any (fun package =>
+      package.extension == "citext" && package.importModule == "AppDb.ExtensionCodecs" &&
+      package.types == #[{ schema := "app", name := "citext", kind := .base }]) do
+    fail "generated metadata omitted extension codec package provenance"
 
 private def exerciseStoredConstraintViolations
     (raw : Pg.Connection)

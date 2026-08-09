@@ -325,6 +325,14 @@ def typeSampleObservedAt
     (row : AppDb.Queries.PutTypeSample.Row) : Std.Time.PlainTime :=
   row.val.observedAt
 
+def typeSampleNickname
+    (row : AppDb.Queries.PutTypeSample.Row) : String :=
+  row.val.nickname
+
+def typeSampleAliases
+    (row : AppDb.Queries.PutTypeSample.Row) : AppDb.Types.AppCitext :=
+  row.val.aliases
+
 def typeSampleCardStatus
     (card : AppDb.Types.AppContactCard) : Option AppDb.Types.AppUserStatus :=
   card.status

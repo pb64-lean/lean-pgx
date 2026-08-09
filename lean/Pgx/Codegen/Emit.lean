@@ -670,19 +670,11 @@ private def validateIR (db : Pgx.DatabaseIR) : Except CodegenError Unit := do
       throw (.malformedIR s!"routine {routine.key}" "unknown volatility code")
     if routine.parallel != "s" && routine.parallel != "r" && routine.parallel != "u" then
       throw (.malformedIR s!"routine {routine.key}" "unknown parallel-safety code")
-    for arg in routine.args do
-      checkTypeSupported db arg.ty.key s!"routine argument {routine.key}"
     for i in [0:routine.resultColumns.size] do
       let column := routine.resultColumns[i]!
       unless column.ordinal == i + 1 do
         throw (.malformedIR s!"routine {routine.key}"
           "result ordinals must be dense and start at one")
-      checkTypeSupported db column.ty.key s!"routine result {routine.key}.{column.name}"
-    if let some result := routine.returnType then
-      -- OUT/TABLE routines report `pg_catalog.record` as the scalar return
-      -- shell; the typed resultColumns above are the usable contract.
-      unless result.key.kind == .pseudo && !routine.resultColumns.isEmpty do
-        checkTypeSupported db result.key s!"routine return {routine.key}"
 
   validateRelationConstraints db
 

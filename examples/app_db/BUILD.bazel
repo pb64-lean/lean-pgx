@@ -7,9 +7,16 @@ load(
     "pg_live_test",
     "pg_query_set",
 )
-load("@rules_lean//lean:defs.bzl", "lean_binary", "lean_test")
+load("@rules_lean//lean:defs.bzl", "lean_binary", "lean_library", "lean_test")
 
 package(default_visibility = ["//visibility:public"])
+
+lean_library(
+    name = "extension_codecs",
+    srcs = ["AppDb/ExtensionCodecs.lean"],
+    deps = ["//lean/Pgx:pg_typed"],
+    strip_module_prefix = "examples/app_db",
+)
 
 pg_query_set(
     name = "queries",
@@ -38,6 +45,7 @@ lean_pg_library(
     ],
     queries = ":queries",
     schemas = ["app"],
+    deps = [":extension_codecs"],
 )
 
 pg_compat_test(
