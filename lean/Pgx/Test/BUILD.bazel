@@ -24,6 +24,13 @@ lean_test(
 )
 
 lean_test(
+    name = "composite_test",
+    srcs = ["Composite.lean"],
+    deps = ["//lean/Pgx/Typed:composite"],
+    strip_module_prefix = "lean",
+)
+
+lean_test(
     name = "manifest_test",
     srcs = ["Manifest.lean"],
     deps = ["//lean/Pgx/Codegen:manifest"],

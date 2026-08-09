@@ -23,6 +23,13 @@ lean_library(
 )
 
 lean_library(
+    name = "composite",
+    srcs = ["Composite.lean"],
+    deps = ["@pg_lean//:pg_lean"],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
     name = "catalog",
     srcs = ["Catalog.lean"],
     deps = [

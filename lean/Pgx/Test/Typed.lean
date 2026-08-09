@@ -16,6 +16,34 @@ private def usersKey : Pgx.RelationKey := { schema := "app", name := "users" }
 private def int4Desc : StaticTypeDesc := { key := int4Key }
 private def textDesc : StaticTypeDesc := { key := textKey }
 
+private def resolveTestType : TypeResolver
+  | key =>
+      if key == int4Key then
+        pure { expected := int4Desc, oid := 23 }
+      else if key == textKey then
+        pure { expected := textDesc, oid := 25 }
+      else
+        throw (.unsupportedType key)
+
+private def int4Codec : ResolvedCodec Int32 where
+  expected := int4Desc
+  encode _ resolved value := do
+    unless resolved.expected == int4Desc && resolved.oid == 23 do
+      throw (.schemaDrift "int4 codec received the wrong resolved descriptor")
+    pure { format := 0, value := some (toString value).toUTF8 }
+  decode _ resolved format value :=
+    match Pg.decodeValue (α := Int32) resolved.oid format value with
+    | .ok decoded => pure decoded
+    | .error message => throw (.decode message)
+
+private def binaryInt4Codec : ResolvedCodec Int32 where
+  expected := int4Desc
+  encode _ _ _ := pure { format := 1, value := some (ByteArray.mk #[0, 0, 0, 42]) }
+  decode _ resolved format value :=
+    match Pg.decodeValue (α := Int32) resolved.oid format value with
+    | .ok decoded => pure decoded
+    | .error message => throw (.decode message)
+
 private def idColumn : StaticColumnDesc :=
   { name := "id", ordinal := 1, ty := int4, nullable := false }
 
@@ -93,7 +121,31 @@ private def isError (result : Except Error α) : Bool :=
   | .error _ => true
   | .ok _ => false
 
+private def resolvedCodecTests : IO Unit := do
+  let binary42 := ByteArray.mk #[0, 0, 0, 42]
+  assert! okEq (int4Codec.encodeText resolveTestType int4 42) "42"
+  assert! okEq (int4Codec.decodeText resolveTestType int4 "-17") (-17)
+  assert! okEq (int4Codec.decodeBinary resolveTestType int4 23 binary42) 42
+
+  -- The enclosing container's OID and the codec's symbolic descriptor are
+  -- both checked before any component decoder can observe the payload.
+  assert! isError (int4Codec.decodeBinary resolveTestType int4 25 binary42)
+  assert! isError (int4Codec.encodeText resolveTestType text 42)
+  assert! isError (int4Codec.decodeText resolveTestType text "42")
+
+  -- Binary-only extension codecs cannot silently reinterpret their bytes as
+  -- a PostgreSQL container's text representation.
+  assert! isError (binaryInt4Codec.encodeText resolveTestType int4 42)
+
+  let optional := int4Codec.option
+  assert! okEq (optional.encode resolveTestType
+    { expected := int4Desc, oid := 23 } none)
+      ({ format := 0, value := none } : EncodedValue)
+  assert! okEq (optional.decode resolveTestType
+    { expected := int4Desc, oid := 23 } 1 none) none
+
 def main : IO UInt32 := do
+  resolvedCodecTests
   let catalog ← match catalogResult with
     | .ok value => pure value
     | .error error => throw (IO.userError (toString error))
