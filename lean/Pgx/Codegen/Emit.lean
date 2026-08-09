@@ -389,6 +389,9 @@ private def validateDomainConstraints (db : Pgx.DatabaseIR)
         throw (.unsupportedConstraint s!"domain {domain.key} constraint {constraint.name}"
           (toString diagnostic))
     | .ok parsed =>
+        unless parsed.validated == constraint.validated do
+          throw (.malformedIR s!"domain {domain.key} constraint {constraint.name}"
+            "NOT VALID suffix differs from catalog validation metadata")
         unless parsed.expression == constraint.expression do
           throw (.malformedIR s!"domain {domain.key} constraint {constraint.name}"
             "typed expression differs from reparsing its normalized source")
@@ -410,6 +413,9 @@ private def validateRelationConstraints (db : Pgx.DatabaseIR) :
       | .error diagnostic =>
           throw (.unsupportedConstraint s!"constraint {constraint.name}" (toString diagnostic))
       | .ok parsed =>
+          unless parsed.validated == constraint.validated do
+            throw (.malformedIR s!"constraint {constraint.name}"
+              "NOT VALID suffix differs from catalog validation metadata")
           unless parsed.expression == expression do
             throw (.malformedIR s!"constraint {constraint.name}"
               "typed expression differs from reparsing its normalized source")

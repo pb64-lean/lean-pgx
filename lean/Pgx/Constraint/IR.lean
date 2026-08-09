@@ -235,6 +235,9 @@ for diagnostics while making the typed expression authoritative. -/
 structure Parsed where
   source : String
   expression : TruthExpr
+  /-- Whether the normalized definition omitted PostgreSQL's `NOT VALID`
+  suffix.  Probes cross-check this deparsed property against `convalidated`. -/
+  validated : Bool := true
   deriving Repr, BEq, Inhabited
 
 end Pgx.Constraint

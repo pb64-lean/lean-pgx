@@ -52,7 +52,8 @@ private def users : Pgx.RelationIR := {
     { name := "age", ordinal := 1, ty := base "int4", nullable := true },
     { name := "status", ordinal := 2, ty := { key := statusKey }, nullable := false },
     { name := "display_name", ordinal := 3, ty := base "varchar" (some 68), nullable := false },
-    { name := "amount", ordinal := 4, ty := base "numeric", nullable := false }
+    { name := "amount", ordinal := 4, ty := base "numeric", nullable := false },
+    { name := "code", ordinal := 5, ty := base "bpchar" (some 7), nullable := false }
   ]
 }
 
@@ -134,6 +135,60 @@ def main : IO Unit := do
     | .ok parsed => pure parsed
     | .error error => panic! toString error
   assert! lengthCheck.expression.referencedColumns == #["display_name"]
+
+  for (serverMajor, source) in #[(17, "CHECK (age >= 0) NOT VALID"),
+      (18, "CHECK (age >= 0) NOT VALID")] do
+    let parsed ← match parseTableCheck users #[status] #[trimmed, email] source with
+      | .ok parsed => pure parsed
+      | .error error => panic! s!"PostgreSQL {serverMajor} suffix shape: {error}"
+    assert! !parsed.validated
+    assert! parsed.source == source
+  let ordinary ← match parseTableCheck users #[status] #[trimmed, email]
+      "CHECK (age >= 0)" with
+    | .ok parsed => pure parsed
+    | .error error => panic! toString error
+  assert! ordinary.validated
+  let deferredDomain ← match parseDomainCheck trimmed #[status] #[trimmed, email]
+      "CHECK (VALUE IS NOT NULL) NOT VALID" with
+    | .ok parsed => pure parsed
+    | .error error => panic! toString error
+  assert! !deferredDomain.validated
+  expectDiagnostic .unsupportedOperator 17
+    "NO INHERIT check constraints are unsupported because inheritance metadata is not modeled" <|
+    parseTableCheck users #[status] #[trimmed, email]
+      "CHECK (age >= 0) NO INHERIT"
+  expectDiagnostic .unsupportedOperator 17
+    "NO INHERIT check constraints are unsupported because inheritance metadata is not modeled" <|
+    parseTableCheck users #[status] #[trimmed, email]
+      "CHECK (age >= 0) NO INHERIT NOT VALID"
+  expectDiagnostic .unsupportedOperator 27
+    "construct not is not supported after the check expression" <|
+    parseTableCheck users #[status] #[trimmed, email]
+      "CHECK (age >= 0) NOT VALID NOT VALID"
+  expectDiagnostic .unsupportedOperator 17
+    "construct valid is not supported after the check expression" <|
+    parseTableCheck users #[status] #[trimmed, email]
+      "CHECK (age >= 0) VALID"
+
+  let nullIsNull ← match parseTableCheck users #[status] #[trimmed, email]
+      "CHECK (NULL IS NULL)" with
+    | .ok parsed => pure parsed
+    | .error error => panic! toString error
+  assert! nullIsNull.expression == .constant (some true)
+  let nullIsNotNull ← match parseTableCheck users #[status] #[trimmed, email]
+      "CHECK (NULL IS NOT NULL)" with
+    | .ok parsed => pure parsed
+    | .error error => panic! toString error
+  assert! nullIsNotNull.expression == .constant (some false)
+
+  expectDiagnostic .unsupportedType 19
+    "pg_catalog.bpchar local constraint semantics are unsupported because fixed-length blank padding is not modeled" <|
+    parseTableCheck users #[status] #[trimmed, email]
+      "CHECK (char_length(code) = 1)"
+  expectDiagnostic .unsupportedType 21
+    "pg_catalog.bpchar local constraint semantics are unsupported because fixed-length blank padding is not modeled" <|
+    parseTableCheck users #[status] #[trimmed, email]
+      "CHECK (display_name::bpchar IS NOT NULL)"
 
   expectDiagnostic .unsupportedFunction 7
     "function lower is not supported in local constraints" <|

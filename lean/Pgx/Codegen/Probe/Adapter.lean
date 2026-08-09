@@ -62,7 +62,15 @@ def constraintCatalogSql (adapter : Adapter) : String :=
   "rns.nspname, rc.relname, " ++
   "CASE WHEN con.contype IN ('c', 'x') " ++
   "THEN pg_catalog.pg_get_constraintdef(con.oid, true) ELSE NULL END, " ++
-  "con.convalidated::text " ++
+  "con.convalidated::text, " ++
+  "(EXISTS (SELECT 1 FROM pg_catalog.pg_depend AS dep " ++
+  "WHERE dep.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass " ++
+  "AND dep.objid = con.oid " ++
+  "AND dep.refclassid = 'pg_catalog.pg_proc'::pg_catalog.regclass))::text, " ++
+  "(EXISTS (SELECT 1 FROM pg_catalog.pg_depend AS dep " ++
+  "WHERE dep.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass " ++
+  "AND dep.objid = con.oid " ++
+  "AND dep.refclassid = 'pg_catalog.pg_operator'::pg_catalog.regclass))::text " ++
   "FROM pg_catalog.pg_constraint AS con " ++
   "JOIN pg_catalog.pg_class AS c ON c.oid = con.conrelid " ++
   "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = c.relnamespace " ++

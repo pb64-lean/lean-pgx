@@ -116,6 +116,43 @@ def main : IO UInt32 := do
   assert! Pg18.adapter.supportsNativeNotNull
   assert! !Pg17.adapter.constraintTypeTags.contains "n"
   assert! Pg18.adapter.constraintTypeTags.contains "n"
+  for adapter in #[Pg17.adapter, Pg18.adapter] do
+    let sql := adapter.constraintCatalogSql
+    assert! sql.contains "pg_catalog.pg_depend"
+    assert! sql.contains "pg_catalog.pg_proc"
+    assert! sql.contains "pg_catalog.pg_operator"
+    assert! sql.contains "pg_catalog.pg_constraint'::pg_catalog.regclass"
+  let dependencySource := "CHECK (btrim(display_name) <> '')"
+  match validateLocalConstraintDependencies "app.users" "name_check"
+      dependencySource true false with
+  | .error (.unsupportedConstraint owner name source diagnostic) => do
+      assert! owner == "app.users"
+      assert! name == "name_check"
+      assert! source == dependencySource
+      assert! diagnostic.category == .unsupportedFunction
+      assert! diagnostic.offset == 0
+      assert! diagnostic.message ==
+        "catalog-dependent functions are unsupported in local constraints"
+  | .error error => panic! s!"unexpected dependency diagnostic: {error}"
+  | .ok () => panic! "catalog-dependent function was accepted"
+  match validateLocalConstraintDependencies "app.users" "operator_check"
+      "CHECK (age OPERATOR(app.>) 0)" false true with
+  | .error (.unsupportedConstraint _ _ _ diagnostic) => do
+      assert! diagnostic.category == .unsupportedOperator
+      assert! diagnostic.offset == 0
+      assert! diagnostic.message ==
+        "catalog-dependent operators are unsupported in local constraints"
+  | .error error => panic! s!"unexpected dependency diagnostic: {error}"
+  | .ok () => panic! "catalog-dependent operator was accepted"
+  assert! (validateLocalConstraintDependencies "app.users" "builtin_check"
+    "CHECK (char_length(display_name) > 0)" false false).isOk
+  assert! (validateConstraintValidationMetadata "app.users" "deferred_check"
+    false false).isOk
+  match validateConstraintValidationMetadata "app.users" "deferred_check" false true with
+  | .error (.catalog message) =>
+      assert! message == "constraint app.users.deferred_check: pg_get_constraintdef validation suffix implies convalidated=true, but pg_constraint reports convalidated=false"
+  | .error error => panic! s!"unexpected validation metadata diagnostic: {error}"
+  | .ok () => panic! "inconsistent NOT VALID metadata was accepted"
   let normalized17 := Pg17.adapter.normalizeConstraints
     #[commonConstraint] attributeNotNull
   let normalized18 := Pg18.adapter.normalizeConstraints

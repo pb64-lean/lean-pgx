@@ -261,6 +261,23 @@ private def forgedDomainAst : DatabaseIR := {
     else domain
 }
 
+private def forgedDomainValidation : DatabaseIR := {
+  fixture with
+  domains := fixture.domains.map fun domain =>
+    if domain.key == emailKey then
+      { domain with localConstraints := domain.localConstraints.map fun constraint =>
+          { constraint with validated := false } }
+    else domain
+}
+
+private def forgedRelationValidation : DatabaseIR := {
+  fixture with
+  constraints := fixture.constraints.map fun constraint =>
+    if constraint.name == usersIdConstraint.name then
+      { constraint with validated := false }
+    else constraint
+}
+
 private def forgedQueryPlan : DatabaseIR := {
   fixture with
   queries := fixture.queries.map fun query =>
@@ -436,6 +453,8 @@ def main : IO UInt32 := do
   assert! isError (emitDatabase "AppDb" (withImportModule ""))
   assert! isError (emitDatabase "AppDb" (withImportModule " Pg.Types.Codec"))
   assert! isError (emitDatabase "AppDb" forgedDomainAst)
+  assert! isError (emitDatabase "AppDb" forgedDomainValidation)
+  assert! isError (emitDatabase "AppDb" forgedRelationValidation)
   assert! isError (emitDatabase "AppDb" forgedQueryPlan)
   assert! isError (emitDatabase "AppDb" forgedLogicalWire)
   assert! isError (emitDatabase "AppDb" invalidCharacterTypmod)

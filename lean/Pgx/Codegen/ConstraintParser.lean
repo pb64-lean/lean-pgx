@@ -459,7 +459,7 @@ private partial def parsePrimary : ParseM RawExpr := do
 
 end
 
-private def parseRaw (source : String) : Except Diagnostic RawExpr := do
+private def parseRaw (source : String) : Except Diagnostic (RawExpr × Bool) := do
   let tokens ← tokenize source
   let initial : ParserState := { tokens }
   let (hasCheck, state) ← (do
@@ -475,7 +475,25 @@ private def parseRaw (source : String) : Except Diagnostic RawExpr := do
       parseFailure .syntax
         (tokens[0]?.map (fun token => token.start) |>.getD 0)
         "expected normalized CHECK (...) definition"
-  let (value, finalState) ← parseBody.run state
+  let (value, bodyState) ← parseBody.run state
+  let parseSuffix : ParseM Bool := do
+    match ← peek with
+    | some token =>
+        if tokenWord? token "no" then
+          let noToken ← take
+          if (← consumeWord "inherit").isSome then
+            parseFailure .unsupportedOperator noToken.start
+              "NO INHERIT check constraints are unsupported because inheritance metadata is not modeled"
+          else
+            parseFailure .trailingInput noToken.start
+              "unexpected input after the check expression"
+        else if tokenWord? token "not" then
+          let _ ← take
+          let _ ← expectKind (.word "valid" false) "VALID after NOT"
+          pure false
+        else pure true
+    | none => pure true
+  let (validated, finalState) ← parseSuffix.run bodyState
   if let some token := finalState.tokens[finalState.index]? then
     match token.kind with
     | .operator value =>
@@ -486,7 +504,7 @@ private def parseRaw (source : String) : Except Diagnostic RawExpr := do
           s!"construct {value} is not supported after the check expression")
     | _ => throw (diagnostic .trailingInput token.start
         "unexpected input after the check expression")
-  pure value
+  pure (value, validated)
 
 /-! ## Symbolic type resolution and typechecking -/
 
@@ -560,7 +578,9 @@ private partial def resolveScalarType (scope : Scope) (offset : Nat) (ref : Pgx.
         | "int4" => pure .int32
         | "int8" => pure .int64
         | "numeric" => pure .numeric
-        | "text" | "varchar" | "bpchar" => pure .text
+        | "text" | "varchar" => pure .text
+        | "bpchar" => throw (diagnostic .unsupportedType offset
+            "pg_catalog.bpchar local constraint semantics are unsupported because fixed-length blank padding is not modeled")
         | name => throw (diagnostic .unsupportedType offset
             s!"pg_catalog.{name} has no local constraint semantics")
       pure { declared := ref, base }
@@ -884,6 +904,8 @@ private partial def resolveTruth (scope : Scope) (raw : RawExpr) :
         | throw (diagnostic .nonBooleanCheck offset
             "arithmetic expression is not a Boolean check")
       resolveComparison scope offset comparison left right
+  | .isNull _ negated (.null _) =>
+      pure (.constant (some (!negated)))
   | .isNull _ negated value =>
       let value ← resolveValue scope value
       pure (if negated then .isNotNull value else .isNull value)
@@ -1004,10 +1026,10 @@ private partial def validateTruth (scope : Scope) : TruthExpr → Except Diagnos
 
 private def parseInScope (scope : Scope) (source : String) :
     Except Diagnostic Parsed := do
-  let raw ← parseRaw source
+  let (raw, validated) ← parseRaw source
   let expression ← resolveTruth scope raw
   validateTruth scope expression
-  pure { source, expression }
+  pure { source, expression, validated }
 
 /-- Parse and typecheck a relation-local `CHECK` definition. -/
 def parseTableCheck (relation : Pgx.RelationIR) (enums : Array Pgx.EnumIR)

@@ -87,6 +87,33 @@ end Error
 
 instance : ToString Error := ⟨Error.toMessage⟩
 
+/-- Reject functions and operators for which `pg_constraint` records a
+dependency.  PostgreSQL's pinned built-ins do not acquire these dependency
+rows; ordinary and extension objects do, regardless of their schema. -/
+def validateLocalConstraintDependencies (owner name source : String)
+    (functionDependency operatorDependency : Bool) : Except Error Unit := do
+  if functionDependency then
+    throw (.unsupportedConstraint owner name source {
+      category := .unsupportedFunction
+      offset := 0
+      message := "catalog-dependent functions are unsupported in local constraints"
+    })
+  if operatorDependency then
+    throw (.unsupportedConstraint owner name source {
+      category := .unsupportedOperator
+      offset := 0
+      message := "catalog-dependent operators are unsupported in local constraints"
+    })
+
+/-- Check that `pg_get_constraintdef`'s `NOT VALID` suffix agrees with the
+authoritative catalog bit instead of silently accepting a deparse mismatch. -/
+def validateConstraintValidationMetadata (owner name : String)
+    (catalogValidated parsedValidated : Bool) : Except Error Unit := do
+  unless parsedValidated == catalogValidated do
+    throw (.catalog s!"constraint {owner}.{name}: pg_get_constraintdef validation suffix \
+      implies convalidated={parsedValidated}, but pg_constraint reports \
+      convalidated={catalogValidated}")
+
 /-- Result of the deliberately one-sided plan inspection.  Both `outerJoin`
 and `uncertain` force every result field back to nullable. -/
 inductive OuterJoinAnalysis where
@@ -558,7 +585,15 @@ private def loadDomains (conn : Pg.Connection) (schemas : Array String)
       }
   let sql :=
     "SELECT t.oid::text, c.conname, " ++
-    "pg_catalog.pg_get_constraintdef(c.oid, true), c.convalidated::text " ++
+    "pg_catalog.pg_get_constraintdef(c.oid, true), c.convalidated::text, " ++
+    "(EXISTS (SELECT 1 FROM pg_catalog.pg_depend AS dep " ++
+    "WHERE dep.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass " ++
+    "AND dep.objid = c.oid " ++
+    "AND dep.refclassid = 'pg_catalog.pg_proc'::pg_catalog.regclass))::text, " ++
+    "(EXISTS (SELECT 1 FROM pg_catalog.pg_depend AS dep " ++
+    "WHERE dep.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass " ++
+    "AND dep.objid = c.oid " ++
+    "AND dep.refclassid = 'pg_catalog.pg_operator'::pg_catalog.regclass))::text " ++
     "FROM pg_catalog.pg_type AS t " ++
     "JOIN pg_catalog.pg_constraint AS c ON c.contypid = t.oid " ++
     "WHERE c.contype = 'c' " ++
@@ -567,34 +602,47 @@ private def loadDomains (conn : Pg.Connection) (schemas : Array String)
   | .error error => pure (.error error)
   | .ok rows =>
     for row in rows.rows do
-      let parsed : Except Error (UInt32 × String × String × Bool) := do
+      let parsed : Except Error (UInt32 × String × String × Bool × Bool × Bool) := do
         pure (← parseUInt32 "read domain constraints"
             (← cell "read domain constraints" row 0),
           ← cell "read domain constraints" row 1,
           ← cell "read domain constraints" row 2,
           ← parseBool "read domain constraints"
-            (← cell "read domain constraints" row 3))
+            (← cell "read domain constraints" row 3),
+          ← parseBool "read domain constraints"
+            (← cell "read domain constraints" row 4),
+          ← parseBool "read domain constraints"
+            (← cell "read domain constraints" row 5))
       match parsed with
       | .error error => return .error error
-      | .ok (oid, name, definition, validated) =>
+      | .ok (oid, name, definition, validated, functionDependency,
+          operatorDependency) =>
         let some ty := typeByOid? types oid
           | return .error (.catalog s!"domain constraint refers to missing type OID {oid}")
         if schemas.contains ty.key.schema then
           let some index := domains.findIdx? (fun value => value.key == ty.key)
             | return .error (.catalog s!"constraint refers to non-domain type {ty.key}")
           let value := domains[index]!
-          let typedExpression ← match
+          match validateLocalConstraintDependencies ty.key.display name definition
+              functionDependency operatorDependency with
+          | .error error => return .error error
+          | .ok () => pure ()
+          let parsedDefinition ← match
               ConstraintParser.parseDomainCheck value enums domains definition with
-            | .ok parsed => pure parsed.expression
+            | .ok parsed => pure parsed
             | .error diagnostic =>
                 return .error (.unsupportedConstraint ty.key.display name definition diagnostic)
+          match validateConstraintValidationMetadata ty.key.display name validated
+              parsedDefinition.validated with
+          | .error error => return .error error
+          | .ok () => pure ()
           domains := domains.set! index {
             value with
               constraints := value.constraints.push definition
               localConstraints := value.localConstraints.push {
                 name
                 source := definition
-                expression := typedExpression
+                expression := parsedDefinition.expression
                 validated
               }
           }
@@ -734,13 +782,22 @@ private def loadConstraints (conn : Pg.Connection)
         let expression ← cell? "read pg_constraint" row 7
         let validated ← parseBool "read pg_constraint"
           (← cell "read pg_constraint" row 8)
+        let functionDependency ← parseBool "read pg_constraint"
+          (← cell "read pg_constraint" row 9)
+        let operatorDependency ← parseBool "read pg_constraint"
+          (← cell "read pg_constraint" row 10)
         let localExpression ← if kind == .check then
           let some source := expression
             | throw (.catalog s!"check constraint {relation}.{name} has no definition")
           let some catalogRelation := relationByKey? relations relation
             | throw (.catalog s!"check constraint {relation}.{name} has no relation")
+          validateLocalConstraintDependencies relation.display name source
+            functionDependency operatorDependency
           match ConstraintParser.parseTableCheck catalogRelation.ir enums domains source with
-          | .ok parsed => pure (some parsed.expression)
+          | .ok parsed => do
+              validateConstraintValidationMetadata relation.display name validated
+                parsed.validated
+              pure (some parsed.expression)
           | .error diagnostic =>
               throw (.unsupportedConstraint relation.display name source diagnostic)
         else pure none
