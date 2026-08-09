@@ -1776,6 +1776,10 @@ private def serverMajorsExpr (db : Pgx.DatabaseIR) : String :=
     else db.supportedServerMajors
   arrayExpr (majors.map (fun major => toString major))
 
+private def requiredExtensionsExpr (db : Pgx.DatabaseIR) : String :=
+  arrayExpr (db.requiredExtensions.map fun value =>
+    s!"({stringLiteral value.1}, {stringLiteral value.2})")
+
 private def emitSchema (plan : NamingPlan) (db : Pgx.DatabaseIR) :
     Except CodegenError String := do
   let mut lines : List String := [
@@ -1796,6 +1800,11 @@ private def emitSchema (plan : NamingPlan) (db : Pgx.DatabaseIR) :
     s!"  session := {sessionExpr db.session}",
     s!"  types := {plan.modulePrefix}.Types.staticTypes",
     s!"  relations := {arrayExpr relationDescriptors}",
+    s!"  views := {arrayExpr (db.views.map viewExpr)}",
+    s!"  routines := {arrayExpr (db.routines.map routineExpr)}",
+    s!"  requiredExtensions := {requiredExtensionsExpr db}",
+    s!"  extensionCodecPackages := {arrayExpr
+      (db.extensionCodecPackages.map extensionCodecPackageExpr)}",
     s!"  schemaHash := {stringLiteral db.contractHash}",
     s!"  contractHash := {stringLiteral db.contractHash}",
     "}",

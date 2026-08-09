@@ -297,14 +297,19 @@ private def exerciseBroaderTypes
       functionRow.val.statusCount == some 3 do
     fail "table-valued function query returned unexpected values"
 
-  unless AppDb.Constraints.views.any (fun view =>
-      view.relation == { schema := "app", name := "type_sample_summary" }) do
-    fail "generated metadata omitted the application view"
-  unless AppDb.Constraints.routines.any (fun routine =>
+  unless AppDb.Constraints.views.size == 1 &&
+      AppDb.Constraints.views.any (fun view =>
+        view.relation == { schema := "app", name := "type_sample_summary" }) do
+    fail "generated metadata did not isolate the application view"
+  -- PostgreSQL adds five constructor routines for the named range and
+  -- multirange.  Extension-owned implementation routines are intentionally
+  -- outside the application metadata contract.
+  unless AppDb.Constraints.routines.size == 6 &&
+      AppDb.Constraints.routines.any (fun routine =>
       routine.key.schema == "app" &&
       routine.key.name == "list_type_sample_summaries" &&
       routine.returnsSet && routine.resultColumns.size == 3) do
-    fail "generated metadata omitted the table-valued function shape"
+    fail "generated metadata did not isolate the application table-valued function"
   unless AppDb.Constraints.extensionCodecPackages.any (fun package =>
       package.extension == "citext" && package.importModule == "AppDb.ExtensionCodecs" &&
       package.types == #[{ schema := "app", name := "citext", kind := .base }]) do

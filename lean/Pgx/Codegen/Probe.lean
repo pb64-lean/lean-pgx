@@ -264,7 +264,11 @@ private def parseConstraintKind (adapter : Adapter) (context value : String) :
         constraint kind {value}")
 
 private def kindSql (alias : String) : String :=
-  s!"CASE WHEN {alias}.typcategory = 'A' AND {alias}.typelem <> 0 THEN 'array' \
+  s!"CASE WHEN {alias}.typcategory = 'A' AND {alias}.typelem <> 0 \
+     AND {alias}.typinput = 'pg_catalog.array_in'::pg_catalog.regproc \
+     AND {alias}.typoutput = 'pg_catalog.array_out'::pg_catalog.regproc \
+     AND {alias}.typreceive = 'pg_catalog.array_recv'::pg_catalog.regproc \
+     AND {alias}.typsend = 'pg_catalog.array_send'::pg_catalog.regproc THEN 'array' \
      WHEN {alias}.typtype = 'b' THEN 'base' \
      WHEN {alias}.typtype = 'c' THEN 'composite' \
      WHEN {alias}.typtype = 'd' THEN 'domain' \
@@ -495,6 +499,7 @@ private structure CatalogRoutine where
   returnTypeOid : UInt32
   inputCount : Nat
   defaultCount : Nat
+  extensionOwned : Bool
   ir : Pgx.RoutineIR
   deriving Inhabited
 
@@ -728,7 +733,12 @@ private def routineCatalogSql : String :=
   "SELECT p.oid::text, ns.nspname, p.proname, p.prokind::text, " ++
   "p.proretset::text, p.prorettype::text, p.pronargs::text, " ++
   "p.pronargdefaults::text, p.proisstrict::text, p.provolatile::text, " ++
-  "p.proparallel::text, p.prosecdef::text " ++
+  "p.proparallel::text, p.prosecdef::text, " ++
+  "(EXISTS (SELECT 1 FROM pg_catalog.pg_depend AS dep " ++
+  "WHERE dep.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass " ++
+  "AND dep.objid = p.oid " ++
+  "AND dep.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass " ++
+  "AND dep.deptype = 'e'))::text " ++
   "FROM pg_catalog.pg_proc AS p " ++
   "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = p.pronamespace " ++
   "ORDER BY p.oid"
@@ -767,8 +777,9 @@ private def loadRoutines (conn : Pg.Connection) (_schemas : Array String)
         let volatility ← cell "read pg_proc" row 9
         let parallel ← cell "read pg_proc" row 10
         let securityDefiner ← parseBool "read pg_proc" (← cell "read pg_proc" row 11)
+        let extensionOwned ← parseBool "read pg_proc" (← cell "read pg_proc" row 12)
         pure {
-          oid, returnTypeOid, inputCount, defaultCount
+          oid, returnTypeOid, inputCount, defaultCount, extensionOwned
           ir := {
             key := { schema, name }
             kind, args := #[], returnsSet
@@ -1163,7 +1174,13 @@ private def viewCatalogSql : String :=
   "WHERE option_name = 'security_invoker'), 'false') " ++
   "FROM pg_catalog.pg_class AS c " ++
   "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = c.relnamespace " ++
-  "WHERE c.relkind IN ('v', 'm') ORDER BY ns.nspname, c.relname"
+  "WHERE c.relkind IN ('v', 'm') " ++
+  "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend AS dep " ++
+  "WHERE dep.classid = 'pg_catalog.pg_class'::pg_catalog.regclass " ++
+  "AND dep.objid = c.oid " ++
+  "AND dep.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass " ++
+  "AND dep.deptype = 'e') " ++
+  "ORDER BY ns.nspname, c.relname"
 
 private def parseViewCheckOption (context : String) : String →
     Except Error Pgx.ViewCheckOption
@@ -1775,7 +1792,8 @@ private def loadSnapshot (conn : Pg.Connection) (config : Config) :
     serverMajor, schemas, types, enums, arrays, domains, composites, ranges,
     multiranges, relations, views
     routines := catalogRoutines.filter (fun value =>
-      config.schemas.contains value.ir.key.schema) |>.map (fun value => value.ir)
+      config.schemas.contains value.ir.key.schema && !value.extensionOwned)
+      |>.map (fun value => value.ir)
     constraints, indexes, extensions
   })
 

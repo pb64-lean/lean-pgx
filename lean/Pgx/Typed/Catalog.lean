@@ -240,7 +240,11 @@ private structure LiveType where
   multirangeRange : Option Pgx.TypeKey := none
 
 private def kindSql (alias : String) : String :=
-  s!"CASE WHEN {alias}.typcategory = 'A' AND {alias}.typelem <> 0 THEN 'array' \
+  s!"CASE WHEN {alias}.typcategory = 'A' AND {alias}.typelem <> 0 \
+     AND {alias}.typinput = 'pg_catalog.array_in'::pg_catalog.regproc \
+     AND {alias}.typoutput = 'pg_catalog.array_out'::pg_catalog.regproc \
+     AND {alias}.typreceive = 'pg_catalog.array_recv'::pg_catalog.regproc \
+     AND {alias}.typsend = 'pg_catalog.array_send'::pg_catalog.regproc THEN 'array' \
      WHEN {alias}.typtype = 'b' THEN 'base' \
      WHEN {alias}.typtype = 'c' THEN 'composite' \
      WHEN {alias}.typtype = 'd' THEN 'domain' \
@@ -528,7 +532,13 @@ private def viewCatalogSql : String :=
   "WHERE option_name = 'security_invoker'), 'false') " ++
   "FROM pg_catalog.pg_class AS c " ++
   "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = c.relnamespace " ++
-  "WHERE c.relkind IN ('v', 'm') ORDER BY ns.nspname, c.relname"
+  "WHERE c.relkind IN ('v', 'm') " ++
+  "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend AS dep " ++
+  "WHERE dep.classid = 'pg_catalog.pg_class'::pg_catalog.regclass " ++
+  "AND dep.objid = c.oid " ++
+  "AND dep.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass " ++
+  "AND dep.deptype = 'e') " ++
+  "ORDER BY ns.nspname, c.relname"
 
 private def loadViews (conn : Pg.Connection) (schemas : Array String) :
     Async (Except Error (Array Pgx.ViewIR)) := do
@@ -583,6 +593,11 @@ private def routineCatalogSql : String :=
   "p.proparallel::text, p.prosecdef::text " ++
   "FROM pg_catalog.pg_proc AS p " ++
   "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = p.pronamespace " ++
+  "WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend AS dep " ++
+  "WHERE dep.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass " ++
+  "AND dep.objid = p.oid " ++
+  "AND dep.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass " ++
+  "AND dep.deptype = 'e') " ++
   "ORDER BY p.oid"
 
 private def routineArgCatalogSql : String :=
@@ -593,6 +608,11 @@ private def routineArgCatalogSql : String :=
   "CROSS JOIN LATERAL pg_catalog.unnest(" ++
   "COALESCE(p.proallargtypes, p.proargtypes::oid[])) " ++
   "WITH ORDINALITY AS args(type_oid, ordinality) " ++
+  "WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend AS dep " ++
+  "WHERE dep.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass " ++
+  "AND dep.objid = p.oid " ++
+  "AND dep.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass " ++
+  "AND dep.deptype = 'e') " ++
   "ORDER BY p.oid, args.ordinality"
 
 private def isRoutineOutput : Pgx.RoutineArgMode → Bool

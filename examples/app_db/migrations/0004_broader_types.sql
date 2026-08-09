@@ -1,4 +1,4 @@
-CREATE EXTENSION citext WITH SCHEMA app;
+CREATE EXTENSION citext WITH SCHEMA app VERSION '1.6';
 
 CREATE TYPE app.contact_card AS (
   label text,
