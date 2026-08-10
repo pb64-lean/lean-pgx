@@ -25,7 +25,8 @@ The current implementation includes:
 - generated one-dimensional arrays of built-in and generated values, named
   composite cells, and range/multirange values with resolver-aware codecs;
 - local character, exact numeric precision/scale, temporal precision, and
-  interval precision refinements;
+  interval precision refinements, propagated through generated arrays,
+  composites, and finite range/multirange bounds;
 - reusable extension codec packages whose installed version and owned types
   are recorded in the generated contract;
 - local revalidation during decoding, reported as typed constraint-violation
@@ -139,9 +140,11 @@ let checked ← AppDb.attach raw
 Attachment installs and verifies the generated session contract, checks the
 server major, resolves every symbolic type/relation against local OIDs, and
 compares schema descriptors, including array elements, composite fields, and
-range/multirange links. Each query's first use prepares with resolved parameter
-OIDs and compares the returned parameter/result descriptors before binding or
-decoding.
+complete range metadata (subtype, multirange link, collation, subtype operator
+class, canonical routine, and subtype-difference routine). It also compares
+normalized view/routine metadata and extension package ownership. Each query's
+first use prepares with resolved parameter OIDs and compares the returned
+parameter/result descriptors before binding or decoding.
 
 Generated container values use these runtime shapes:
 
@@ -257,7 +260,9 @@ cardinalities, enum/domain arrays, composite cells, ranges/multiranges,
 numeric/time modifiers, view and table-valued-function metadata,
 conservative outer-join nullability, shifted user OIDs, proof-producing local
 validation, invalid stored-data rejection, runtime cardinality checks,
-`QueryDrift`, `SchemaDrift`, and live PostgreSQL 17/18 compatibility.
+`QueryDrift`, targeted semantic `SchemaDrift` (including range collation,
+operator-class, and subtype-difference changes), and live PostgreSQL 17/18
+compatibility.
 
 Lake supplies the editor project model; Bazel remains authoritative:
 
