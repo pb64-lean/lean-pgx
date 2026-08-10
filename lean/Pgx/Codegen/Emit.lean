@@ -982,11 +982,13 @@ private def buildTypeNames (modulePrefix : String) (db : Pgx.DatabaseIR) : Array
       scope := next
       let leanType := modulePrefix ++ ".Types." ++ name
       values := values.push { key := value.key, leanType, codec := leanType ++ ".codec" }
-  -- Preserve the public names of semantic types when PostgreSQL's
-  -- automatically named array type normalizes to the same Lean identifier.
+  -- Preserve semantic type names and give a colliding PostgreSQL array an
+  -- explicit `Array` suffix rather than an opaque allocator suffix such as
+  -- `_2`. Non-colliding array names retain their existing readable spelling.
   for value in db.arrays do
     if (db.typeOverride? value.key).isNone then
-      let preferred := upperCamel value.key.schema ++ upperCamel value.key.name
+      let baseName := upperCamel value.key.schema ++ upperCamel value.key.name
+      let preferred := if scope.used.contains baseName then baseName ++ "Array" else baseName
       let (name, next) := scope.claim preferred
       scope := next
       let leanType := modulePrefix ++ ".Types." ++ name
@@ -1551,21 +1553,26 @@ private def emitValidator (dataType publicType : String)
     s!"def checks : List (Pgx.Constraint.Check {dataType}) :=",
     "  [" ++ commaSep checkExprs ++ "]",
     "",
+    s!"/-- Proposition established by validation of a `{dataType}` value. -/",
     s!"@[expose] def ValidPred (value : {dataType}) : Prop :=",
     "  Pgx.Constraint.Valid checks value",
     "",
     s!"instance (value : {dataType}) : Decidable (ValidPred value) :=",
     "  Pgx.Constraint.validDecidable checks value",
     "",
+    s!"/-- A `{dataType}` paired with proof of its generated local constraints. -/",
     "abbrev " ++ publicType ++ " := { value : " ++ dataType ++ " // ValidPred value }",
     "",
+    s!"/-- Validate a `{dataType}` and construct its proof-bearing `{publicType}`. -/",
     s!"@[expose] def validate (value : {dataType}) : Except Pgx.ConstraintViolation {publicType} :=",
     "  Pgx.Constraint.validate checks value",
     "",
+    "/-- Successful validation preserves the input and establishes `ValidPred`. -/",
     "theorem validate_sound {value : " ++ dataType ++ "} {refined : " ++ publicType ++ "} :",
     "    validate value = .ok refined → refined.val = value ∧ ValidPred value := by",
     "  exact Pgx.Constraint.validate_sound checks",
     "",
+    "/-- Every value satisfying `ValidPred` is accepted by `validate`. -/",
     "theorem validate_complete {value : " ++ dataType ++ "} :",
     s!"    ValidPred value → ∃ refined : {publicType}, validate value = .ok refined := by",
     "  exact Pgx.Constraint.validate_complete checks",
@@ -2085,6 +2092,7 @@ private def emitTypes (plan : NamingPlan) (db : Pgx.DatabaseIR) :
     lines := lines ++ (← emitGeneratedType plan db key)
   let descriptors := collectTypeKeys db |>.map (typeDescExpr db)
   lines := lines ++ [
+    "/-- Symbolic descriptors for every generated and referenced PostgreSQL type. -/",
     "def staticTypes : Array Pgx.Typed.StaticTypeDesc :=",
     s!"  {arrayExpr descriptors}",
     "",
@@ -2130,13 +2138,18 @@ private def emitRelation (plan : NamingPlan) (db : Pgx.DatabaseIR)
         column.nullable s!"{relation.key.display}.{column.name} type modifier" then
       checks := checks.push check
   let mut lines := [s!"namespace {plan.modulePrefix}.Schema.{schemaName}.{relationName}", ""]
-  lines := lines ++ ["structure Data where"]
+  lines := lines ++ [
+    s!"/-- One possible row value for PostgreSQL relation `{relation.key.display}`.",
+    "Logical membership in a database state is represented separately. -/",
+    "structure Data where"
+  ]
   for i in [0:relation.columns.size] do
     let column := relation.columns[i]!
     lines := lines ++ [s!"  {names[i]!} : {← fieldType plan db column.ty column.nullable}"]
   lines := lines ++ [""]
   lines := lines ++ emitValidator "Data" "Row" checks
   lines := lines ++ [
+    s!"/-- Symbolic descriptor checked when attaching `{relation.key.display}`. -/",
     "def descriptor : Pgx.Typed.StaticRelationDesc :=",
     s!"  {staticRelationExpr relation}",
     "",
@@ -2170,6 +2183,7 @@ private def emitSchema (plan : NamingPlan) (db : Pgx.DatabaseIR) :
   lines := lines ++ [
     s!"namespace {plan.modulePrefix}",
     "",
+    "/-- Complete generated contract used to attach and verify a live connection. -/",
     "def database : Pgx.Typed.DatabaseDesc := {",
     s!"  canonicalMajor := {db.serverMajor}",
     s!"  serverMajors := {serverMajorsExpr db}",
@@ -2187,6 +2201,8 @@ private def emitSchema (plan : NamingPlan) (db : Pgx.DatabaseIR) :
     s!"  contractHash := {stringLiteral db.contractHash}",
     "}",
     "",
+    "/-- Verify a raw PostgreSQL connection against `database` and return the",
+    "checked capability required by generated query runners. -/",
     "def attach (conn : Pg.Connection) :",
     "    Std.Async.Async (Except Pgx.Typed.Error (Pgx.Typed.CheckedConnection database)) :=",
     "  Pgx.Typed.attach database conn",
@@ -2608,12 +2624,18 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
     "",
     s!"namespace {namespaceName}",
     "",
+    s!"/-- Named parameters for generated query `{query.name}`. -/",
     "structure Params where"
   ]
   for i in [0:query.params.size] do
     let param := query.params[i]!
     lines := lines ++ [s!"  {paramNames[i]!} : {← fieldType plan db param.ty param.nullable}"]
-  lines := lines ++ ["", "structure RowData where"]
+  lines := lines ++ [
+    "",
+    s!"/-- Decoded result fields for generated query `{query.name}` before",
+    "proof-producing local validation. -/",
+    "structure RowData where"
+  ]
   for i in [0:query.columns.size] do
     let column := query.columns[i]!
     let logical := column.logicalType.getD column.ty
@@ -2674,6 +2696,7 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
   ]
   lines := lines ++ [
     "",
+    s!"/-- Static SQL, descriptor, codec, and cardinality contract for `{query.name}`. -/",
     "def spec :",
     s!"    Pgx.Typed.QuerySpec {plan.modulePrefix}.database Params Row .{cardinalityName query.cardinality} := " ++ "{",
     s!"  name := {stringLiteral query.name}",
@@ -2685,6 +2708,7 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
     "  decode := decodeRow",
     "}",
     "",
+    s!"/-- Execute `{query.name}` through a descriptor-checked prepared statement. -/",
     "def run",
     s!"    (conn : Pgx.Typed.CheckedConnection {plan.modulePrefix}.database)",
     s!"    (params : Params) : Std.Async.Async (Except Pgx.Typed.Error ({cardinalityResult query.cardinality})) :=",

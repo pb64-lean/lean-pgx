@@ -1,0 +1,40 @@
+"""Minimal generated-query tutorial and live acceptance test."""
+
+load(
+    "//bazel:defs.bzl",
+    "lean_pg_library",
+    "pg_live_test",
+    "pg_query_set",
+)
+load("@rules_lean//lean:defs.bzl", "lean_binary")
+
+package(default_visibility = ["//visibility:private"])
+
+pg_query_set(
+    name = "queries",
+    srcs = ["queries/get_user.sql"],
+    manifest = "queries/queries.json",
+)
+
+lean_pg_library(
+    name = "quickstart_db",
+    module_prefix = "QuickstartDb",
+    migrations = ["migrations/0001_users.sql"],
+    queries = ":queries",
+    schemas = ["app"],
+)
+
+lean_binary(
+    name = "quickstart",
+    srcs = ["Main.lean"],
+    deps = [
+        ":quickstart_db",
+        "@pg_lean//:pg_lean",
+    ],
+)
+
+pg_live_test(
+    name = "runtime_test",
+    database = ":quickstart_db",
+    runner = ":quickstart",
+)

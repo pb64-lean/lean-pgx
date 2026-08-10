@@ -1,6 +1,7 @@
 import Pgx.Typed.Catalog
 
 open Pgx.Typed
+open Pgx.Typed.Internal
 
 private def int4Key : Pgx.TypeKey :=
   { schema := "pg_catalog", name := "int4", kind := .base }
@@ -146,6 +147,34 @@ private def isSchemaDrift (result : Except Error α) : Bool :=
   match result with
   | .error (.schemaDrift _) => true
   | .error _ | .ok _ => false
+
+private def preparationFailureTests : IO Unit := do
+  let classified := preparationFailure (.transport "temporary socket failure")
+  assert! match classified with
+    | .postgres (.transport message) => message == "temporary socket failure"
+    | _ => false
+  assert! !isVerifiedDescriptorDrift classified
+  assert! isVerifiedDescriptorDrift (.queryDrift "verified result descriptor mismatch")
+  assert! !isVerifiedDescriptorDrift (.postgres .disconnected)
+
+private def structuredErrorTests : IO Unit := do
+  assert! Error.kind (.postgres .disconnected) == .postgres
+  assert! Error.kind (.decode "bad payload") == .decode
+  assert! Error.driftContext? (.schemaDrift "missing app.users") == some {
+    kind := .schema
+    message := "missing app.users"
+  }
+  assert! Error.driftContext? (.queryDrift "column changed") == some {
+    kind := .query
+    message := "column changed"
+  }
+  assert! Error.cardinalityContext? (.cardinality "one row" "3 rows") == some {
+    expected := "one row"
+    actual := "3 rows"
+  }
+  assert! match Error.postgres? (.postgres (.transport "temporary")) with
+    | some (.transport message) => message == "temporary"
+    | _ => false
 
 private def resolvedCodecTests : IO Unit := do
   let binary42 := ByteArray.mk #[0, 0, 0, 42]
@@ -367,6 +396,8 @@ private def relationalMetadataTests : IO Unit := do
   assert! !relationalConstraintOperatorSql.contains "item.ordinality::text"
 
 def main : IO UInt32 := do
+  preparationFailureTests
+  structuredErrorTests
   resolvedCodecTests
   semanticMetadataTests
   relationalMetadataTests

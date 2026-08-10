@@ -109,6 +109,11 @@
     "cardinality": "many",
     "parameters": []
   },
+  "prepare_retry.sql": {
+    "leanName": "PrepareRetry",
+    "cardinality": "exactlyOne",
+    "parameters": []
+  },
   "put_type_sample.sql": {
     "leanName": "PutTypeSample",
     "cardinality": "exactlyOne",

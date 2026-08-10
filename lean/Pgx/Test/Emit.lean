@@ -386,6 +386,9 @@ private def timeArrayKey : TypeKey :=
 private def emailArrayKey : TypeKey :=
   { schema := "app", name := "email_vector", kind := .array }
 
+private def automaticStatusArrayKey : TypeKey :=
+  { schema := "app", name := "_user_status", kind := .array }
+
 private def varcharArray12 : TypeRef :=
   { key := varcharArrayKey, typmod := some 16 }
 
@@ -404,11 +407,12 @@ private def scoreMultirangeKey : TypeKey :=
 private def activePacketsKey : RelationKey :=
   { schema := "app", name := "active_packets" }
 
-/-- One compact contract exercising every generated Milestone-3 type shape,
+/-- One compact contract exercising every generated PostgreSQL type shape,
 including a domain whose base is itself a generated container. -/
-private def m3Fixture : DatabaseIR := {
+private def generatedTypeFixture : DatabaseIR := {
   fixture with
   arrays := #[
+    { key := automaticStatusArrayKey, element := ref statusKey },
     { key := statusArrayKey, element := ref statusKey },
     { key := varcharArrayKey, element := base "varchar" },
     { key := timeArrayKey, element := time },
@@ -488,23 +492,23 @@ private def m3Fixture : DatabaseIR := {
   }]
 }
 
-private def invalidM3Delimiter : DatabaseIR := {
-  m3Fixture with
-  arrays := m3Fixture.arrays.map fun value =>
+private def invalidArrayDelimiter : DatabaseIR := {
+  generatedTypeFixture with
+  arrays := generatedTypeFixture.arrays.map fun value =>
     if value.key == statusArrayKey then { value with delimiter := ";" } else value
 }
 
-private def invalidM3RangeLink : DatabaseIR := {
-  m3Fixture with
-  multiranges := m3Fixture.multiranges.map fun value =>
+private def invalidRangeLink : DatabaseIR := {
+  generatedTypeFixture with
+  multiranges := generatedTypeFixture.multiranges.map fun value =>
     if value.key == scoreMultirangeKey then
       { value with range := { schema := "app", name := "other_range", kind := .range } }
     else value
 }
 
-private def invalidM3CompositeArity : DatabaseIR := {
-  m3Fixture with
-  composites := m3Fixture.composites.map fun value =>
+private def invalidCompositeArity : DatabaseIR := {
+  generatedTypeFixture with
+  composites := generatedTypeFixture.composites.map fun value =>
     if value.key == packetKey then
       { value with fields := value.fields.map fun field =>
           if field.name == "score" then { field with ordinal := 3 } else field }
@@ -533,36 +537,38 @@ private def isError (result : Except CodegenError GeneratedSources) : Bool :=
   | .error _ => true
   | .ok _ => false
 
-private def milestone3Tests : IO Unit := do
-  let sources ← match emitDatabase "m3_db" m3Fixture with
+private def generatedTypeTests : IO Unit := do
+  let sources ← match emitDatabase "type_shape_db" generatedTypeFixture with
     | .ok value => pure value
     | .error error => throw (IO.userError (toString error))
 
   -- Generated container/composite types retain symbolic component
   -- descriptors and use the resolver-aware text and binary codec paths.
+  assert! sources.types.contents.contains "namespace AppUserStatusArray"
+  assert! !sources.types.contents.contains "namespace AppUserStatus_2"
   assert! sources.types.contents.contains "namespace AppStatusVector"
   assert! sources.types.contents.contains
-    "abbrev Value := Pgx.Typed.PgArray (M3Db.Types.AppUserStatus)"
+    "abbrev Value := Pgx.Typed.PgArray (TypeShapeDb.Types.AppUserStatus)"
   assert! sources.types.contents.contains "arrayDelimiter := some (\",\")"
   assert! sources.types.contents.contains "Pgx.Typed.decodeArrayBinary element.oid"
   assert! sources.types.contents.contains "namespace AppEmailVector"
   assert! sources.types.contents.contains
-    "abbrev Data := Pgx.Typed.PgArray (M3Db.Types.AppEmailAddress)"
+    "abbrev Data := Pgx.Typed.PgArray (TypeShapeDb.Types.AppEmailAddress)"
   assert! sources.types.contents.contains "arrayElementsNotNull value"
   assert! sources.types.contents.contains "namespace AppStatusList"
-  assert! sources.types.contents.contains "toBase : M3Db.Types.AppStatusVector"
+  assert! sources.types.contents.contains "toBase : TypeShapeDb.Types.AppStatusVector"
   assert! sources.types.contents.contains "namespace AppReviewPacket"
   assert! sources.types.contents.contains
-    "statuses : Option (M3Db.Types.AppStatusList)"
-  assert! sources.types.contents.contains "score : Option (M3Db.Types.AppScoreRange)"
+    "statuses : Option (TypeShapeDb.Types.AppStatusList)"
+  assert! sources.types.contents.contains "score : Option (TypeShapeDb.Types.AppScoreRange)"
   assert! sources.types.contents.contains "title : Option (String)"
   assert! sources.types.contents.contains "observedAt : Option (Std.Time.PlainTime)"
   assert! sources.types.contents.contains
-    "tags : Option (M3Db.Types.PgCatalogVarchar)"
+    "tags : Option (TypeShapeDb.Types.PgCatalogVarchar)"
   assert! sources.types.contents.contains
-    "email : Option (M3Db.Types.AppEmailAddress)"
+    "email : Option (TypeShapeDb.Types.AppEmailAddress)"
   assert! sources.types.contents.contains
-    "times : Option (M3Db.Types.PgCatalogTime)"
+    "times : Option (TypeShapeDb.Types.PgCatalogTime)"
   assert! sources.types.contents.contains
     "evaluateCharacterTypmod (some (16)) (value.title)"
   assert! sources.types.contents.contains "evaluateTimeTypmod (none)"
@@ -600,9 +606,9 @@ private def milestone3Tests : IO Unit := do
   -- Views remain relation-shaped in Schema while semantic view and
   -- table-valued-function metadata is preserved verbatim in Constraints.
   assert! sources.schema.contents.contains
-    "namespace M3Db.Schema.App.ActivePackets"
+    "namespace TypeShapeDb.Schema.App.ActivePackets"
   assert! sources.schema.contents.contains
-    "packet : M3Db.Types.AppReviewPacket"
+    "packet : TypeShapeDb.Types.AppReviewPacket"
   assert! sources.constraints.contents.contains "def views : Array Pgx.ViewIR"
   assert! sources.constraints.contents.contains
     "SELECT packet, scores FROM app.review_queue WHERE active"
@@ -614,9 +620,9 @@ private def milestone3Tests : IO Unit := do
   assert! sources.constraints.contents.contains
     "name := \"scores\", ordinal := 2"
 
-  assert! isError (emitDatabase "M3Db" invalidM3Delimiter)
-  assert! isError (emitDatabase "M3Db" invalidM3RangeLink)
-  assert! isError (emitDatabase "M3Db" invalidM3CompositeArity)
+  assert! isError (emitDatabase "TypeShapeDb" invalidArrayDelimiter)
+  assert! isError (emitDatabase "TypeShapeDb" invalidRangeLink)
+  assert! isError (emitDatabase "TypeShapeDb" invalidCompositeArity)
 
 -- This single golden test intentionally checks the complete generated surface.
 -- Keep its elaboration budget local rather than raising it for the library.
@@ -646,7 +652,7 @@ def main : IO UInt32 := do
       match emitDatabase "app_db" unsupportedRelationalFixture with
       | .ok value => pure value
       | .error error => throw (IO.userError (toString error))
-  milestone3Tests
+  generatedTypeTests
 
   -- Fixed output layout and a compact full-file golden for the root module.
   assert! sources.modulePrefix == "AppDb"

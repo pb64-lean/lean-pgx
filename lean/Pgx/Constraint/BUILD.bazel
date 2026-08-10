@@ -2,13 +2,14 @@
 
 load("@rules_lean//lean:defs.bzl", "lean_library")
 
-package(default_visibility = ["//visibility:public"])
+package(default_visibility = ["//visibility:private"])
 
 lean_library(
     name = "ir",
     srcs = ["IR.lean"],
     deps = ["//lean/Pgx/IR:core"],
     strip_module_prefix = "lean",
+    visibility = ["//lean:internal"],
 )
 
 lean_library(
@@ -20,4 +21,6 @@ lean_library(
         "@pg_lean//:pg_lean",
     ],
     strip_module_prefix = "lean",
+    # Generated contracts depend on the proof-producing validator runtime.
+    visibility = ["//visibility:public"],
 )

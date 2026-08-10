@@ -132,6 +132,26 @@ private def insertOrganization (conn : Pg.Connection) : Async Int64 := do
   | .ok id => pure id
   | .error error => fail s!"decode organization id: {error}"
 
+/-- A transient server failure during first preparation must not be classified
+as descriptor drift or poison the checked connection's prepared cache. -/
+private def exerciseTransientPrepareFailure
+    (raw : Pg.Connection)
+    (conn : Pgx.Typed.CheckedConnection AppDb.database) : Async Unit := do
+  let _ ← pg! "begin transient-prepare fixture" (← raw.exec "BEGIN")
+  match ← raw.exec "SELECT 1 / 0" with
+  | .error _ => pure ()
+  | .ok _ => fail "division-by-zero fixture unexpectedly succeeded"
+  match ← AppDb.Queries.PrepareRetry.run conn {} with
+  | .error (.postgres _) => pure ()
+  | .error error =>
+    fail s!"transient first prepare returned the wrong typed error: {error}"
+  | .ok _ => fail "query unexpectedly prepared in an aborted transaction"
+  let _ ← pg! "rollback transient-prepare fixture" (← raw.exec "ROLLBACK")
+  let retried ← typed! "retry preparation after rollback"
+    (← AppDb.Queries.PrepareRetry.run conn {})
+  unless retried.val.value == some 42 do
+    fail s!"retried query returned {retried.val.value}; expected some 42"
+
 private def exerciseGeneratedQueries
     (conn : Pgx.Typed.CheckedConnection AppDb.database)
     (organizationId : Int64) : Async Unit := do
@@ -235,17 +255,17 @@ private def exerciseBroaderTypes
     (conn : Pgx.Typed.CheckedConnection AppDb.database) : Async Unit := do
   let primaryEmail ← validatedEmail! "validate composite email" "card@example.com"
   let secondaryEmail ← validatedEmail! "validate array email" "array@example.com"
-  let statuses : AppDb.Types.AppUserStatus_2 :=
+  let statuses : AppDb.Types.AppUserStatusArray :=
     #[some .active, none, some .disabled]
-  let emailData : AppDb.Types.AppEmailAddress_2.Data :=
+  let emailData : AppDb.Types.AppEmailAddressArray.Data :=
     #[some primaryEmail, some secondaryEmail]
-  let invalidEmailData : AppDb.Types.AppEmailAddress_2.Data :=
+  let invalidEmailData : AppDb.Types.AppEmailAddressArray.Data :=
     #[some primaryEmail, none]
-  match AppDb.Types.AppEmailAddress_2.validate invalidEmailData with
+  match AppDb.Types.AppEmailAddressArray.validate invalidEmailData with
   | .error (.checkFailed "app._email_address (array) element domain NOT NULL") => pure ()
   | .error violation => fail s!"domain array returned the wrong violation: {violation}"
   | .ok _ => fail "domain array accepted a NULL element"
-  let emails ← match AppDb.Types.AppEmailAddress_2.validate emailData with
+  let emails ← match AppDb.Types.AppEmailAddressArray.validate emailData with
     | .ok refined => pure refined
     | .error violation => fail s!"validate domain array fixture: {violation}"
   let cardData : AppDb.Types.AppContactCard.Data := {
@@ -559,6 +579,7 @@ private def runAcceptance (options : Options) : Async Unit := do
     replayMigrations raw options.migrations
     verifyGeneratedNotValidMetadata
     let checked ← attach! "attach generated AppDb" raw
+    exerciseTransientPrepareFailure raw checked
     let organizationId ← insertOrganization raw
     exerciseGeneratedQueries checked organizationId
     exerciseNullableCheck checked organizationId

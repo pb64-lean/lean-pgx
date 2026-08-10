@@ -1,0 +1,30 @@
+"""Dependency-mode generation and cross-major compatibility smoke test."""
+
+load(
+    "@lean_pgx//bazel:defs.bzl",
+    "lean_pg_library",
+    "pg_compat_test",
+    "pg_query_set",
+)
+
+package(default_visibility = ["//visibility:private"])
+
+pg_query_set(
+    name = "queries",
+    srcs = ["queries/get_widget.sql"],
+    manifest = "queries/queries.json",
+)
+
+lean_pg_library(
+    name = "widget_db",
+    canonical_major = 17,
+    module_prefix = "WidgetDb",
+    migrations = ["migrations/0001_widgets.sql"],
+    queries = ":queries",
+    schemas = ["app"],
+)
+
+pg_compat_test(
+    name = "postgres_compatibility_test",
+    database = ":widget_db",
+)

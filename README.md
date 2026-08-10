@@ -1,100 +1,135 @@
 # lean-pgx
 
-`lean-pgx` generates checked Lean 4 records and query runners from PostgreSQL
-DDL and literal SQL. PostgreSQL itself performs SQL parsing, name resolution,
-cast selection, and result description; generated code stores only symbolic
-schema/type identities and verifies the live descriptors before decoding.
+[![CI](https://github.com/pb64-lean/lean-pgx/actions/workflows/ci.yml/badge.svg)](https://github.com/pb64-lean/lean-pgx/actions/workflows/ci.yml)
+[![Assurance](https://github.com/pb64-lean/lean-pgx/actions/workflows/assurance.yml/badge.svg)](https://github.com/pb64-lean/lean-pgx/actions/workflows/assurance.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-The current implementation includes:
+`lean-pgx` generates checked Lean 4 types and query runners from PostgreSQL
+DDL and literal SQL. PostgreSQL performs SQL parsing, name resolution, cast
+selection, and statement description; generated code records stable symbolic
+identities and verifies a live database before decoding values.
 
-- deterministic schema/query IR for schemas, enums, domains, arrays,
-  composites, ranges, multiranges, tables, views, routines, constraints,
-  indexes, parameters, result columns, and cardinality;
-- a pinned PostgreSQL 18.2 generation action and PostgreSQL 17.8 compatibility
-  test;
-- generated enum codecs, proof-refined domains, `Params`, proof-refined `Row`
-  values, and checked runners;
-- a typed local-constraint IR with PostgreSQL three-valued Boolean semantics,
-  proof-producing domain/row validators, and soundness/completeness theorems;
-- provenance-checked propagation of domain and same-row `CHECK` refinements
-  through complete direct query projections;
-- conservative result nullability (`Option` whenever non-null cannot be
-  established);
-- runtime symbolic OID resolution, schema attachment, prepared-descriptor
-  verification, and typed `SchemaDrift`/`QueryDrift` errors;
-- generated one-dimensional arrays of built-in and generated values, named
-  composite cells, and range/multirange values with resolver-aware codecs;
-- local character, exact numeric precision/scale, temporal precision, and
-  interval precision refinements, propagated through generated arrays,
-  composites, and finite range/multirange bounds;
-- reusable extension codec packages whose installed version and owned types
-  are recorded in the generated contract;
-- local revalidation during decoding, reported as typed constraint-violation
-  errors when stored data does not establish the generated proposition;
-- normalized symbolic metadata for unique, primary-key, foreign-key, and
-  exclusion constraints and their semantic supporting indexes;
-- a pure, duplicate-preserving, many-sorted relational state kernel with
-  generated state-indexed `At`/`OccAt` aliases, relational `Holds`
-  propositions, lifecycle-aware integrity contexts, and abstract
-  insert/delete/update specifications;
-- explicit type overrides and hard generation errors for unsupported types.
+> [!IMPORTANT]
+> The project is pre-release. The module version is a development coordinate,
+> not a compatibility promise, and public APIs may change before the first
+> release.
 
-## Bazel usage
+```text
+migrations + .sql files + manifest
+                │
+                ▼
+      transient pinned PostgreSQL
+                │
+                ▼
+ canonical IR + generated Lean modules
+                │
+                ▼
+  attach-time and per-query verification
+```
 
-The build expects `rules_lean`, `pg-lean`, and `tls13-lean` as sibling
-checkouts. The local module pins PostgreSQL, `socat`, and the action lifecycle
-utilities through one Nix revision; the ordinary build does not use a
-developer or production database.
+Generation never consults a developer or production database. The Bazel action
+starts an empty private cluster, replays only declared migrations, probes the
+declared schemas and queries, writes deterministic outputs, and stops it.
 
-Lake and Lean-aware editors use `nightly-2026-04-25`, the official toolchain
-built from the same upstream Lean commit (`24bef91f9a20a45f074729e869461d374687de1c`)
-as the Nix toolchain registered for Bazel. Install it with
-`elan toolchain install leanprover/lean4-nightly:nightly-2026-04-25` before
-opening the checkout, and restart an existing language server after changing
-toolchains. The `lean4-nightly` spelling is intentional: Lean4IJ maps the
-selector directly to Elan's on-disk nightly directory.
+## Current scope
+
+The implemented surface includes:
+
+- PostgreSQL 17/18 code generation and compatibility checks, with PostgreSQL
+  18 as the default canonical generator;
+- generated enums, domains, one-dimensional arrays, composites, ranges, and
+  multiranges, plus explicit codecs for extension or application types;
+- typed query parameters and rows with `execute`, `exactlyOne`, `zeroOrOne`,
+  and `many` cardinality contracts;
+- checked attachment, symbolic OID resolution, prepared-statement descriptor
+  checks, result verification, and typed drift errors;
+- proof-producing local domain and row validation for a conservative subset of
+  normalized PostgreSQL `CHECK` expressions; and
+- a pure finite relational-state model for selected unique, primary-key,
+  foreign-key, and exclusion constraints, with abstract one-row mutation
+  specifications.
+
+It does **not** yet provide relational semantics for analyzed queries, a proof
+that a live database is represented by a logical state, transaction or
+concurrency semantics, or complete PostgreSQL expression/constraint coverage.
+See [Support](docs/support.md) for the exact boundary and
+[Roadmap](ROADMAP.md) for planned work.
+
+## Prerequisites
+
+- Bazel or Bazelisk using the version in [`.bazelversion`](.bazelversion)
+  (currently Bazel 8.5);
+- Nix, used by Bazel to build the Lean and PostgreSQL execution tools; and
+- a Linux or macOS POSIX host with Bash and Bazel directory runfiles enabled;
+  Windows and manifest-only runfiles are not currently supported; and
+- while the modules are not published, sibling source checkouts of
+  `rules_lean`, `pg-lean`, and `tls13-lean`.
+
+For editor support, install the toolchain named in [`lean-toolchain`](lean-toolchain).
+Bazel is the authoritative build; Lake supplies the editor project model.
+
+## Source-checkout consumer setup
+
+Until releases are published, a consuming root module can use local overrides:
 
 ```starlark
-load(
-    "@lean-pgx//bazel:defs.bzl",
-    "lean_pg_library",
-    "pg_compat_test",
-    "pg_query_set",
+bazel_dep(name = "lean-pgx", version = "0.1.0")
+local_path_override(module_name = "lean-pgx", path = "../lean-pgx")
+
+# Local overrides in a dependency are not inherited by the root module.
+bazel_dep(name = "rules_lean", version = "0.1.0")
+local_path_override(module_name = "rules_lean", path = "../rules_lean")
+
+bazel_dep(name = "pg-lean", version = "0.1.0", repo_name = "pg_lean")
+local_path_override(module_name = "pg-lean", path = "../pg-lean")
+
+bazel_dep(name = "tls13-lean", version = "0.1.0", repo_name = "tls13_lean")
+local_path_override(module_name = "tls13-lean", path = "../tls13-lean")
+
+lean = use_extension("@rules_lean//lean:extensions.bzl", "lean")
+lean.nix_toolchain(
+    name = "lean4",
+    attr = "lean4_upstream_std",
+    nix_file = "@rules_lean//:nixpkgs.nix",
+    nix_file_deps = ["@rules_lean//:nixpkgs.json"],
 )
+use_repo(lean, "lean4_toolchain")
+register_toolchains("@lean4_toolchain//:all")
+```
+
+The `lean-pgx` module extension owns namespaced repositories for its pinned
+PostgreSQL, `socat`, and lifecycle tools, so consumers do not declare those
+repositories or copy a private Nix extension block. This is an intentionally
+temporary source-checkout recipe; [Getting started](docs/getting-started.md) is
+the authoritative setup guide while the publication interface is finalized.
+
+## Minimal database target
+
+```starlark
+load("@lean-pgx//bazel:defs.bzl", "lean_pg_library", "pg_query_set")
 
 pg_query_set(
     name = "queries",
-    srcs = [
-        "queries/get_user.sql",
-        "queries/list_users.sql",
-    ],
+    srcs = ["queries/get_user.sql"],
     manifest = "queries/queries.json",
 )
 
 lean_pg_library(
     name = "app_db",
     module_prefix = "AppDb",
-    migrations = [
-        "migrations/0001_schema.sql",
-        "migrations/0002_tables.sql",
-    ],
+    migrations = ["migrations/0001_users.sql"],
     queries = ":queries",
     schemas = ["app"],
-)
-
-pg_compat_test(
-    name = "app_db_pg17_pg18",
-    database = ":app_db",
-    postgres = [
-        "@postgresql_17//:toolchain",
-        "@postgresql_18//:toolchain",
-    ],
+    visibility = ["//visibility:public"],
 )
 ```
 
-Each query file must contain one statement. Its manifest entry supplies the
-Lean module name, parameter names/nullability, and runtime-checked cardinality;
-PostgreSQL infers all SQL types.
+The [complete quickstart](examples/quickstart/README.md) adds a runnable client
+and a live transient-PostgreSQL test.
+
+Each query file contains one statement. Its root manifest entry uses the exact
+SQL basename and supplies only the application-owned facts PostgreSQL cannot
+infer safely:
 
 ```json
 {
@@ -109,226 +144,68 @@ PostgreSQL infers all SQL types.
 }
 ```
 
-The declared generation outputs are fixed:
-
-```text
-AppDb/Types.lean
-AppDb/Schema.lean
-AppDb/Constraints.lean
-AppDb/Queries/GetUser.lean
-AppDb/Queries/ListUsers.lean
-AppDb.lean
-app_db.pgir.json
-app_db.contract.sha256
-app_db.compatibility.sha256
-```
-
-The action initializes a private cluster, makes PostgreSQL listen only on an
-action-private Unix-domain socket, replays the declared migrations in order,
-probes the declared schemas and queries, writes those outputs, and stops the
-server. The PostgreSQL client dependency currently exposes TCP connections,
-so a pinned `socat` process bridges a random loopback port to that private
-socket for the duration of the action. Bazel blocks external networking, all
-server/bridge/lifecycle tools are declared inputs, and cleanup stops both
-processes and removes the private cluster.
-
-## Generated runtime API
+The generated root module exports the database descriptor, attachment
+function, types, schema declarations, constraints, logic API, and query
+modules. Handle attachment failures before using the checked capability:
 
 ```lean
 import AppDb
 
-def findUser
-    (conn : Pgx.Typed.CheckedConnection AppDb.database)
-    (id : Int64) :
-    Std.Async.Async
-      (Except Pgx.Typed.Error (Option AppDb.Queries.GetUser.Row)) :=
-  AppDb.Queries.GetUser.run conn { id }
+open Std.Async
+
+private def typed! (context : String) (result : Except Pgx.Typed.Error α) :
+    Async α :=
+  match result with
+  | .ok value => pure value
+  | .error error => throw (IO.userError s!"{context}: {error}")
+
+def findUser (raw : Pg.Connection) (id : Int64) :
+    Async (Option AppDb.Queries.GetUser.Row) := do
+  let checked ← typed! "attach AppDb" (← AppDb.attach raw)
+  typed! "GetUser" (← AppDb.Queries.GetUser.run checked { id })
 ```
 
-Obtain the checked capability from a raw `Pg.Connection`:
+The owner of `raw` remains responsible for closing it. Treat
+`CheckedConnection` as a capability tied to the installed session contract:
+do not mutate its session settings, deallocate its cached statements, or
+change the checked schema behind it.
 
-```lean
-let checked ← AppDb.attach raw
-```
+## Trust boundary
 
-Attachment installs and verifies the generated session contract, checks the
-server major, resolves every symbolic type/relation against local OIDs, and
-compares schema descriptors, including array elements, composite fields, and
-complete range metadata (subtype, multirange link, collation, subtype operator
-class, canonical routine, and subtype-difference routine). It also compares
-normalized view/routine metadata, extension package ownership, and relation
-constraints, including validation/enforcement/deferral, foreign-key actions
-and operator vectors, inheritance/period facts, and supporting-index identity.
-Semantic unique, primary-key, and exclusion indexes are compared with their
-key expressions, collations, operator classes, equality operators, null
-policy, predicates, and readiness/validity flags. Ordinary performance-only
-indexes are not attachment blockers. Each query's first use prepares with
-resolved parameter OIDs and compares the returned parameter/result descriptors
-before binding or decoding.
+Lean checks generated validator proofs relative to the generated predicates
+and checks the pure relational theorems. PostgreSQL, catalog and protocol
+observations, the normalized-expression parser, code generator, emitter, and
+runtime I/O remain trusted implementation components. Attachment detects many
+forms of drift; it does not turn a live PostgreSQL database into a proved Lean
+logical state. Details are in [Assurance and trust](docs/assurance-and-trust.md).
 
-PostgreSQL 18 native `NOT NULL` constraints that are unvalidated or unenforced
-are rejected during generation and attachment: `attnotnull` alone is not a
-sound promise that pre-existing rows are non-null in that transitional state.
+## Documentation
 
-Generated container values use these runtime shapes:
+- [Getting started](docs/getting-started.md)
+- [Runnable quickstart](examples/quickstart/README.md)
+- [Supported and unsupported behavior](docs/support.md)
+- [Architecture](docs/architecture.md)
+- [Bazel rule reference](docs/reference/bazel-rules.md)
+- [Query manifest reference](docs/reference/manifest.md)
+- [Generated API reference](docs/reference/generated-api.md)
+- [Runtime errors](docs/reference/runtime-errors.md)
+- [Design decisions](docs/design/0001-server-authoritative-codegen.md)
+- [Roadmap](ROADMAP.md)
 
-```lean
-Pgx.Typed.PgArray α       -- Array (Option α), one dimension
-Pgx.Typed.PgRange α       -- empty or finite/infinite typed bounds
-Pgx.Typed.PgMultirange α  -- Array (PgRange α)
-```
-
-A named PostgreSQL composite becomes a generated structure. Every composite
-field is an `Option`: table `NOT NULL` constraints do not constrain a row-type
-value used independently. `AppDb.Constraints.views` and
-`AppDb.Constraints.routines` expose normalized view and overload/table-result
-metadata captured from PostgreSQL.
-
-Generated domains and row-returning queries separate freely constructible
-`Data` from their proof-bearing public value:
-
-```lean
-def ValidPred : Data → Prop
-def validate : Data → Except Pgx.ConstraintViolation Row
-theorem validate_sound ...
-theorem validate_complete ...
-```
-
-`CHECK` evaluation is performed again in Lean. As in PostgreSQL, only SQL
-`false` violates a check; `true` and `unknown` both pass. No database axiom is
-used to construct the subtype proof. Unique, primary-key, foreign-key, and
-exclusion guarantees still do not refine an individual row. They are emitted
-instead as propositions over `AppDb.Logic.State`; generated `At` aliases
-package positive row membership, while `OccAt` preserves duplicate occurrence
-identity for uniqueness and exclusion reasoning.
-
-## Relational logic API
-
-`AppDb.Logic` defines a finite, immutable logical state whose tables are arrays
-of row occurrences. For every modeled relational constraint, code generation
-emits typed key projections, catalog lifecycle metadata, and a `Holds`
-proposition. SQL equality, null, collation, and operator behavior is supplied
-explicitly through `AppDb.Logic.Semantics`; neither attachment nor a live query
-manufactures these semantics or a proof that a logical state represents
-PostgreSQL.
-
-Generated propositions currently cover column-key `UNIQUE` constraints,
-including `NULLS NOT DISTINCT`; primary keys; `MATCH SIMPLE` and `MATCH FULL`
-foreign keys whose referenced relation is present in the generated state; and
-column-only exclusion constraints. `unsupportedRelationalConstraints` records
-conservative omissions such as `MATCH PARTIAL`, temporal
-`PERIOD`/`WITHOUT OVERLAPS`, expression-based exclusion keys, and references
-outside the generated state.
-
-`IntegrityContext` includes only modeled relational constraints that are
-enforced, validated, and due at the selected catalog-default phase. It is not
-a predicate for every local `CHECK`, `NOT NULL`, or domain constraint.
-Generated `insertSpec`, `deleteSpec`, and `updateSpec` declarations are pure,
-one-occurrence state-transition specifications, not live DML operations or
-backend-correctness theorems.
-
-Analyzed query/K-relational semantics, relational `LocalPred`, `ScopedPred`,
-and exact-bag `ResultPred` contracts, nominal snapshot scopes, `SnapshotM`,
-state reification/certification, and any theorem connecting a live PostgreSQL
-observation to a logical `State` are not yet implemented. Mutation specs do
-not yet model cascades, `SET NULL`/`SET DEFAULT`, triggers, generated-column
-effects, multi-row statements, transaction-local `SET CONSTRAINTS`,
-concurrency, or isolation semantics. Standalone indexes receive no `Holds`
-proposition, and attachment assumes the schema is not concurrently modified
-while its catalog checks run.
-
-The executable subset covers null tests, Boolean connectives, fixed-width
-integer comparisons, Boolean and enum equality, character length, one-argument
-`btrim`, `POSITION`, nested domains, and casts whose modeled values are proved
-unchanged. Generation reports a categorized source-offset diagnostic for
-unsupported constructs. In particular, user-defined functions/operators,
-`NO INHERIT`, `bpchar` check semantics, numeric arithmetic, and casts into a
-constrained or type-modified domain are rejected instead of approximated.
-
-Table checks propagate to a query row only when result descriptors establish
-every referenced identity projection and generic-plan inspection establishes
-exactly one non-outer occurrence of that relation. This prevents synthetic
-outer-join nulls and columns from different self-join aliases from being
-treated as one source row. Domain validation remains value-local, so present
-domain values can still be refined in nullable outer-join results.
-
-The generated runners map cardinality to results as follows:
-
-| Manifest value | Lean result |
-| --- | --- |
-| `execute` | `Pgx.Typed.CommandResult` |
-| `exactlyOne` | `Row` |
-| `zeroOrOne` | `Option Row` |
-| `many` | `Array Row` |
-
-## Type overrides and extension packages
-
-Unknown base/extension types and pseudo-types are rejected unless the manifest
-declares an override:
-
-```json
-{
-  "typeOverrides": [
-    {
-      "key": {"schema": "ext", "name": "vector", "kind": "base"},
-      "leanType": "MyVector.Vector",
-      "codec": "MyVector.codec",
-      "importModule": "MyVector"
-    }
-  ]
-}
-```
-
-The `codec` declaration must have type
-`Pgx.Typed.ResolvedCodec MyVector.Vector`; add its Bazel Lean target to the
-`deps` of `lean_pg_library`.
-
-When several codecs belong to one PostgreSQL extension, declare them as a
-package. The package owns one import module, so nested overrides omit
-`importModule`:
-
-```json
-{
-  "extensionCodecPackages": [
-    {
-      "extension": "vector",
-      "importModule": "PgVector",
-      "typeOverrides": [
-        {
-          "key": {"schema": "public", "name": "vector", "kind": "base"},
-          "leanType": "PgVector.Vector",
-          "codec": "PgVector.codec"
-        }
-      ]
-    }
-  ]
-}
-```
-
-Generation requires that extension to be installed, resolves its installed
-version, rejects overlapping package ownership, and records deterministic
-package provenance alongside the resolved overrides.
-
-## Build and tests
+## Development
 
 ```sh
 bazel build //...
 bazel test //...
-```
-
-The end-to-end fixture in `examples/app_db` exercises DDL replay, all four
-cardinalities, enum/domain arrays, composite cells, ranges/multiranges,
-numeric/time modifiers, view and table-valued-function metadata,
-conservative outer-join nullability, shifted user OIDs, proof-producing local
-validation, invalid stored-data rejection, runtime cardinality checks,
-generated relational API compilation, `QueryDrift`, targeted semantic
-`SchemaDrift` (including relational constraint lifecycle, semantic index
-identity, range collation, operator-class, and subtype-difference changes), and
-live PostgreSQL 17/18 compatibility.
-
-Lake supplies the editor project model; Bazel remains authoritative:
-
-```sh
 lake update
 lake build
 ```
+
+`bazel test //...` includes unit tests, generation from real DDL in transient
+PostgreSQL clusters, cross-major compatibility checks, and a live generated
+API acceptance test. See [Contributing](CONTRIBUTING.md) before sending a
+change and [Security](SECURITY.md) for private vulnerability reporting.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).

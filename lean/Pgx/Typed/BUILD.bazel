@@ -2,7 +2,7 @@
 
 load("@rules_lean//lean:defs.bzl", "lean_library")
 
-package(default_visibility = ["//visibility:public"])
+package(default_visibility = ["//visibility:private"])
 
 lean_library(
     name = "descriptors",
@@ -13,6 +13,7 @@ lean_library(
         "@pg_lean//:pg_lean",
     ],
     strip_module_prefix = "lean",
+    visibility = ["//lean:internal"],
 )
 
 lean_library(
@@ -20,6 +21,7 @@ lean_library(
     srcs = ["Containers.lean"],
     deps = ["@pg_lean//:pg_lean"],
     strip_module_prefix = "lean",
+    visibility = ["//lean:internal"],
 )
 
 lean_library(
@@ -27,6 +29,7 @@ lean_library(
     srcs = ["Composite.lean"],
     deps = ["@pg_lean//:pg_lean"],
     strip_module_prefix = "lean",
+    visibility = ["//lean:internal"],
 )
 
 lean_library(
@@ -37,6 +40,7 @@ lean_library(
         "@pg_lean//Pg:connection",
     ],
     strip_module_prefix = "lean",
+    visibility = ["//lean:internal"],
 )
 
 lean_library(
@@ -48,4 +52,5 @@ lean_library(
         "@pg_lean//:pg_lean",
     ],
     strip_module_prefix = "lean",
+    visibility = ["//lean:internal"],
 )

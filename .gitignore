@@ -1,3 +1,6 @@
 bazel-*
 .lake/
 .bazelrc.user
+.DS_Store
+result
+result-*

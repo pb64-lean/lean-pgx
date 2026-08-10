@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/pb64-lean/lean-pgx/blob/main/docs/reference/query-manifest.schema.json",
+  "title": "lean-pgx query manifest",
+  "description": "Static shape for a lean-pgx query manifest. Deterministic Lean names, dense parameter positions, cross-entry uniqueness, query-file correspondence, and Bazel server-major equality are enforced by the generator.",
+  "type": "object",
+  "properties": {
+    "supportedServerMajors": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "default": [17, 18]
+    },
+    "typeOverrides": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/directTypeOverride"
+      },
+      "default": []
+    },
+    "extensionCodecPackages": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/extensionCodecPackage"
+      },
+      "default": []
+    }
+  },
+  "patternProperties": {
+    "^[^/\\\\]+\\.sql$": {
+      "$ref": "#/$defs/query"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "nonemptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "typeKind": {
+      "enum": [
+        "base",
+        "enum",
+        "domain",
+        "array",
+        "range",
+        "multirange",
+        "composite",
+        "pseudo"
+      ]
+    },
+    "typeKey": {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "name": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "kind": {
+          "$ref": "#/$defs/typeKind"
+        }
+      },
+      "required": ["schema", "name", "kind"],
+      "additionalProperties": false
+    },
+    "parameter": {
+      "type": "object",
+      "properties": {
+        "position": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "name": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "nullable": {
+          "type": "boolean"
+        }
+      },
+      "required": ["position", "name", "nullable"],
+      "additionalProperties": false
+    },
+    "query": {
+      "type": "object",
+      "properties": {
+        "leanName": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9]*$"
+        },
+        "cardinality": {
+          "enum": ["execute", "exactlyOne", "zeroOrOne", "many"]
+        },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/parameter"
+          }
+        }
+      },
+      "required": ["leanName", "cardinality", "parameters"],
+      "additionalProperties": false
+    },
+    "directTypeOverride": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/typeKey"
+        },
+        "leanType": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "codec": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "importModule": {
+          "$ref": "#/$defs/nonemptyString"
+        }
+      },
+      "required": ["key", "leanType", "codec"],
+      "additionalProperties": false
+    },
+    "packagedTypeOverride": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/typeKey"
+        },
+        "leanType": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "codec": {
+          "$ref": "#/$defs/nonemptyString"
+        }
+      },
+      "required": ["key", "leanType", "codec"],
+      "additionalProperties": false
+    },
+    "extensionCodecPackage": {
+      "type": "object",
+      "properties": {
+        "extension": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "importModule": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "typeOverrides": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/packagedTypeOverride"
+          }
+        }
+      },
+      "required": ["extension", "importModule", "typeOverrides"],
+      "additionalProperties": false
+    }
+  }
+}

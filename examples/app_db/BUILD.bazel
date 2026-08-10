@@ -9,12 +9,12 @@ load(
 )
 load("@rules_lean//lean:defs.bzl", "lean_binary", "lean_library", "lean_test")
 
-package(default_visibility = ["//visibility:public"])
+package(default_visibility = ["//visibility:private"])
 
 lean_library(
     name = "extension_codecs",
     srcs = ["AppDb/ExtensionCodecs.lean"],
-    deps = ["//lean/Pgx:pg_typed"],
+    deps = ["//lean:pg_typed"],
     strip_module_prefix = "examples/app_db",
 )
 
@@ -29,6 +29,7 @@ pg_query_set(
         "queries/list_users_with_profile.sql",
         "queries/list_type_sample_view.sql",
         "queries/mix_user_rows.sql",
+        "queries/prepare_retry.sql",
         "queries/put_type_sample.sql",
     ],
     manifest = "queries/queries.json",
@@ -51,10 +52,6 @@ lean_pg_library(
 pg_compat_test(
     name = "pg17_pg18_test",
     database = ":app_db",
-    postgres = [
-        "@postgresql_17//:toolchain",
-        "@postgresql_18//:toolchain",
-    ],
 )
 
 lean_test(
@@ -75,13 +72,12 @@ lean_binary(
 pg_live_test(
     name = "runtime_test",
     database = ":app_db",
-    postgres = "@postgresql_18//:toolchain",
     runner = ":runtime_test_bin",
 )
 
 pg_live_test(
     name = "runtime_test_pg17",
     database = ":app_db",
-    postgres = "@postgresql_17//:toolchain",
+    major = 17,
     runner = ":runtime_test_bin",
 )

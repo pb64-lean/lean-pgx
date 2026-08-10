@@ -1,0 +1,6 @@
+CREATE SCHEMA app;
+
+CREATE TABLE app.widgets (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL UNIQUE
+);

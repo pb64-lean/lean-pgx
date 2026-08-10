@@ -71,7 +71,7 @@ theorem validateSchemaUserComplete
       AppDb.Schema.App.Users.validate value = .ok refined :=
   AppDb.Schema.App.Users.validate_complete valid
 
-/-! Milestone-4 state-indexed rows and relational specifications.  Comparator
+/-! State-indexed rows and relational specifications. Comparator
 semantics remain explicit inputs and are never obtained from a live response. -/
 
 abbrev LogicalState := AppDb.Logic.State
@@ -332,16 +332,16 @@ def runListProfiles
         (Array AppDb.Queries.ListUsersWithProfile.Row)) :=
   AppDb.Queries.ListUsersWithProfile.run conn params
 
-/-! Milestone-3 containers, composites, type modifiers, views, and routines. -/
+/-! Containers, composites, type modifiers, views, and routines. -/
 
 def typeSampleStatuses
     (params : AppDb.Queries.PutTypeSample.Params) :
-    AppDb.Types.AppUserStatus_2 :=
+    AppDb.Types.AppUserStatusArray :=
   params.statuses
 
 def typeSampleEmails
     (params : AppDb.Queries.PutTypeSample.Params) :
-    AppDb.Types.AppEmailAddress_2 :=
+    AppDb.Types.AppEmailAddressArray :=
   params.emails
 
 def typeSampleCard

@@ -2,6 +2,8 @@
 
 load("@rules_lean//lean:defs.bzl", "lean_test")
 
+package(default_visibility = ["//visibility:private"])
+
 lean_test(
     name = "ir_test",
     srcs = ["IR.lean"],

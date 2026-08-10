@@ -1,6 +1,8 @@
-import Pgx.IR
-import Pgx.TypeMapping
-import Pg.Config
+module
+
+public import Pg.Config
+
+public section
 
 namespace Pgx
 

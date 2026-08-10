@@ -1,7 +1,11 @@
-import Pgx.Typed
-import Pgx.Core
-import Pgx.Constraint.Semantics
-import Pgx.Logic.All
+module
+
+public import Pgx.Typed
+public import Pgx.Core
+public import Pgx.Constraint.Semantics
+public import Pgx.Logic.All
+
+public section
 
 /-!
 # Pgx

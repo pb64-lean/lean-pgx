@@ -1,0 +1,14 @@
+{
+  "supportedServerMajors": [17, 18],
+  "get_user.sql": {
+    "leanName": "GetUser",
+    "cardinality": "zeroOrOne",
+    "parameters": [
+      {
+        "position": 1,
+        "name": "id",
+        "nullable": false
+      }
+    ]
+  }
+}

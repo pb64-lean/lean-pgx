@@ -1,0 +1,28 @@
+name: ci
+
+# Hermetic Bazel tests on the self-hosted NixOS runners.
+# NEVER add pull_request here: these jobs run on self-hosted runners.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "37 4 * * 1"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    uses: pb64-lean/.github/.github/workflows/bazel-ci.yml@main
+    with:
+      siblings: rules_lean pg-lean tls13-lean
+
+  downstream:
+    uses: pb64-lean/.github/.github/workflows/integration.yml@main
+    with:
+      siblings: rules_lean pg-lean tls13-lean
+      run: cd integration/downstream && bazel test //... --lockfile_mode=error --test_output=errors --color=yes --curses=no
+      timeout_minutes: 120

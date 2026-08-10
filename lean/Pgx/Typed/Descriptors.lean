@@ -17,6 +17,36 @@ wire descriptors.
 
 namespace Pgx.Typed
 
+/-- Stable, payload-independent classification for runtime failures. -/
+inductive ErrorKind where
+  | postgres
+  | schemaDrift
+  | queryDrift
+  | unsupportedType
+  | constraintViolation
+  | encode
+  | decode
+  | cardinality
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+/-- Which checked contract produced a drift diagnostic. -/
+inductive DriftKind where
+  | schema
+  | query
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+/-- Structured view of a schema- or query-drift diagnostic. -/
+structure DriftContext where
+  kind : DriftKind
+  message : String
+  deriving Repr, BEq, Inhabited
+
+/-- Structured view of a generated cardinality-contract failure. -/
+structure CardinalityContext where
+  expected : String
+  actual : String
+  deriving Repr, BEq, Inhabited
+
 inductive Error where
   | postgres (error : Pg.Error)
   | schemaDrift (message : String)
@@ -29,6 +59,33 @@ inductive Error where
   deriving Repr, Inhabited
 
 namespace Error
+
+/-- Classify an error without parsing its rendered message. -/
+def kind : Error → ErrorKind
+  | .postgres _ => .postgres
+  | .schemaDrift _ => .schemaDrift
+  | .queryDrift _ => .queryDrift
+  | .unsupportedType _ => .unsupportedType
+  | .constraintViolation _ => .constraintViolation
+  | .encode _ => .encode
+  | .decode _ => .decode
+  | .cardinality _ _ => .cardinality
+
+/-- Recover the original pg-lean error when this is a PostgreSQL failure. -/
+def postgres? : Error → Option Pg.Error
+  | .postgres error => some error
+  | _ => none
+
+/-- Recover structured drift scope and diagnostic text. -/
+def driftContext? : Error → Option DriftContext
+  | .schemaDrift message => some { kind := .schema, message }
+  | .queryDrift message => some { kind := .query, message }
+  | _ => none
+
+/-- Recover structured cardinality details without parsing `toString`. -/
+def cardinalityContext? : Error → Option CardinalityContext
+  | .cardinality expected actual => some { expected, actual }
+  | _ => none
 
 def toMessage : Error → String
   | .postgres error => toString error
@@ -92,7 +149,10 @@ structure DatabaseDesc where
   routines : Array Pgx.RoutineIR := #[]
   requiredExtensions : Array (String × String) := #[]
   extensionCodecPackages : Array Pgx.ExtensionCodecPackageIR := #[]
+  /-- Legacy name retained for source compatibility. Generated descriptors set
+  this to `contractHash`; new code should use `contractHash`. -/
   schemaHash : String
+  /-- Fingerprint of the generated schema, query, session, and codec contract. -/
   contractHash : String
   deriving Repr, BEq, Inhabited
 

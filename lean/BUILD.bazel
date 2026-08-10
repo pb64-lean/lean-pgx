@@ -1,12 +1,20 @@
 """Primary lean-pgx library target."""
 
-load("@rules_lean//lean:defs.bzl", "lean_library")
+load("@rules_lean//lean:defs.bzl", "lean_assurance_test", "lean_library")
+load("//:assurance.bzl", "PGX_ALLOWED_AXIOMS")
+load("//:assurance_types.bzl", "PGX_PRINCIPAL_TYPES")
 
-package(default_visibility = ["//visibility:public"])
+package(default_visibility = ["//visibility:private"])
+
+package_group(
+    name = "internal",
+    packages = ["//lean/..."],
+)
 
 alias(
     name = "pg_typed",
     actual = "//lean/Pgx:pg_typed",
+    visibility = ["//visibility:public"],
 )
 
 lean_library(
@@ -19,4 +27,43 @@ lean_library(
         "//lean/Pgx/Logic:logic",
     ],
     strip_module_prefix = "lean",
+    visibility = ["//visibility:public"],
+)
+
+# Exact policy for the public Pgx runtime and relational-logic surface. The
+# imported Pg/TLS stack is audited in its owning repositories; every Pgx
+# module, principal statement, and trust-boundary inventory is pinned here.
+lean_assurance_test(
+    name = "pgx_assurance",
+    allowed_axioms = PGX_ALLOWED_AXIOMS,
+    module_prefixes = ["Pgx"],
+    unaudited_module_prefixes = [
+        "HaclStar",
+        "Pg",
+        "TLS13",
+        "Tls",
+    ],
+    policy_mode = "exact",
+    principal_theorems = [
+        "Pgx.Constraint.validate_sound",
+        "Pgx.Constraint.validate_complete",
+        "Pgx.Logic.State.equivalent_refl",
+        "Pgx.Logic.State.equivalent_symm",
+        "Pgx.Logic.State.equivalent_trans",
+    ],
+    principal_theorem_types = PGX_PRINCIPAL_TYPES,
+    expected_unsafe_constants = [],
+    expected_partial_definitions = [
+        "Pgx.IR.Pgx.truthExprAtom",
+        "Pgx.IR.Pgx.valueExprAtom",
+    ],
+    expected_opaque_constants = [],
+    expected_implemented_by = {},
+    expected_extern_declarations = {},
+    expected_native_targets = [
+        "@tls13-lean++_repo_rules+hacl//:hacl",
+        "@tls13-lean+//HaclStar:hacl_shim",
+        "@tls13-lean+//HaclStar:lean_runtime_headers",
+    ],
+    deps = [":pgx"],
 )

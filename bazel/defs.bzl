@@ -24,6 +24,7 @@ LeanPgGenInfo = provider(
         "contract_hash": "Canonical-major semantic contract fingerprint.",
         "compatibility_hash": "Major-independent contract fingerprint.",
         "module_prefix": "Root Lean module name.",
+        "canonical_major": "PostgreSQL major used to emit the canonical contract.",
         "query_names": "Generated query module names.",
         "migrations": "Ordered DDL migration files.",
         "query_srcs": "Ordered literal query files.",
@@ -103,7 +104,15 @@ _pg_query_set = rule(
 )
 
 def pg_query_set(name, srcs, manifest, visibility = None, **kwargs):
-    """Collects one-statement SQL files and their query manifest."""
+    """Collects one-statement SQL files and their query manifest.
+
+    Args:
+      name: Target name.
+      srcs: Nonempty list of literal `.sql` source labels.
+      manifest: JSON query-manifest label.
+      visibility: Optional Bazel visibility.
+      **kwargs: Additional common rule attributes.
+    """
     _pg_query_set(
         name = name,
         srcs = srcs,
@@ -173,6 +182,19 @@ SLEEP="$(pgx_absolute "$9")"
 GENERATOR="$(pgx_absolute "${10}")"
 shift 10
 
+if [ -n "${PGX_EXPECTED_SERVER_MAJOR:-}" ]; then
+  PGX_VERSION_OUTPUT="$("$POSTGRES" --version)"
+  if [[ ! "$PGX_VERSION_OUTPUT" =~ PostgreSQL\)[[:space:]]+([0-9]+) ]]; then
+    echo "unable to determine PostgreSQL major from: $PGX_VERSION_OUTPUT" >&2
+    exit 1
+  fi
+  PGX_ACTUAL_SERVER_MAJOR="${BASH_REMATCH[1]}"
+  if [ "$PGX_ACTUAL_SERVER_MAJOR" != "$PGX_EXPECTED_SERVER_MAJOR" ]; then
+    echo "PostgreSQL distribution major mismatch: expected $PGX_EXPECTED_SERVER_MAJOR, got $PGX_ACTUAL_SERVER_MAJOR" >&2
+    exit 1
+  fi
+fi
+
 pgx_print_log() {
   PGX_PRINT_FILE="$1"
   PGX_PRINT_COUNT=0
@@ -189,7 +211,15 @@ case "$PGX_WORK" in
   *) echo "refusing unexpected temporary path: $PGX_WORK" >&2; exit 1 ;;
 esac
 PGX_DATA="$PGX_WORK/data"
-PGX_SOCKET="$PGX_WORK/socket"
+# PostgreSQL limits Unix-socket paths to roughly 100 bytes. Bazel test
+# sandboxes can make TEST_TMPDIR substantially longer, so only the socket
+# directory uses the conventional short temporary root. mktemp prevents
+# collisions between concurrent tests.
+PGX_SOCKET="$("$MKTEMP" -d "/tmp/lean-pgx-socket.XXXXXX")"
+case "$PGX_SOCKET" in
+  /tmp/lean-pgx-socket.*|/private/tmp/lean-pgx-socket.*) ;;
+  *) echo "refusing unexpected socket path: $PGX_SOCKET" >&2; exit 1 ;;
+esac
 PGX_LOG="$PGX_WORK/postgres.log"
 PGX_SOCAT_LOG="$PGX_WORK/socat.log"
 PGX_POSTGRES_PID=""
@@ -222,6 +252,11 @@ cleanup() {
   fi
   case "$PGX_WORK" in
     "$PGX_TMP_ROOT"/lean-pgx.*) "$RM" -rf -- "$PGX_WORK" ;;
+  esac
+  case "$PGX_SOCKET" in
+    /tmp/lean-pgx-socket.*|/private/tmp/lean-pgx-socket.*)
+      "$RM" -rf -- "$PGX_SOCKET"
+      ;;
   esac
   exit "$PGX_STATUS"
 }
@@ -405,6 +440,7 @@ def _lean_pg_generate_impl(ctx):
             contract_hash = contract_out,
             compatibility_hash = compatibility_out,
             module_prefix = ctx.attr.module_prefix,
+            canonical_major = ctx.attr.canonical_major,
             query_names = query_info.lean_names,
             migrations = ctx.files.migrations,
             query_srcs = query_info.srcs,
@@ -429,7 +465,7 @@ _lean_pg_generate = rule(
         ),
         "schemas": attr.string_list(mandatory = True),
         "postgres": attr.label(
-            default = "@postgresql_18//:toolchain",
+            default = "@lean_pgx_postgresql_18//:toolchain",
             allow_files = True,
             cfg = "exec",
         ),
@@ -441,12 +477,12 @@ _lean_pg_generate = rule(
             cfg = "exec",
         ),
         "_socat": attr.label(
-            default = "@socat//:toolchain",
+            default = "@lean_pgx_socat//:toolchain",
             allow_files = True,
             cfg = "exec",
         ),
         "_coreutils": attr.label(
-            default = "@coreutils//:toolchain",
+            default = "@lean_pgx_coreutils//:toolchain",
             allow_files = True,
             cfg = "exec",
         ),
@@ -455,6 +491,12 @@ _lean_pg_generate = rule(
 
 def _pg_compat_snapshot_impl(ctx):
     database = ctx.attr.database[LeanPgGenInfo]
+    if ctx.attr.major not in database.server_majors:
+        fail("PostgreSQL major %s is not accepted by %s (accepted: %s)" % (
+            ctx.attr.major,
+            ctx.attr.database.label,
+            database.server_majors,
+        ))
     ir_out = ctx.actions.declare_file(ctx.label.name + ".pgir.json")
     contract_out = ctx.actions.declare_file(ctx.label.name + ".contract.sha256")
     compatibility_out = ctx.actions.declare_file(
@@ -556,12 +598,12 @@ _pg_compat_snapshot = rule(
             cfg = "exec",
         ),
         "_socat": attr.label(
-            default = "@socat//:toolchain",
+            default = "@lean_pgx_socat//:toolchain",
             allow_files = True,
             cfg = "exec",
         ),
         "_coreutils": attr.label(
-            default = "@coreutils//:toolchain",
+            default = "@lean_pgx_coreutils//:toolchain",
             allow_files = True,
             cfg = "exec",
         ),
@@ -570,8 +612,11 @@ _pg_compat_snapshot = rule(
 
 def _runfile_expr(path):
     if path.startswith("../"):
-        return '"$RUNFILES_DIR/%s"' % path[3:]
-    return '"$RUNFILES_DIR/$TEST_WORKSPACE/%s"' % path
+        return '"$RUNFILES_DIR"/%s' % _shell_quote(path[3:])
+    return '"$RUNFILES_DIR/$TEST_WORKSPACE"/%s' % _shell_quote(path)
+
+def _shell_quote(value):
+    return "'" + value.replace("'", "'\"'\"'") + "'"
 
 def _pg_compat_compare_test_impl(ctx):
     snapshots = [target[_PgCompatSnapshotInfo].schema_ir for target in ctx.attr.snapshots]
@@ -610,13 +655,13 @@ _pg_compat_compare_test = rule(
 
 def _pg_live_test_impl(ctx):
     database = ctx.attr.database[LeanPgGenInfo]
-    stamp = ctx.actions.declare_file(ctx.label.name + ".live-ok")
+    if ctx.attr.major not in database.server_majors:
+        fail("PostgreSQL major %s is not accepted by %s (accepted: %s)" % (
+            ctx.attr.major,
+            ctx.attr.database.label,
+            database.server_majors,
+        ))
     script = ctx.actions.declare_file(ctx.label.name + ".sh")
-    args = ctx.actions.args()
-    for migration in database.migrations:
-        args.add("--migration")
-        args.add(migration)
-    args.add_all(ctx.attr.runner_args)
 
     postgres_files = ctx.files.postgres
     initdb = _find_postgres_tool(postgres_files, "initdb")
@@ -630,45 +675,64 @@ def _pg_live_test_impl(ctx):
     mkdir = _find_distribution_tool(coreutils_files, "mkdir", "coreutils")
     rm = _find_distribution_tool(coreutils_files, "rm", "coreutils")
     sleep = _find_distribution_tool(coreutils_files, "sleep", "coreutils")
-    command = _SERVER_LIFECYCLE + '\nprintf "ok\\n" > "$PGX_STAMP"\n'
-    ctx.actions.run_shell(
-        command = command,
-        arguments = [
-            initdb.path,
-            postgres.path,
-            pg_isready.path,
-            pg_ctl.path,
-            socat.path,
-            mktemp.path,
-            mkdir.path,
-            rm.path,
-            sleep.path,
-            ctx.executable.runner.path,
-            args,
-        ],
-        env = {"PGX_STAMP": stamp.path},
-        inputs = depset(
-            direct = database.migrations + ctx.files.data,
-        ),
-        outputs = [stamp],
-        tools = depset(
-            direct = postgres_files + socat_files + coreutils_files + [ctx.executable.runner],
-        ),
-        use_default_shell_env = False,
-        execution_requirements = {
-            "block-network": "1",
-        },
-        mnemonic = "LeanPgLiveTest",
-        progress_message = "Running checked PostgreSQL acceptance test %s" % ctx.label,
-    )
+
+    positional = [
+        _runfile_expr(initdb.short_path),
+        _runfile_expr(postgres.short_path),
+        _runfile_expr(pg_isready.short_path),
+        _runfile_expr(pg_ctl.short_path),
+        _runfile_expr(socat.short_path),
+        _runfile_expr(mktemp.short_path),
+        _runfile_expr(mkdir.short_path),
+        _runfile_expr(rm.short_path),
+        _runfile_expr(sleep.short_path),
+        _runfile_expr(ctx.executable.runner.short_path),
+    ]
+    for migration in database.migrations:
+        positional.extend([
+            _shell_quote("--migration"),
+            _runfile_expr(migration.short_path),
+        ])
+    positional.extend([_shell_quote(arg) for arg in ctx.attr.runner_args])
+
+    preamble = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "export PGX_EXPECTED_SERVER_MAJOR=%s" % _shell_quote(str(ctx.attr.major)),
+        'if [[ -z "${RUNFILES_DIR:-}" ]]; then',
+        '  if [[ -d "$0.runfiles" ]]; then',
+        '    RUNFILES_DIR="$0.runfiles"',
+        "    export RUNFILES_DIR",
+        "  else",
+        '    echo "unable to locate Bazel runfiles directory" >&2',
+        "    exit 1",
+        "  fi",
+        "fi",
+        "set -- " + " ".join(positional),
+    ]
     ctx.actions.write(
         script,
-        "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n",
+        "\n".join(preamble) + "\n" + _SERVER_LIFECYCLE,
         is_executable = True,
     )
+
+    runtime_files = (
+        database.migrations +
+        ctx.files.data +
+        postgres_files +
+        socat_files +
+        coreutils_files +
+        [ctx.executable.runner]
+    )
+    runfiles = ctx.runfiles(files = runtime_files)
+    runfiles = runfiles.merge(ctx.attr.runner[DefaultInfo].default_runfiles)
+    runfiles = runfiles.merge(ctx.attr.runner[DefaultInfo].data_runfiles)
+    for target in ctx.attr.data:
+        runfiles = runfiles.merge(target[DefaultInfo].default_runfiles)
+        runfiles = runfiles.merge(target[DefaultInfo].data_runfiles)
     return [DefaultInfo(
         executable = script,
-        runfiles = ctx.runfiles(files = [stamp]),
+        runfiles = runfiles,
     )]
 
 _pg_live_test = rule(
@@ -682,27 +746,61 @@ _pg_live_test = rule(
         "runner": attr.label(
             mandatory = True,
             executable = True,
-            cfg = "exec",
+            cfg = "target",
         ),
         "postgres": attr.label(
-            default = "@postgresql_18//:toolchain",
+            default = "@lean_pgx_postgresql_18//:toolchain",
             allow_files = True,
             cfg = "exec",
         ),
+        "major": attr.int(mandatory = True),
         "runner_args": attr.string_list(),
         "data": attr.label_list(allow_files = True),
         "_socat": attr.label(
-            default = "@socat//:toolchain",
+            default = "@lean_pgx_socat//:toolchain",
             allow_files = True,
             cfg = "exec",
         ),
         "_coreutils": attr.label(
-            default = "@coreutils//:toolchain",
+            default = "@lean_pgx_coreutils//:toolchain",
             allow_files = True,
             cfg = "exec",
         ),
     },
 )
+
+_POSTGRES_BY_MAJOR = {
+    17: Label("@lean_pgx_postgresql_17//:toolchain"),
+    18: Label("@lean_pgx_postgresql_18//:toolchain"),
+}
+
+_PGX_CONSTRAINT_SEMANTICS = Label("//lean/Pgx/Constraint:semantics")
+_PGX_LOGIC = Label("//lean/Pgx/Logic:logic")
+_PGX_TYPED = Label("//lean:pg_typed")
+
+def _validate_major(major, argument):
+    if type(major) != "int" or major not in _POSTGRES_BY_MAJOR:
+        fail("%s must be one of %s, got %s" % (
+            argument,
+            sorted(_POSTGRES_BY_MAJOR.keys()),
+            major,
+        ))
+
+def _validate_majors(majors, argument):
+    selected = [17, 18] if majors == None else [major for major in majors]
+    if not selected:
+        fail("%s must contain at least one PostgreSQL major" % argument)
+    seen = {}
+    for major in selected:
+        _validate_major(major, argument)
+        if major in seen:
+            fail("%s contains duplicate PostgreSQL major %s" % (argument, major))
+        seen[major] = True
+    return selected
+
+def _postgres_for_major(major):
+    _validate_major(major, "major")
+    return _POSTGRES_BY_MAJOR[major]
 
 def _generation_label(database):
     value = str(database)
@@ -710,7 +808,7 @@ def _generation_label(database):
         return value + "_gen"
     if ":" in value:
         return value + "_gen"
-    if value.startswith("//"):
+    if "//" in value:
         target = value.rsplit("/", 1)[-1]
         return value + ":" + target + "_gen"
     return value + "_gen"
@@ -721,12 +819,34 @@ def lean_pg_library(
         migrations,
         queries,
         schemas,
-        postgres = "@postgresql_18//:toolchain",
+        canonical_major = 18,
+        postgres = None,
         server_majors = None,
         deps = None,
         visibility = None,
         **kwargs):
-    """Replays DDL, emits checked Lean modules, then compiles a lean_library."""
+    """Replays DDL, emits checked Lean modules, then compiles a lean_library.
+
+    Args:
+      name: Compiled Lean library target name.
+      module_prefix: Root generated Lean module name.
+      migrations: Ordered DDL migration labels.
+      queries: A target providing `PgQuerySetInfo`.
+      schemas: PostgreSQL schemas included in the generated contract.
+      canonical_major: PostgreSQL major used for canonical generation.
+      postgres: Optional matching PostgreSQL distribution override.
+      server_majors: Majors accepted by generated attachment; defaults to 17/18.
+      deps: Additional Lean dependencies, such as custom codec modules.
+      visibility: Optional visibility for generated and compiled targets.
+      **kwargs: Additional `lean_library` attributes.
+    """
+    selected_majors = _validate_majors(server_majors, "server_majors")
+    _validate_major(canonical_major, "canonical_major")
+    if canonical_major not in selected_majors:
+        fail("canonical_major %s must be included in server_majors %s" % (
+            canonical_major,
+            selected_majors,
+        ))
     gen_name = name + "_gen"
     _lean_pg_generate(
         name = gen_name,
@@ -735,8 +855,9 @@ def lean_pg_library(
         migrations = migrations,
         queries = queries,
         schemas = schemas,
-        postgres = postgres,
-        server_majors = server_majors or [17, 18],
+        canonical_major = canonical_major,
+        postgres = postgres if postgres != None else _postgres_for_major(canonical_major),
+        server_majors = selected_majors,
         visibility = visibility,
     )
     srcs_name = name + "_srcs"
@@ -751,9 +872,9 @@ def lean_pg_library(
         srcs = [":" + srcs_name],
         strip_module_prefix = native.package_name(),
         deps = [
-            "@lean-pgx//lean:pg_typed",
-            "@lean-pgx//lean/Pgx/Constraint:semantics",
-            "@lean-pgx//lean/Pgx/Logic:logic",
+            _PGX_TYPED,
+            _PGX_CONSTRAINT_SEMANTICS,
+            _PGX_LOGIC,
         ] + (deps or []),
         visibility = visibility,
         **kwargs
@@ -762,7 +883,7 @@ def lean_pg_library(
 def pg_compat_test(
         name,
         database,
-        postgres,
+        postgres = None,
         majors = None,
         visibility = None,
         **kwargs):
@@ -770,19 +891,32 @@ def pg_compat_test(
 
     Compatibility ignores the server-major field itself and compares every
     other Lean-level schema/query semantic in the canonical IR.
+
+    Args:
+      name: Test target name.
+      database: A target created by `lean_pg_library`.
+      postgres: Optional distributions corresponding positionally to `majors`.
+      majors: At least two supported PostgreSQL majors; defaults to 17/18.
+      visibility: Optional Bazel visibility.
+      **kwargs: Additional common test attributes.
     """
-    if len(postgres) < 2:
-        fail("pg_compat_test requires at least two PostgreSQL distributions")
-    selected_majors = majors or [17, 18]
-    if len(selected_majors) != len(postgres):
+    selected_majors = _validate_majors(majors, "majors")
+    if len(selected_majors) < 2:
+        fail("pg_compat_test requires at least two PostgreSQL majors")
+    selected_postgres = (
+        [_postgres_for_major(major) for major in selected_majors]
+        if postgres == None
+        else postgres
+    )
+    if len(selected_majors) != len(selected_postgres):
         fail("pg_compat_test majors and postgres lists must have equal length")
     snapshots = []
-    for i in range(len(postgres)):
+    for i in range(len(selected_postgres)):
         snapshot_name = name + "_pg" + str(selected_majors[i]) + "_" + str(i + 1)
         _pg_compat_snapshot(
             name = snapshot_name,
             database = _generation_label(database),
-            postgres = postgres[i],
+            postgres = selected_postgres[i],
             major = selected_majors[i],
             visibility = ["//visibility:private"],
         )
@@ -798,19 +932,41 @@ def pg_live_test(
         name,
         database,
         runner,
-        postgres = "@postgresql_18//:toolchain",
+        major = 18,
+        postgres = None,
         args = None,
         data = None,
         visibility = None,
         **kwargs):
-    """Runs a Lean acceptance executable against a fresh migrated cluster."""
+    """Runs an acceptance executable on a fresh cluster.
+
+    The runner receives the database URL and ordered migration paths and is
+    responsible for replaying those migrations before attachment.
+
+    Args:
+      name: Test target name.
+      database: A target created by `lean_pg_library`.
+      runner: Executable accepting `--url` and ordered `--migration` arguments.
+      major: PostgreSQL major to exercise; defaults to 18.
+      postgres: Optional matching PostgreSQL distribution override.
+      args: Additional arguments appended after generated harness arguments.
+      data: Additional runner runfiles.
+      visibility: Optional Bazel visibility.
+      **kwargs: Additional common test attributes.
+    """
+    _validate_major(major, "major")
+    tags = kwargs.pop("tags", [])
+    if "block-network" not in tags:
+        tags = tags + ["block-network"]
     _pg_live_test(
         name = name,
         database = _generation_label(database),
         runner = runner,
-        postgres = postgres,
-        runner_args = args or [],
-        data = data or [],
+        major = major,
+        postgres = postgres if postgres != None else _postgres_for_major(major),
+        runner_args = [] if args == None else args,
+        data = [] if data == None else data,
+        tags = tags,
         visibility = visibility,
         **kwargs
     )

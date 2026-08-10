@@ -1,0 +1,14 @@
+{
+  "supportedServerMajors": [17, 18],
+  "get_widget.sql": {
+    "leanName": "GetWidget",
+    "cardinality": "zeroOrOne",
+    "parameters": [
+      {
+        "position": 1,
+        "name": "id",
+        "nullable": false
+      }
+    ]
+  }
+}

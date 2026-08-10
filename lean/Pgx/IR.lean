@@ -2,8 +2,8 @@ module
 
 public import Pgx.IR.Core
 public import Pgx.Constraint.IR
-public import Pg.Crypto.Sha256
-public import Pg.Crypto.Hex
+import Pg.Crypto.Sha256
+import Pg.Crypto.Hex
 
 public section
 
@@ -105,8 +105,8 @@ structure DomainIR where
   notNull : Bool
   defaultExpr : Option String := none
   /-- Legacy/raw normalized definitions retained for snapshot compatibility
-  and diagnostics while the typed local constraints are populated by the
-  Milestone-2 probe. -/
+  and diagnostics. Typed local constraints are populated independently from
+  the normalized catalog definitions. -/
   constraints : Array String := #[]
   localConstraints : Array DomainConstraintIR := #[]
   deriving Repr, BEq, Inhabited

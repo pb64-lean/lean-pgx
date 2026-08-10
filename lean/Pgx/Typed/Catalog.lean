@@ -636,6 +636,8 @@ installation-local OIDs.  The OIDs only join the several catalog result sets
 during attachment.
 -/
 
+namespace Internal
+
 /-- Semantic index metadata used by relational constraints. -/
 def relationalIndexCatalogSql : String :=
   "SELECT i.indexrelid::text, ns.nspname, c.relname, ins.nspname, ic.relname, " ++
@@ -698,6 +700,10 @@ def relationalIndexElementSql : String :=
   "OR (iam.amname = 'hash' AND eqamop.amopstrategy = 1)) " ++
   "ORDER BY eqop.oid LIMIT 1) AS eq ON true " ++
   "ORDER BY i.indexrelid, item.ordinality"
+
+end Internal
+
+open Internal
 
 private structure LiveIndex where
   oid : UInt32
@@ -844,6 +850,8 @@ private def relationalConstraintTypeList (serverMajor : Nat) : String :=
   if serverMajor >= 18 then "'c', 'n', 'p', 'u', 'f', 'x'"
   else "'c', 'p', 'u', 'f', 'x'"
 
+namespace Internal
+
 /-- Versioned relation-constraint query.  PostgreSQL 17 has neither native
 NOT NULL constraint rows nor the `conenforced`/`conperiod` columns, so those
 values are supplied as semantic literals without mentioning absent columns.
@@ -920,6 +928,8 @@ def relationalConstraintOperatorSql : String :=
     branch "conexclop" "exclude"
   ] ++ " ORDER BY 1, 2, 3"
 
+end Internal
+
 private structure LiveConstraint where
   oid : UInt32
   ir : Pgx.ConstraintIR
@@ -970,6 +980,8 @@ private def nativeNotNullKey (constraint : Pgx.ConstraintIR) :
       has unexpected catalog metadata")
   pure { relation := constraint.relation, column := constraint.columns[0]! }
 
+namespace Internal
+
 /-- PostgreSQL 18 may set `pg_attribute.attnotnull` for an enforced but
 unvalidated native NOT NULL constraint while pre-existing NULL values remain.
 Until relation nullability is derived from lifecycle-aware metadata, such a
@@ -982,6 +994,8 @@ def validateNotNullReadSafety (serverMajor : Nat)
       throw (drift s!"cannot trust relation nullability for native NOT NULL \
         constraint {constraint.relation}.{constraint.name}: enforced={constraint.enforced}, \
         validated={constraint.validated}")
+
+end Internal
 
 private def normalizeNotNullConstraints (serverMajor : Nat)
     (catalog : Array Pgx.ConstraintIR) (relations : Array LiveRelation) :
@@ -1513,6 +1527,8 @@ private def loadExtensions (conn : Pg.Connection) :
       | .ok value => extensions := extensions.push value
     pure (.ok extensions)
 
+namespace Internal
+
 /-- Symbolic extension membership recovered from live `pg_depend` rows. -/
 structure ExtensionTypeOwnership where
   key : Pgx.TypeKey
@@ -1531,6 +1547,8 @@ def extensionTypeOwnershipSql : String :=
   "AND dep.refobjsubid = 0 " ++
   "AND dep.deptype = 'e' " ++
   "ORDER BY dep.objid, ext.extname"
+
+end Internal
 
 private def loadExtensionTypeOwnership (conn : Pg.Connection)
     (types : Array LiveType) :
@@ -1577,6 +1595,8 @@ private def catalogConstraintView (value : Pgx.ConstraintIR) : Pgx.ConstraintIR 
     localExpression := none
     foreignKeyDeleteSetColumns := sortedStrings value.foreignKeyDeleteSetColumns
   }
+
+namespace Internal
 
 /-- Compare relation constraints as an unordered, duplicate-free collection.
 Ordered column/operator vectors remain ordered; only the documented set-like
@@ -1710,6 +1730,8 @@ def validateExtensionMetadata (db : DatabaseDesc)
         throw (drift s!"extension codec package type {key} belongs to \
           {owner.extension}, not {package.extension}")
 
+end Internal
+
 private def checkTypes (db : DatabaseDesc) (live : Array LiveType) :
     Except Error (Array ResolvedType) := do
   let mut resolved : Array ResolvedType := #[]
@@ -1813,9 +1835,11 @@ receive the same promise and never prepare a duplicate named statement on the
 physical connection.
 -/
 
-/-- Runtime-internal cache state.  Its name is public because module-mode
-`CheckedConnection` must expose the types of its private representation fields;
-applications construct and observe the cache only through the operations below. -/
+namespace Internal
+
+/-- Runtime-internal cache state. Its name remains visible only because
+module-mode `CheckedConnection` must expose the types of its private
+representation fields. Applications must not construct or inspect it. -/
 inductive PreparedEntryState where
   | pending (completion : IO.Promise (Except Error Pg.Statement))
   | ready (statement : Pg.Statement)
@@ -1835,15 +1859,35 @@ inductive PrepareDecision where
   | owner
   | wait (completion : IO.Promise (Except Error Pg.Statement))
 
+/-- A failed Parse/Describe request has not verified descriptor drift. Preserve
+the underlying PostgreSQL error so transient failures remain retryable. -/
+def preparationFailure (error : Pg.Error) : Error :=
+  .postgres error
+
+/-- Only a descriptor mismatch established after successful Parse/Describe is
+sticky in the prepared-statement cache. -/
+def isVerifiedDescriptorDrift : Error → Bool
+  | .queryDrift _ => true
+  | _ => false
+
+end Internal
+
 /-- A raw connection after its generated database contract has been checked.
 The constructor is private; `attach` is the only way to obtain this capability. -/
 structure CheckedConnection (db : DatabaseDesc) where
   private mk ::
   private rawValue : Pg.Connection
   private catalogValue : ResolvedCatalog db
-  private preparedValue : PreparedCache
+  private preparedValue : Internal.PreparedCache
 
-/-- Access the underlying connection for verified generated operations. -/
+/--
+Access the underlying connection for transaction and lifecycle integration.
+
+Mutating session/schema state or deallocating generated prepared statements can
+invalidate this checked capability. Close the physical connection and attach a
+new one afterward; bare reattachment cannot safely reconcile server-side
+prepared-statement names with a fresh Lean cache.
+-/
 def CheckedConnection.raw (conn : CheckedConnection db) : Pg.Connection :=
   conn.rawValue
 
@@ -1851,8 +1895,10 @@ def CheckedConnection.raw (conn : CheckedConnection db) : Pg.Connection :=
 def CheckedConnection.catalog (conn : CheckedConnection db) : ResolvedCatalog db :=
   conn.catalogValue
 
-/-- Observe a completed cached preparation without claiming first-use ownership. -/
-def CheckedConnection.lookupPrepared (conn : CheckedConnection db) (key : String) :
+namespace Internal
+
+/-- Runtime-only observation of a completed cached preparation. -/
+def lookupPrepared (conn : CheckedConnection db) (key : String) :
     IO (Option Pg.Statement) :=
   conn.preparedValue.atomically do
     let entries ← get
@@ -1864,7 +1910,7 @@ def CheckedConnection.lookupPrepared (conn : CheckedConnection db) (key : String
 
 /-- Claim preparation ownership, reuse a completed statement, or wait for the
 caller that already owns this key. -/
-def CheckedConnection.beginPrepare (conn : CheckedConnection db) (key : String) :
+def beginPrepare (conn : CheckedConnection db) (key : String) :
     IO PrepareDecision :=
   conn.preparedValue.atomically do
     let entries ← get
@@ -1880,7 +1926,7 @@ def CheckedConnection.beginPrepare (conn : CheckedConnection db) (key : String) 
 /-- Publish the owner's result.  Descriptor drift stays sticky because the
 named statement already exists; pre-Parse/transient failures are evicted so a
 later call may retry.  Every result wakes current waiters. -/
-def CheckedConnection.completePrepare (conn : CheckedConnection db) (key : String)
+def completePrepare (conn : CheckedConnection db) (key : String)
     (result : Except Error Pg.Statement) : IO Unit := do
   let completion? ← conn.preparedValue.atomically do
     let entries ← get
@@ -1894,14 +1940,17 @@ def CheckedConnection.completePrepare (conn : CheckedConnection db) (key : Strin
       match result with
       | .ok statement =>
         set (entries.set! index { key, state := .ready statement })
-      | .error error@(.queryDrift _) =>
-        set (entries.set! index { key, state := .drifted error })
-      | .error _ =>
-        set (entries.filter (fun value => value.key != key))
+      | .error error =>
+        if isVerifiedDescriptorDrift error then
+          set (entries.set! index { key, state := .drifted error })
+        else
+          set (entries.filter (fun value => value.key != key))
       pure (some completion)
   match completion? with
   | none => pure ()
   | some completion => discard <| completion.resolve result
+
+end Internal
 
 /-- Install the generated session contract and compare every relevant type,
 relation, column, relational constraint/index, view, routine, and required

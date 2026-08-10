@@ -326,7 +326,7 @@ def configureSession (conn : Pg.Connection) (session : Pgx.SessionContract) :
   if session.searchPath.any isBlank then
     return .error (.invalidConfig "session search_path contains an empty schema")
   unless session.encoding.toUpper == "UTF8" do
-    return .error (.invalidConfig "Milestone 1 requires UTF8 client encoding")
+    return .error (.invalidConfig "generated contracts require UTF8 client encoding")
   if isBlank session.timezone then
     return .error (.invalidConfig "session timezone must not be empty")
   let searchPath := String.intercalate ", "
@@ -2253,7 +2253,7 @@ private def loadSnapshot (conn : Pg.Connection) (config : Config) :
   })
 
 /-- Probe a migrated live server and return a fully symbolic, normalized
-Milestone-1 contract.  PostgreSQL's extended-protocol `Parse` is the sole SQL
+database contract. PostgreSQL's extended-protocol `Parse` is the sole SQL
 statement parser, so every `QueryInput.sql` is necessarily one statement. -/
 def probeDatabase (conn : Pg.Connection) (config : Config) :
     Async (Except Error Pgx.DatabaseIR) := do

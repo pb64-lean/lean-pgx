@@ -383,8 +383,8 @@ def evaluateNumericTypmod (typmod : Option Int32) (value : Option Pg.PgNumeric) 
     Except EvaluationError SqlTruth := do
   numericPrecisionScaleBound (← decodeNumericTypmod typmod) value
 
-/-- Compatibility diagnostic for callers which have not yet adopted the
-executable numeric refinement. -/
+/-- Legacy diagnostic retained for source compatibility. New code should call
+`evaluateNumericTypmod` and handle its executable result. -/
 def unsupportedNumericTypmod (typmod : Option Int32) : EvaluationError :=
   .invalidValue "numeric typmod"
     s!"local numeric precision/scale propositions are unsupported ({repr typmod})"

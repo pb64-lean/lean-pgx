@@ -1,8 +1,8 @@
 module
 
 public import Pgx.Typed.Catalog
-public import Pg.Crypto.Sha256
-public import Pg.Crypto.Hex
+import Pg.Crypto.Sha256
+import Pg.Crypto.Hex
 
 public section
 
@@ -30,9 +30,6 @@ private def resolvedParamOids (catalog : ResolvedCatalog db)
   params.mapM fun param => do
     pure (← catalog.resolveType param.ty.key).oid
 
-private def preparationFailure (error : Pg.Error) : Error :=
-  .queryDrift s!"PostgreSQL rejected the generated statement during descriptor verification: {error}"
-
 private def executionFailure (error : Pg.Error) : Error :=
   match error with
   | .server fields =>
@@ -47,7 +44,7 @@ private def prepareChecked (db : DatabaseDesc)
     (spec : QuerySpec db Params Row cardinality) (conn : CheckedConnection db) :
     Async (Except Error Pg.Statement) := do
   let key := queryKey db spec
-  match ← conn.beginPrepare key with
+  match ← Internal.beginPrepare conn key with
   | .ready statement => pure (.ok statement)
   | .failed error => pure (.error error)
   | .wait completion => await completion
@@ -57,12 +54,12 @@ private def prepareChecked (db : DatabaseDesc)
       | .error error => pure (.error error)
       | .ok paramOids =>
         match ← Pg.Connection.prepare conn.raw (statementName key) spec.sql paramOids with
-        | .error error => pure (.error (preparationFailure error))
+        | .error error => pure (.error (Internal.preparationFailure error))
         | .ok statement =>
           match verifyStatement conn.catalog spec.params spec.columns statement with
           | .error error => pure (.error error)
           | .ok () => pure (.ok statement)
-    conn.completePrepare key result
+    Internal.completePrepare conn key result
     pure result
 
 private def runChecked (db : DatabaseDesc)

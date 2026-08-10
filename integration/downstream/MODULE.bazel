@@ -1,0 +1,41 @@
+"""Standalone consumer fixture for lean-pgx's dependency-mode contract."""
+
+module(
+    name = "lean-pgx-downstream-test",
+    version = "0.0.0",
+    bazel_compatibility = [">=8.0.0"],
+)
+
+bazel_dep(name = "lean-pgx", version = "0.1.0", repo_name = "lean_pgx")
+local_path_override(
+    module_name = "lean-pgx",
+    path = "../..",
+)
+
+# Local overrides make this checkout-only fixture independent of publication
+# timing.  PostgreSQL, socat, and coreutils are intentionally absent: lean-pgx
+# must provision those transitively from its own pinned Nix expression.
+bazel_dep(name = "rules_lean", version = "0.1.0")
+local_path_override(
+    module_name = "rules_lean",
+    path = "../../../rules_lean",
+)
+local_path_override(
+    module_name = "pg-lean",
+    path = "../../../pg-lean",
+)
+local_path_override(
+    module_name = "tls13-lean",
+    path = "../../../tls13-lean",
+)
+
+lean = use_extension("@rules_lean//lean:extensions.bzl", "lean")
+lean.nix_toolchain(
+    name = "lean4",
+    attr = "lean4_upstream_std",
+    nix_file = "@rules_lean//:nixpkgs.nix",
+    nix_file_deps = ["@rules_lean//:nixpkgs.json"],
+)
+use_repo(lean, "lean4_toolchain")
+
+register_toolchains("@lean4_toolchain//:all")

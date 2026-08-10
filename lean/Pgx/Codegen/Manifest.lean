@@ -4,10 +4,9 @@ import Lean.Data.Json
 /-!
 # Typed-query manifest
 
-The manifest follows the query-object shape from `discussion.md`: every query
-is keyed by the basename of its literal `.sql` file.  Two reserved root keys,
-`supportedServerMajors`, `typeOverrides`, and `extensionCodecPackages`, carry
-optional generation-wide configuration.
+Every query is keyed by the basename of its literal `.sql` file. Three
+reserved root keys -- `supportedServerMajors`, `typeOverrides`, and
+`extensionCodecPackages` -- carry optional generation-wide configuration.
 -/
 
 namespace Pgx.Codegen

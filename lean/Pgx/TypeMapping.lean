@@ -1,5 +1,8 @@
-import Pgx.IR
-import Pg.Types.Codec
+module
+
+public import Pgx.IR
+
+public section
 
 namespace Pgx
 

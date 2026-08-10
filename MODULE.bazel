@@ -4,6 +4,7 @@ module(
     name = "lean-pgx",
     version = "0.1.0",
     compatibility_level = 1,
+    bazel_compatibility = [">=8.0.0"],
 )
 
 # Base Lean build rules.
@@ -46,107 +47,17 @@ register_toolchains(
     dev_dependency = True,
 )
 
-# Pinned PostgreSQL distributions and TCP/Unix bridge used only by
-# code-generation actions and cross-major compatibility tests. Generated
-# libraries have no PostgreSQL server runtime dependency.
+# Pinned PostgreSQL distributions and process tools used only by generation,
+# compatibility probes, and live tests.  The extension is owned by lean-pgx,
+# so these repositories are present in lean-pgx's mapping even when the module
+# is consumed as a dependency.  Generated libraries have no server dependency.
 bazel_dep(name = "rules_nixpkgs_core", version = "0.13.0")
 
-postgres_nix = use_extension(
-    "@rules_nixpkgs_core//extensions:repository.bzl",
-    "nix_repo",
-)
-postgres_nix.default(name = "postgres_nixpkgs")
-use_repo(postgres_nix, "postgres_nixpkgs")
-
-# The non-dev default above keeps the repository visible in lean-pgx's repo
-# mapping when this module is a dependency. As the root module, this dev-only
-# override supplies the pinned repository contents.
-postgres_nix_override = use_extension(
-    "@rules_nixpkgs_core//extensions:repository.bzl",
-    "nix_repo",
-    dev_dependency = True,
-)
-postgres_nix_override.file(
-    name = "postgres_nixpkgs",
-    file = "//:postgres.nix",
-    file_deps = ["//:postgres.json"],
-)
-
-postgres_pkg = use_extension(
-    "@rules_nixpkgs_core//extensions:package.bzl",
-    "nix_pkg",
-)
-postgres_pkg.default(attr = "postgresql_17")
-postgres_pkg.default(attr = "postgresql_18")
-postgres_pkg.default(attr = "socat")
-postgres_pkg.default(attr = "coreutils")
+postgres_tools = use_extension("//bazel:extensions.bzl", "lean_pgx_tools")
 use_repo(
-    postgres_pkg,
-    "coreutils",
-    "postgresql_17",
-    "postgresql_18",
-    "socat",
-)
-
-# Root-only package definitions override the globally named defaults while
-# preserving those names in downstream repository mappings.
-postgres_pkg_override = use_extension(
-    "@rules_nixpkgs_core//extensions:package.bzl",
-    "nix_pkg",
-    dev_dependency = True,
-)
-
-_POSTGRES_BUILD = """\
-filegroup(
-    name = "toolchain",
-    srcs = glob(["bin/**", "lib/**", "share/**"]),
-    visibility = ["//visibility:public"],
-)
-"""
-
-_SOCAT_BUILD = """\
-filegroup(
-    name = "toolchain",
-    srcs = ["bin/socat", "bin/socat1"],
-    visibility = ["//visibility:public"],
-)
-"""
-
-_COREUTILS_BUILD = """\
-filegroup(
-    name = "toolchain",
-    srcs = [
-        "bin/coreutils",
-        "bin/mkdir",
-        "bin/mktemp",
-        "bin/rm",
-        "bin/sleep",
-    ],
-    visibility = ["//visibility:public"],
-)
-"""
-
-postgres_pkg_override.attr(
-    name = "postgresql_17",
-    attr = "postgresql_17",
-    build_file_content = _POSTGRES_BUILD,
-    repo = "@postgres_nixpkgs",
-)
-postgres_pkg_override.attr(
-    name = "postgresql_18",
-    attr = "postgresql_18",
-    build_file_content = _POSTGRES_BUILD,
-    repo = "@postgres_nixpkgs",
-)
-postgres_pkg_override.attr(
-    name = "socat",
-    attr = "socat",
-    build_file_content = _SOCAT_BUILD,
-    repo = "@postgres_nixpkgs",
-)
-postgres_pkg_override.attr(
-    name = "coreutils",
-    attr = "coreutils",
-    build_file_content = _COREUTILS_BUILD,
-    repo = "@postgres_nixpkgs",
+    postgres_tools,
+    "lean_pgx_coreutils",
+    "lean_pgx_postgresql_17",
+    "lean_pgx_postgresql_18",
+    "lean_pgx_socat",
 )

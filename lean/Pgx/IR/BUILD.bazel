@@ -2,12 +2,13 @@
 
 load("@rules_lean//lean:defs.bzl", "lean_library")
 
-package(default_visibility = ["//visibility:public"])
+package(default_visibility = ["//visibility:private"])
 
 lean_library(
     name = "core",
     srcs = ["Core.lean"],
     strip_module_prefix = "lean",
+    visibility = ["//lean:internal"],
 )
 
 lean_library(
@@ -15,4 +16,5 @@ lean_library(
     srcs = ["Json.lean"],
     deps = ["//lean/Pgx:ir"],
     strip_module_prefix = "lean",
+    visibility = ["//lean:internal"],
 )
