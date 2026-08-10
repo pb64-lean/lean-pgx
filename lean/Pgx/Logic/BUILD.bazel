@@ -1,0 +1,48 @@
+"""Pure, many-sorted relational logic kernel."""
+
+load("@rules_lean//lean:defs.bzl", "lean_library")
+
+package(default_visibility = ["//visibility:public"])
+
+lean_library(
+    name = "schema",
+    srcs = ["Schema.lean"],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
+    name = "state",
+    srcs = ["State.lean"],
+    deps = [":schema"],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
+    name = "spec",
+    srcs = ["Spec.lean"],
+    deps = [
+        ":state",
+        "//lean/Pgx/Constraint:ir",
+    ],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
+    name = "constraint",
+    srcs = ["Constraint.lean"],
+    deps = [
+        ":state",
+        "//lean/Pgx/Constraint:ir",
+    ],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
+    name = "logic",
+    srcs = ["All.lean"],
+    deps = [
+        ":constraint",
+        ":spec",
+    ],
+    strip_module_prefix = "lean",
+)

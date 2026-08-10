@@ -16,6 +16,7 @@ lean_library(
         ":pg_typed",
         "//lean/Pgx:core",
         "//lean/Pgx/Constraint:semantics",
+        "//lean/Pgx/Logic:logic",
     ],
     strip_module_prefix = "lean",
 )

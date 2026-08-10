@@ -1,0 +1,12 @@
+"""Focused tests for the pure relational logic kernel."""
+
+load("@rules_lean//lean:defs.bzl", "lean_test")
+
+package(default_visibility = ["//visibility:public"])
+
+lean_test(
+    name = "state_test",
+    srcs = ["State.lean"],
+    deps = ["//lean/Pgx/Logic:spec"],
+    strip_module_prefix = "lean",
+)

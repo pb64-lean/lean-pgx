@@ -85,3 +85,10 @@ lean_test(
     deps = ["//lean/Pgx/Constraint:semantics"],
     strip_module_prefix = "lean",
 )
+
+lean_test(
+    name = "relational_constraint_test",
+    srcs = ["RelationalConstraint.lean"],
+    deps = ["//lean/Pgx/Logic:constraint"],
+    strip_module_prefix = "lean",
+)
