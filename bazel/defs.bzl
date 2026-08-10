@@ -5,7 +5,11 @@ migration inputs, and probes literal query files.  Nothing in the ordinary
 build connects to a developer or production database.
 """
 
-load("@rules_lean//lean:defs.bzl", "LeanGeneratedSourceInfo", "lean_library")
+load(
+    "@rules_lean//lean:defs.bzl",
+    "lean_library",
+    _LeanGeneratedSourceInfo = "LeanGeneratedSourceInfo",
+)
 
 PgQuerySetInfo = provider(
     doc = "Literal SQL query inputs and their declarative manifest.",
@@ -434,7 +438,7 @@ def _lean_pg_generate_impl(ctx):
             contract_hash = depset([contract_out]),
             compatibility_hash = depset([compatibility_out]),
         ),
-        LeanGeneratedSourceInfo(lean_srcs = depset(lean_srcs)),
+        _LeanGeneratedSourceInfo(lean_srcs = depset(lean_srcs)),
         LeanPgGenInfo(
             lean_srcs = depset(lean_srcs),
             schema_ir = ir_out,
@@ -453,7 +457,7 @@ def _lean_pg_generate_impl(ctx):
 
 _lean_pg_generate = rule(
     implementation = _lean_pg_generate_impl,
-    provides = [LeanGeneratedSourceInfo, LeanPgGenInfo],
+    provides = [_LeanGeneratedSourceInfo, LeanPgGenInfo],
     attrs = {
         "module_prefix": attr.string(mandatory = True),
         "output_basename": attr.string(mandatory = True),
@@ -951,7 +955,9 @@ def pg_live_test(
       runner: Executable accepting `--url` and ordered `--migration` arguments.
       major: PostgreSQL major to exercise; defaults to 18.
       postgres: Optional matching PostgreSQL distribution override.
-      args: Additional arguments appended after generated harness arguments.
+      args: Additional arguments appended verbatim after generated harness
+        arguments. Relative runfile paths start at the workspace root and
+        therefore include the data file's package path.
       data: Additional runner runfiles.
       visibility: Optional Bazel visibility.
       **kwargs: Additional common test attributes.

@@ -28,3 +28,5 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   runtime error, design, contribution, security, conduct, and roadmap docs.
 - An exact assurance policy for the public `Pgx` module surface, including
   pinned principal theorem statements and trust-boundary inventories.
+- rules_lean `LeanGeneratedSourceInfo` interoperability on generated-source
+  targets.

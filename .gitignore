@@ -1,6 +1,7 @@
-bazel-*
+/bazel-*
+/integration/downstream/bazel-*
 .lake/
 .bazelrc.user
 .DS_Store
-result
-result-*
+/result
+/result-*
