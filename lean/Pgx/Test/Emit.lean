@@ -17,6 +17,7 @@ private def int4 : TypeRef := base "int4"
 private def int8 : TypeRef := base "int8"
 private def text : TypeRef := base "text"
 private def bool : TypeRef := base "bool"
+private def time : TypeRef := base "time"
 private def varchar12 : TypeRef :=
   { key := { schema := "pg_catalog", name := "varchar", kind := .base }, typmod := some 16 }
 
@@ -357,6 +358,18 @@ private def typmodOverride : DatabaseIR := {
 private def statusArrayKey : TypeKey :=
   { schema := "app", name := "status_vector", kind := .array }
 
+private def varcharArrayKey : TypeKey :=
+  { schema := "pg_catalog", name := "_varchar", kind := .array }
+
+private def timeArrayKey : TypeKey :=
+  { schema := "pg_catalog", name := "_time", kind := .array }
+
+private def emailArrayKey : TypeKey :=
+  { schema := "app", name := "email_vector", kind := .array }
+
+private def varcharArray12 : TypeRef :=
+  { key := varcharArrayKey, typmod := some 16 }
+
 private def statusListKey : TypeKey :=
   { schema := "app", name := "status_list", kind := .domain }
 
@@ -376,10 +389,12 @@ private def activePacketsKey : RelationKey :=
 including a domain whose base is itself a generated container. -/
 private def m3Fixture : DatabaseIR := {
   fixture with
-  arrays := #[{
-    key := statusArrayKey
-    element := ref statusKey
-  }]
+  arrays := #[
+    { key := statusArrayKey, element := ref statusKey },
+    { key := varcharArrayKey, element := base "varchar" },
+    { key := timeArrayKey, element := time },
+    { key := emailArrayKey, element := ref emailKey }
+  ]
   domains := fixture.domains.push {
     key := statusListKey
     base := ref statusArrayKey
@@ -389,7 +404,12 @@ private def m3Fixture : DatabaseIR := {
     key := packetKey
     fields := #[
       { name := "statuses", ordinal := 1, ty := ref statusListKey },
-      { name := "score", ordinal := 2, ty := ref scoreRangeKey }
+      { name := "score", ordinal := 2, ty := ref scoreRangeKey },
+      { name := "title", ordinal := 3, ty := varchar12 },
+      { name := "observed_at", ordinal := 4, ty := time },
+      { name := "tags", ordinal := 5, ty := varcharArray12 },
+      { name := "email", ordinal := 6, ty := ref emailKey },
+      { name := "times", ordinal := 7, ty := ref timeArrayKey }
     ]
   }]
   ranges := #[{
@@ -494,15 +514,38 @@ private def milestone3Tests : IO Unit := do
     "abbrev Value := Pgx.Typed.PgArray (M3Db.Types.AppUserStatus)"
   assert! sources.types.contents.contains "arrayDelimiter := some (\",\")"
   assert! sources.types.contents.contains "Pgx.Typed.decodeArrayBinary element.oid"
+  assert! sources.types.contents.contains "namespace AppEmailVector"
+  assert! sources.types.contents.contains
+    "abbrev Data := Pgx.Typed.PgArray (M3Db.Types.AppEmailAddress)"
+  assert! sources.types.contents.contains "arrayElementsNotNull value"
   assert! sources.types.contents.contains "namespace AppStatusList"
   assert! sources.types.contents.contains "toBase : M3Db.Types.AppStatusVector"
   assert! sources.types.contents.contains "namespace AppReviewPacket"
   assert! sources.types.contents.contains
     "statuses : Option (M3Db.Types.AppStatusList)"
   assert! sources.types.contents.contains "score : Option (M3Db.Types.AppScoreRange)"
+  assert! sources.types.contents.contains "title : Option (String)"
+  assert! sources.types.contents.contains "observedAt : Option (Std.Time.PlainTime)"
+  assert! sources.types.contents.contains
+    "tags : Option (M3Db.Types.PgCatalogVarchar)"
+  assert! sources.types.contents.contains
+    "email : Option (M3Db.Types.AppEmailAddress)"
+  assert! sources.types.contents.contains
+    "times : Option (M3Db.Types.PgCatalogTime)"
+  assert! sources.types.contents.contains
+    "evaluateCharacterTypmod (some (16)) (value.title)"
+  assert! sources.types.contents.contains "evaluateTimeTypmod (none)"
+  assert! sources.types.contents.contains
+    "evaluateArrayElements (fun item => Pgx.Constraint.evaluateCharacterTypmod (some (16)) (item))"
+  assert! sources.types.contents.contains
+    "evaluateArrayElements (fun item => Pgx.Constraint.evaluateTimeTypmod (none)"
+  assert! sources.types.contents.contains
+    "SqlTruth.isNotNull value.email"
+  assert! sources.types.contents.contains "match value.val.statuses with"
+  assert! sources.types.contents.contains "match validate decoded with"
   assert! sources.types.contents.contains "compositeFields := #["
   assert! sources.types.contents.contains "Pgx.Typed.renderCompositeText"
-  assert! sources.types.contents.contains "Pgx.Typed.parseCompositeTextArity 2"
+  assert! sources.types.contents.contains "Pgx.Typed.parseCompositeTextArity 7"
   assert! sources.types.contents.contains
     "abbrev Value := Pgx.Typed.PgRange (Int32)"
   assert! sources.types.contents.contains "rangeMultirange := some ("

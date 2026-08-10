@@ -157,6 +157,11 @@
         "position": 9,
         "name": "aliases",
         "nullable": false
+      },
+      {
+        "position": 10,
+        "name": "labels",
+        "nullable": false
       }
     ]
   }

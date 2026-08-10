@@ -122,6 +122,24 @@ def liftNullable₂ (operation : α → β → Except EvaluationError γ) :
   | some left, some right => some <$> operation left right
   | _, _ => .ok none
 
+/-- Apply a scalar type-modifier predicate to every element of a nullable
+one-dimensional array.  A null array or null element contributes SQL unknown;
+an invalid non-null element still makes the combined result false. -/
+def evaluateArrayElements
+    (evaluate : Option α → Except EvaluationError SqlTruth)
+    (values : Option (Array (Option α))) : Except EvaluationError SqlTruth := do
+  let some values := values
+    | pure .unknown
+  let mut result := SqlTruth.true
+  for value in values do
+    result := result.conjunction (← evaluate value)
+  pure result
+
+/-- PostgreSQL domains declared `NOT NULL` reject null values even when they
+occur as elements of an array of that domain. -/
+def arrayElementsNotNull (values : Array (Option α)) : SqlTruth :=
+  if values.any (fun value => value.isNone) then .false else .true
+
 def equalNullable [BEq α] (left right : Option α) : SqlTruth :=
   match left, right with
   | some left, some right => SqlTruth.ofOptionBool (some (left == right))

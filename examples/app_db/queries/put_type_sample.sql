@@ -7,9 +7,10 @@ INSERT INTO app.type_samples (
   amount,
   observed_at,
   nickname,
-  aliases
+  aliases,
+  labels
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING
   id,
   statuses,
@@ -20,4 +21,5 @@ RETURNING
   amount,
   observed_at,
   nickname,
-  aliases;
+  aliases,
+  labels;

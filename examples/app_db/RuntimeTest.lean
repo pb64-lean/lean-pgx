@@ -237,13 +237,39 @@ private def exerciseBroaderTypes
   let secondaryEmail ← validatedEmail! "validate array email" "array@example.com"
   let statuses : AppDb.Types.AppUserStatus_2 :=
     #[some .active, none, some .disabled]
-  let emails : AppDb.Types.AppEmailAddress_2 :=
+  let emailData : AppDb.Types.AppEmailAddress_2.Data :=
     #[some primaryEmail, some secondaryEmail]
-  let card : AppDb.Types.AppContactCard := {
+  let invalidEmailData : AppDb.Types.AppEmailAddress_2.Data :=
+    #[some primaryEmail, none]
+  match AppDb.Types.AppEmailAddress_2.validate invalidEmailData with
+  | .error (.checkFailed "app._email_address (array) element domain NOT NULL") => pure ()
+  | .error violation => fail s!"domain array returned the wrong violation: {violation}"
+  | .ok _ => fail "domain array accepted a NULL element"
+  let emails ← match AppDb.Types.AppEmailAddress_2.validate emailData with
+    | .ok refined => pure refined
+    | .error violation => fail s!"validate domain array fixture: {violation}"
+  let cardData : AppDb.Types.AppContactCard.Data := {
     label := some "quoted, composite \\ value"
     status := some .active
     email := some primaryEmail
   }
+  let oversizedCard : AppDb.Types.AppContactCard.Data := {
+    cardData with label := some "12345678901234567890123456789012345678901"
+  }
+  match AppDb.Types.AppContactCard.validate oversizedCard with
+  | .error (.checkFailed "app.contact_card (composite).label type modifier") => pure ()
+  | .error violation => fail s!"composite typmod returned the wrong violation: {violation}"
+  | .ok _ => fail "composite typmod accepted an oversized field"
+  let missingEmailCard : AppDb.Types.AppContactCard.Data := {
+    cardData with email := none
+  }
+  match AppDb.Types.AppContactCard.validate missingEmailCard with
+  | .error (.checkFailed "app.contact_card (composite).email domain NOT NULL") => pure ()
+  | .error violation => fail s!"composite domain returned the wrong violation: {violation}"
+  | .ok _ => fail "composite accepted NULL for a NOT NULL domain field"
+  let card ← match AppDb.Types.AppContactCard.validate cardData with
+    | .ok refined => pure refined
+    | .error violation => fail s!"validate composite typmod fixture: {violation}"
   let score : AppDb.Types.AppScoreRange :=
     .span (some { value := 10, inclusive := true })
       (some { value := 20, inclusive := false })
@@ -256,19 +282,21 @@ private def exerciseBroaderTypes
   let nickname := "MiXeD-Case"
   let aliases : AppDb.Types.AppCitext :=
     #[some "Primary", none, some "SECONDARY"]
+  let labels : AppDb.Types.PgCatalogVarchar :=
+    #[some "primary", none, some "backup"]
 
   let stored ← typed! "PutTypeSample.exactlyOne" (←
     AppDb.Queries.PutTypeSample.run conn {
-      statuses, emails, card, score, scores, amount, observedAt, nickname, aliases
+      statuses, emails, card, score, scores, amount, observedAt, nickname, aliases, labels
     })
   unless stored.val.statuses == statuses do
     fail "enum array did not round-trip, including its NULL element"
-  unless stored.val.emails.map (fun value => value.map emailBase) ==
-      emails.map (fun value => value.map emailBase) do
+  unless stored.val.emails.val.map (fun value => value.map emailBase) ==
+      emails.val.map (fun value => value.map emailBase) do
     fail "domain array did not round-trip"
-  unless stored.val.card.label == card.label &&
-      stored.val.card.status == card.status &&
-      stored.val.card.email.map emailBase == card.email.map emailBase do
+  unless stored.val.card.val.label == card.val.label &&
+      stored.val.card.val.status == card.val.status &&
+      stored.val.card.val.email.map emailBase == card.val.email.map emailBase do
     fail "composite value did not round-trip"
   unless stored.val.score == score && stored.val.scores == scores do
     fail "range or multirange did not round-trip"
@@ -277,6 +305,8 @@ private def exerciseBroaderTypes
     fail "numeric/time type-modifier values did not round-trip"
   unless stored.val.nickname == nickname && stored.val.aliases == aliases do
     fail "extension package scalar or nested array codec did not round-trip"
+  unless stored.val.labels == labels do
+    fail "array element type-modifier value did not round-trip"
 
   let summaries ← typed! "ListTypeSampleView.many" (←
     AppDb.Queries.ListTypeSampleView.run conn {})

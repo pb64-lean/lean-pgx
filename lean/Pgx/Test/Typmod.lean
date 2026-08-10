@@ -32,6 +32,16 @@ def main : IO UInt32 := do
   assert! okEq (evaluateCharacterTypmod (some 9) (some "Lean4!")) .false
   assert! okEq (evaluateCharacterTypmod none (some "arbitrarily long")) .true
   assert! okEq (evaluateCharacterTypmod (some 9) none) .unknown
+  assert! okEq (evaluateArrayElements (evaluateCharacterTypmod (some 9))
+    (some #[some "Lean", none])) .unknown
+  assert! okEq (evaluateArrayElements (evaluateCharacterTypmod (some 9))
+    (some #[some "Lean", some "Lean4!"])) .false
+  assert! okEq (evaluateArrayElements (evaluateCharacterTypmod (some 9))
+    (some #[])) .true
+  assert! okEq (evaluateArrayElements (evaluateCharacterTypmod (some 9))
+    (none : Option (Array (Option String)))) .unknown
+  assert! arrayElementsNotNull #[some "Lean", some "PostgreSQL"] == .true
+  assert! arrayElementsNotNull #[some "Lean", none] == .false
 
   -- Bounds count characters, not UTF-8 bytes: this value is three Unicode
   -- scalar values despite occupying seven UTF-8 bytes.

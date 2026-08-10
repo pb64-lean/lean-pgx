@@ -428,7 +428,19 @@ private def wireBaseRef (db : Pgx.DatabaseIR) (ref : Pgx.TypeRef) :
     Except CodegenError Pgx.TypeRef :=
   wireBaseRefAux db ref #[]
 
-private def validateRefinementTypmod (db : Pgx.DatabaseIR) (ref : Pgx.TypeRef)
+private partial def typeRejectsNullAux (db : Pgx.DatabaseIR) (key : Pgx.TypeKey)
+    (seen : Array Pgx.TypeKey) : Bool :=
+  if seen.contains key then false
+  else
+    match db.domain? key with
+    | none => false
+    | some domain =>
+        domain.notNull || typeRejectsNullAux db domain.base.key (seen.push key)
+
+private def typeRejectsNull (db : Pgx.DatabaseIR) (key : Pgx.TypeKey) : Bool :=
+  typeRejectsNullAux db key #[]
+
+private def validateScalarRefinementTypmod (db : Pgx.DatabaseIR) (ref : Pgx.TypeRef)
     (context : String) :
     Except CodegenError Unit := do
   if ref.typmod.isSome && (db.typeOverride? ref.key).isSome then
@@ -457,6 +469,22 @@ private def validateRefinementTypmod (db : Pgx.DatabaseIR) (ref : Pgx.TypeRef)
     | .error error => throw (.malformedIR context (toString error))
   else
     pure ()
+
+private def validateRefinementTypmod (db : Pgx.DatabaseIR) (ref : Pgx.TypeRef)
+    (context : String) : Except CodegenError Unit := do
+  if ref.key.kind == .array then
+    if (db.typeOverride? ref.key).isSome then
+      throw (.unsupportedConstraint context
+        s!"type override {ref.key} has no type-modifier refinement adapter")
+    let some array := db.array? ref.key
+      | throw (.malformedIR context s!"array metadata for {ref.key} is absent")
+    if array.element.key.kind == .array then
+      throw (.unsupportedConstraint context
+        "nested array element type modifiers are not supported")
+    validateScalarRefinementTypmod db
+      { array.element with typmod := ref.typmod } context
+  else
+    validateScalarRefinementTypmod db ref context
 
 private def validateDomainConstraints (db : Pgx.DatabaseIR)
     (domain : Pgx.DomainIR) : Except CodegenError Unit := do
@@ -1202,7 +1230,7 @@ private partial def compileTruthExpr (plan : NamingPlan) (db : Pgx.DatabaseIR)
       let value ← compileTruthExpr plan db scope context value
       pure s!"({value}).map Pgx.Constraint.SqlTruth.negate"
 
-private def typmodCheck? (ref : Pgx.TypeRef) (access : String)
+private def scalarTypmodCheck? (ref : Pgx.TypeRef) (access : String)
     (nullable : Bool) (name : String) : Option GeneratedCheck :=
   let optionalValue := if nullable then access else s!"some ({access})"
   if ref.typmod.isSome && ref.key.schema == "pg_catalog" &&
@@ -1217,7 +1245,7 @@ private def typmodCheck? (ref : Pgx.TypeRef) (access : String)
       name
       evaluate := s!"Pgx.Constraint.evaluateNumericTypmod ({optionExpr (ref.typmod.map toString)}) ({optionalValue})"
     }
-  else if ref.typmod.isSome && ref.key.schema == "pg_catalog" && ref.key.name == "time" then
+  else if ref.key.schema == "pg_catalog" && ref.key.name == "time" then
     let nanos := if nullable then
       s!"({access}).map (fun item => item.toNanoseconds.toInt)"
     else s!"some (({access}).toNanoseconds.toInt)"
@@ -1225,7 +1253,7 @@ private def typmodCheck? (ref : Pgx.TypeRef) (access : String)
       name
       evaluate := s!"Pgx.Constraint.evaluateTimeTypmod ({optionExpr (ref.typmod.map toString)}) ({nanos})"
     }
-  else if ref.typmod.isSome && ref.key.schema == "pg_catalog" &&
+  else if ref.key.schema == "pg_catalog" &&
       ref.key.name == "timestamp" then
     let nanos := if nullable then
       s!"({access}).map (fun item => item.time.toNanoseconds.toInt)"
@@ -1234,7 +1262,7 @@ private def typmodCheck? (ref : Pgx.TypeRef) (access : String)
       name
       evaluate := s!"Pgx.Constraint.evaluateTimestampTypmod ({optionExpr (ref.typmod.map toString)}) ({nanos})"
     }
-  else if ref.typmod.isSome && ref.key.schema == "pg_catalog" &&
+  else if ref.key.schema == "pg_catalog" &&
       ref.key.name == "timestamptz" then
     let nanos := if nullable then
       s!"({access}).map (fun item => item.toNanosecondsSinceUnixEpoch.toInt)"
@@ -1250,6 +1278,23 @@ private def typmodCheck? (ref : Pgx.TypeRef) (access : String)
       evaluate := s!"Pgx.Constraint.evaluatePgIntervalPrecisionTypmod ({optionExpr (ref.typmod.map toString)}) ({optionalValue})"
     }
   else none
+
+private def typmodCheck? (db : Pgx.DatabaseIR) (ref : Pgx.TypeRef)
+    (access : String) (nullable : Bool) (name : String) : Option GeneratedCheck :=
+  let optionalValue := if nullable then access else s!"some ({access})"
+  if ref.key.kind == .array then
+    match db.array? ref.key with
+    | none => none
+    | some array =>
+      let elementRef := { array.element with typmod := ref.typmod }
+      match scalarTypmodCheck? elementRef "item" true name with
+      | none => none
+      | some elementCheck => some {
+          name
+          evaluate := s!"Pgx.Constraint.evaluateArrayElements (fun item => {elementCheck.evaluate}) ({optionalValue})"
+        }
+  else
+    scalarTypmodCheck? ref access nullable name
 
 private def emitValidator (dataType publicType : String)
     (checks : Array GeneratedCheck) : List String :=
@@ -1350,11 +1395,18 @@ private def emitArray (plan : NamingPlan) (db : Pgx.DatabaseIR)
     | throw (.unsupportedType value.key "array declaration")
   let localName := (named.leanType.splitOn ".").getLast!
   let element ← resolveTypeUse plan db value.element.key
-  let mut lines := [
-    s!"namespace {localName}",
-    "",
-    s!"abbrev Value := Pgx.Typed.PgArray ({element.leanType})",
-    "",
+  let rejectsNull := typeRejectsNull db value.element.key
+  let arrayType := s!"Pgx.Typed.PgArray ({element.leanType})"
+  let mut lines := [s!"namespace {localName}", ""]
+  if rejectsNull then
+    lines := lines ++ [s!"abbrev Data := {arrayType}", ""]
+    lines := lines ++ emitValidator "Data" "Value" #[{
+      name := s!"{value.key.display} element domain NOT NULL"
+      evaluate := ".ok (Pgx.Constraint.arrayElementsNotNull value)"
+    }]
+  else
+    lines := lines ++ [s!"abbrev Value := {arrayType}", ""]
+  lines := lines ++ [
     "def descriptor : Pgx.Typed.StaticTypeDesc :=",
     s!"  {typeDescExpr db value.key}",
     ""
@@ -1366,12 +1418,13 @@ private def emitArray (plan : NamingPlan) (db : Pgx.DatabaseIR)
     "  encode resolve _ value := do",
     "    let encoded ← Pgx.Typed.fromEncodeStringError <|",
     "      Pgx.Typed.encodeArrayText",
-    "        (fun element => Pgx.Typed.asStringError (encodeElement resolve element)) value",
+    s!"        (fun element => Pgx.Typed.asStringError (encodeElement resolve element)) \
+      {if rejectsNull then "value.val" else "value"}",
     "    pure { format := 0, value := some encoded.toUTF8 }",
     "  decode resolve _ format value := do",
     "    let some bytes := value",
     s!"      | throw (.decode {stringLiteral ("unexpected NULL for array " ++ value.key.display)})",
-    "    if format == 0 then",
+    "    let decoded ← if format == 0 then",
     "      let some text := String.fromUTF8? bytes",
     s!"        | throw (.decode {stringLiteral ("array text is not UTF-8 for " ++ value.key.display)})",
     "      Pgx.Typed.fromDecodeStringError <|",
@@ -1384,8 +1437,17 @@ private def emitArray (plan : NamingPlan) (db : Pgx.DatabaseIR)
     "          (fun oid item => Pgx.Typed.asStringError",
     "            (decodeElementBinary resolve oid item)) bytes",
     "    else",
-    s!"      throw (.decode {stringLiteral ("unsupported wire format for array " ++ value.key.display)})",
-    "",
+    s!"      throw (.decode {stringLiteral ("unsupported wire format for array " ++ value.key.display)})"
+  ]
+  if rejectsNull then
+    lines := lines ++ [
+      "    match validate decoded with",
+      "    | .ok refined => pure refined",
+      "    | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)"
+    ]
+  else
+    lines := lines ++ ["    pure decoded"]
+  lines := lines ++ ["",
     s!"end {localName}",
     "",
     s!"abbrev {localName} := {localName}.Value",
@@ -1501,10 +1563,27 @@ private def emitComposite (plan : NamingPlan) (db : Pgx.DatabaseIR)
   let fieldNames := allocatedNames (value.fields.map (·.name)) "field"
   let mut uses : Array TypeUse := #[]
   for field in value.fields do uses := uses.push (← resolveTypeUse plan db field.ty.key)
+  let mut checks : Array GeneratedCheck := #[]
+  for i in [0:value.fields.size] do
+    let field := value.fields[i]!
+    if typeRejectsNull db field.ty.key then
+      checks := checks.push {
+        name := s!"{value.key.display}.{field.name} domain NOT NULL"
+        evaluate := s!".ok (Pgx.Constraint.SqlTruth.isNotNull value.{fieldNames[i]!})"
+      }
+    if let some check := typmodCheck? db field.ty s!"value.{fieldNames[i]!}" true
+        s!"{value.key.display}.{field.name} type modifier" then
+      checks := checks.push check
+  let refined := !checks.isEmpty
   let mut lines := [s!"namespace {localName}", "", "structure Data where"]
   for i in [0:value.fields.size] do
     lines := lines ++ [s!"  {fieldNames[i]!} : Option ({uses[i]!.leanType})"]
-  lines := lines ++ ["", "abbrev Value := Data", "", "def descriptor : Pgx.Typed.StaticTypeDesc :=",
+  lines := lines ++ [""]
+  if refined then
+    lines := lines ++ emitValidator "Data" "Value" checks
+  else
+    lines := lines ++ ["abbrev Value := Data", ""]
+  lines := lines ++ ["def descriptor : Pgx.Typed.StaticTypeDesc :=",
     s!"  {typeDescExpr db value.key}", ""]
   for i in [0:value.fields.size] do
     lines := lines ++ emitComponentHelpers s!"Field{i + 1}" value.fields[i]!.ty uses[i]!
@@ -1513,9 +1592,10 @@ private def emitComposite (plan : NamingPlan) (db : Pgx.DatabaseIR)
     "  expected := descriptor",
     "  encode resolve _ value := do"
   ]
+  let valueAccess := if refined then "value.val" else "value"
   for i in [0:value.fields.size] do
     lines := lines ++ [
-      s!"    let field{i + 1} ← match value.{fieldNames[i]!} with",
+      s!"    let field{i + 1} ← match {valueAccess}.{fieldNames[i]!} with",
       "      | none => pure none",
       s!"      | some item => some <$> encodeField{i + 1} resolve item"
     ]
@@ -1540,9 +1620,16 @@ private def emitComposite (plan : NamingPlan) (db : Pgx.DatabaseIR)
     ]
   let decodedFields := Array.range value.fields.size |>.map fun i =>
     s!"{fieldNames[i]!} := field{i + 1}"
-  lines := lines ++ [
-    "    pure { " ++ commaSep decodedFields ++ " }",
-    "",
+  if refined then
+    lines := lines ++ [
+      "    let decoded : Data := { " ++ commaSep decodedFields ++ " }",
+      "    match validate decoded with",
+      "    | .ok refined => pure refined",
+      "    | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)"
+    ]
+  else
+    lines := lines ++ ["    pure { " ++ commaSep decodedFields ++ " }"]
+  lines := lines ++ ["",
     s!"end {localName}",
     "",
     s!"abbrev {localName} := {localName}.Value",
@@ -1614,7 +1701,7 @@ private def emitDomain (plan : NamingPlan) (db : Pgx.DatabaseIR)
       evaluate := ← compileTruthExpr plan db scope
         s!"{context} constraint {constraint.name}" constraint.expression
     }
-  if let some check := typmodCheck? value.base "value.toBase" false
+  if let some check := typmodCheck? db value.base "value.toBase" false
       s!"{value.key.display} type modifier" then
     checks := checks.push check
   let mut lines := [
@@ -1752,7 +1839,7 @@ private def emitRelation (plan : NamingPlan) (db : Pgx.DatabaseIR)
       }
   for i in [0:relation.columns.size] do
     let column := relation.columns[i]!
-    if let some check := typmodCheck? column.ty s!"value.{names[i]!}"
+    if let some check := typmodCheck? db column.ty s!"value.{names[i]!}"
         column.nullable s!"{relation.key.display}.{column.name} type modifier" then
       checks := checks.push check
   let mut lines := [s!"namespace {plan.modulePrefix}.Schema.{schemaName}.{relationName}", ""]
@@ -1961,7 +2048,7 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
   for i in [0:query.columns.size] do
     let column := query.columns[i]!
     if column.logicalType.isNone then
-      if let some check := typmodCheck? column.ty s!"value.{columnNames[i]!}"
+      if let some check := typmodCheck? db column.ty s!"value.{columnNames[i]!}"
           column.nullable s!"query {query.name}.{column.name} type modifier" then
         checks := checks.push check
   let mut lines : List String := [

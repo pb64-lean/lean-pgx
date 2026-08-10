@@ -333,9 +333,13 @@ def typeSampleAliases
     (row : AppDb.Queries.PutTypeSample.Row) : AppDb.Types.AppCitext :=
   row.val.aliases
 
+def typeSampleLabels
+    (row : AppDb.Queries.PutTypeSample.Row) : AppDb.Types.PgCatalogVarchar :=
+  row.val.labels
+
 def typeSampleCardStatus
     (card : AppDb.Types.AppContactCard) : Option AppDb.Types.AppUserStatus :=
-  card.status
+  card.val.status
 
 def summaryViewAmount
     (row : AppDb.Queries.ListTypeSampleView.Row) : Option Pg.PgNumeric :=
