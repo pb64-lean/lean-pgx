@@ -737,6 +737,25 @@ private def integerFits (value : Int) (ty : ScalarType) : Bool :=
   | .numeric => true
   | _ => false
 
+/-- PostgreSQL deparses integer constants outside the `int4` range as an
+unknown string literal followed by an explicit fixed-width integer cast (for
+example, `'4294967296'::bigint`).  Treat that catalog-normalized spelling as
+the integer literal it denotes, but only for the three modeled builtin integer
+types.  In particular this does not make arbitrary text-to-integer casts, or
+casts into integer-backed domains, value-preserving. -/
+private def resolveDeparsedIntegerCast (offset : Nat) (value : String)
+    (target : ScalarType) : Except Diagnostic ValueExpr := do
+  unless target == int2Type || target == int4Type || target == int8Type do
+    throw (diagnostic .typeMismatch offset
+      s!"text literal cannot have type {target.display}")
+  let some parsed := value.toInt?
+    | throw (diagnostic .invalidLiteral offset
+        s!"{repr value} is not a valid PostgreSQL integer literal for {target.display}")
+  unless integerFits parsed target do
+    throw (diagnostic .invalidLiteral offset
+      s!"integer literal {value} is outside {target.display}")
+  pure (.literal (.integer parsed) target)
+
 private def compatibleLiteralType (expected : ScalarType) (predicate : ScalarType → Bool)
     (fallback : ScalarType) : ScalarType :=
   if predicate expected then expected else fallback
@@ -797,6 +816,10 @@ private partial def resolveValue (scope : Scope) (raw : RawExpr)
             throw (diagnostic .invalidLiteral literalOffset
               s!"{repr label} is not a label of {key.display}")
           pure (.cast .enumLiteral (.literal (.text label) textType) target)
+      | .string literalOffset value, .int16
+      | .string literalOffset value, .int32
+      | .string literalOffset value, .int64 =>
+          resolveDeparsedIntegerCast literalOffset value target
       | _, _ =>
           let value ← resolveValue scope rawValue (some target)
           ensureExplicitDomainCastPreserving scope offset value.type target

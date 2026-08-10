@@ -83,6 +83,13 @@ def main : IO UInt32 := do
   assert! notEqualNullable (some (1 : Int32)) (some 2) == .true
   assert! compareNullable .lt (some (1 : Int32)) (some 2) == .true
   assert! compareNullable .ge (some (1 : Int32)) (some 2) == .false
+  -- Exact Int64 comparison at the first value above UInt32's range.  This is
+  -- the representative constant PostgreSQL deparses as
+  -- `'4294967296'::bigint` in a BIGINT CHECK.
+  let uint32Ceiling : Int64 := 4294967296
+  assert! compareNullable .lt (some (4294967295 : Int64)) (some uint32Ceiling) == .true
+  assert! compareNullable .lt (some uint32Ceiling) (some uint32Ceiling) == .false
+  assert! compareNullable .ge (some uint32Ceiling) (some uint32Ceiling) == .true
 
   assert! charLength "hé🚀" == 3
   assert! btrim "  hello  " == "hello"

@@ -96,7 +96,9 @@ private def users : Pgx.RelationIR := {
     { name := "amount", ordinal := 4, ty := base "numeric", nullable := false },
     { name := "code", ordinal := 5, ty := base "bpchar" (some 7), nullable := false },
     { name := "email", ordinal := 6, ty := { key := emailKey }, nullable := false },
-    { name := "checked_value", ordinal := 7, ty := { key := checkedKey }, nullable := false }
+    { name := "checked_value", ordinal := 7, ty := { key := checkedKey }, nullable := false },
+    { name := "small_count", ordinal := 8, ty := base "int2", nullable := false },
+    { name := "big_count", ordinal := 9, ty := base "int8", nullable := false }
   ]
 }
 
@@ -163,6 +165,11 @@ private partial def anyValue (predicate : ValueExpr → Bool) : TruthExpr → Bo
   | .and left right | .or left right => anyValue predicate left || anyValue predicate right
   | .not value => anyValue predicate value
 
+private partial def integerLiteral? : ValueExpr → Option (Int × ScalarType)
+  | .literal (.integer value) ty => some (value, ty)
+  | .cast .identity value _ => integerLiteral? value
+  | _ => none
+
 def main : IO Unit := do
   let tableCheck ← match parseTableCheck users #[status] #[trimmed, email]
       "CHECK (((age IS NULL) OR ((age >= 0) AND (status = 'active'::app.user_status))))" with
@@ -187,6 +194,38 @@ def main : IO Unit := do
     | .ok parsed => pure parsed
     | .error error => panic! toString error
   assert! lengthCheck.expression.referencedColumns == #["display_name"]
+
+  -- PostgreSQL quotes integer constants that do not fit its initially chosen
+  -- int4 literal type, then records the selected fixed-width type as a cast.
+  -- These three forms must remain exact integer literals in the typed IR.
+  for (source, expectedValue, expectedType) in #[
+      ("CHECK (small_count <= '32767'::smallint)", (32767 : Int), base "int2"),
+      ("CHECK (age <= '2147483647'::integer)", (2147483647 : Int), base "int4"),
+      ("CHECK (big_count < '4294967296'::bigint)", (4294967296 : Int), base "int8")
+    ] do
+    let parsed ← match parseTableCheck users #[status] #[trimmed, email] source with
+      | .ok parsed => pure parsed
+      | .error error => panic! s!"deparsed integer cast {source}: {error}"
+    match parsed.expression with
+    | .compare _ _ right =>
+        let some (value, ty) := integerLiteral? right
+          | panic! s!"deparsed integer cast did not produce an integer literal: {source}"
+        assert! value == expectedValue
+        assert! ty.declared == expectedType
+    | _ => panic! s!"deparsed integer cast did not produce a comparison: {source}"
+
+  expectDiagnostic .invalidLiteral 19
+    "\"not-an-int\" is not a valid PostgreSQL integer literal for pg_catalog.int8 (base)" <|
+    parseTableCheck users #[status] #[trimmed, email]
+      "CHECK (big_count < 'not-an-int'::bigint)"
+  expectDiagnostic .invalidLiteral 22
+    "integer literal 32768 is outside pg_catalog.int2 (base)" <|
+    parseTableCheck users #[status] #[trimmed, email]
+      "CHECK (small_count <= '32768'::smallint)"
+  expectDiagnostic .invalidLiteral 19
+    "integer literal 9223372036854775808 is outside pg_catalog.int8 (base)" <|
+    parseTableCheck users #[status] #[trimmed, email]
+      "CHECK (big_count < '9223372036854775808'::bigint)"
 
   for (serverMajor, source) in #[(17, "CHECK (age >= 0) NOT VALID"),
       (18, "CHECK (age >= 0) NOT VALID")] do

@@ -55,16 +55,45 @@ postgres_nix = use_extension(
     "@rules_nixpkgs_core//extensions:repository.bzl",
     "nix_repo",
 )
-postgres_nix.file(
+postgres_nix.default(name = "postgres_nixpkgs")
+use_repo(postgres_nix, "postgres_nixpkgs")
+
+# The non-dev default above keeps the repository visible in lean-pgx's repo
+# mapping when this module is a dependency. As the root module, this dev-only
+# override supplies the pinned repository contents.
+postgres_nix_override = use_extension(
+    "@rules_nixpkgs_core//extensions:repository.bzl",
+    "nix_repo",
+    dev_dependency = True,
+)
+postgres_nix_override.file(
     name = "postgres_nixpkgs",
     file = "//:postgres.nix",
     file_deps = ["//:postgres.json"],
 )
-use_repo(postgres_nix, "postgres_nixpkgs")
 
 postgres_pkg = use_extension(
     "@rules_nixpkgs_core//extensions:package.bzl",
     "nix_pkg",
+)
+postgres_pkg.default(attr = "postgresql_17")
+postgres_pkg.default(attr = "postgresql_18")
+postgres_pkg.default(attr = "socat")
+postgres_pkg.default(attr = "coreutils")
+use_repo(
+    postgres_pkg,
+    "coreutils",
+    "postgresql_17",
+    "postgresql_18",
+    "socat",
+)
+
+# Root-only package definitions override the globally named defaults while
+# preserving those names in downstream repository mappings.
+postgres_pkg_override = use_extension(
+    "@rules_nixpkgs_core//extensions:package.bzl",
+    "nix_pkg",
+    dev_dependency = True,
 )
 
 _POSTGRES_BUILD = """\
@@ -97,34 +126,27 @@ filegroup(
 )
 """
 
-postgres_pkg.attr(
+postgres_pkg_override.attr(
     name = "postgresql_17",
     attr = "postgresql_17",
     build_file_content = _POSTGRES_BUILD,
     repo = "@postgres_nixpkgs",
 )
-postgres_pkg.attr(
+postgres_pkg_override.attr(
     name = "postgresql_18",
     attr = "postgresql_18",
     build_file_content = _POSTGRES_BUILD,
     repo = "@postgres_nixpkgs",
 )
-postgres_pkg.attr(
+postgres_pkg_override.attr(
     name = "socat",
     attr = "socat",
     build_file_content = _SOCAT_BUILD,
     repo = "@postgres_nixpkgs",
 )
-postgres_pkg.attr(
+postgres_pkg_override.attr(
     name = "coreutils",
     attr = "coreutils",
     build_file_content = _COREUTILS_BUILD,
     repo = "@postgres_nixpkgs",
-)
-use_repo(
-    postgres_pkg,
-    "coreutils",
-    "postgresql_17",
-    "postgresql_18",
-    "socat",
 )
