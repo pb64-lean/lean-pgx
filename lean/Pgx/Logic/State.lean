@@ -1,4 +1,8 @@
-import Pgx.Logic.Schema
+module
+
+public import Pgx.Logic.Schema
+
+public section
 
 /-!
 # Finite relational states

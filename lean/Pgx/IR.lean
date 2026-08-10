@@ -1,7 +1,11 @@
-import Pgx.IR.Core
-import Pgx.Constraint.IR
-import Pg.Crypto.Sha256
-import Pg.Crypto.Hex
+module
+
+public import Pgx.IR.Core
+public import Pgx.Constraint.IR
+public import Pg.Crypto.Sha256
+public import Pg.Crypto.Hex
+
+public section
 
 /-!
 # Canonical PostgreSQL schema and query IR

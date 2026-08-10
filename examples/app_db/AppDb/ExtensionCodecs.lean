@@ -1,4 +1,8 @@
-import Pgx.Typed
+module
+
+public import Pgx.Typed
+
+public section
 
 /-! Reusable codecs for extension-owned PostgreSQL types used by the fixture. -/
 

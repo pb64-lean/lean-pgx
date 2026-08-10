@@ -1,3 +1,7 @@
+module
+
+public section
+
 /-!
 # Symbolic PostgreSQL IR primitives
 

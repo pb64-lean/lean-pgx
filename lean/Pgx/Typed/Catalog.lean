@@ -1,5 +1,9 @@
-import Pgx.Typed.Descriptors
-import Pg.Connection
+module
+
+public import Pgx.Typed.Descriptors
+public import Pg.Connection
+
+public section
 
 /-!
 # Live catalog attachment
@@ -1809,18 +1813,21 @@ receive the same promise and never prepare a duplicate named statement on the
 physical connection.
 -/
 
-private inductive PreparedEntryState where
+/-- Runtime-internal cache state.  Its name is public because module-mode
+`CheckedConnection` must expose the types of its private representation fields;
+applications construct and observe the cache only through the operations below. -/
+inductive PreparedEntryState where
   | pending (completion : IO.Promise (Except Error Pg.Statement))
   | ready (statement : Pg.Statement)
   /-- Descriptor drift is sticky: PostgreSQL has already installed the named
   statement, so retrying the same name would itself be a protocol error. -/
   | drifted (error : Error)
 
-private structure PreparedEntry where
+structure PreparedEntry where
   key : String
   state : PreparedEntryState
 
-private abbrev PreparedCache := Std.Mutex (Array PreparedEntry)
+abbrev PreparedCache := Std.Mutex (Array PreparedEntry)
 
 inductive PrepareDecision where
   | ready (statement : Pg.Statement)

@@ -1,7 +1,11 @@
-import Pgx.Constraint.IR
-import Pgx.Typed.Containers
-import Pg.Types.Numeric
-import Pg.Types.Interval
+module
+
+public import Pgx.Constraint.IR
+public import Pgx.Typed.Containers
+public import Pg.Types.Numeric
+public import Pg.Types.Interval
+
+public section
 
 /-!
 # Executable local-constraint semantics
@@ -102,7 +106,7 @@ instance : ToString Violation := ⟨Violation.toMessage⟩
 abbrev ConstraintViolation := Violation
 
 /-- SQL evaluation errors do not prove a local guarantee. -/
-def resultPasses : Except EvaluationError SqlTruth → Prop
+@[expose] def resultPasses : Except EvaluationError SqlTruth → Prop
   | .ok truth => truth.checkPasses
   | .error _ => False
 
@@ -502,7 +506,7 @@ structure Check (α : Type u) where
   evaluate : α → Except EvaluationError SqlTruth
 
 /-- Every check must either evaluate to true or to SQL unknown. -/
-def Valid : List (Check α) → α → Prop
+@[expose] def Valid : List (Check α) → α → Prop
   | [], _ => True
   | check :: rest, value =>
       resultPasses (check.evaluate value) ∧ Valid rest value
@@ -533,7 +537,7 @@ def firstViolation? : List (Check α) → α → Option Violation
       | .ok .true | .ok .unknown => firstViolation? rest value
 
 /-- Construct a proof-bearing value only by executing its local checks. -/
-def validate (checks : List (Check α)) (value : α) :
+@[expose] def validate (checks : List (Check α)) (value : α) :
     Except Violation { refined : α // Valid checks refined } :=
   if valid : Valid checks value then
     .ok ⟨value, valid⟩

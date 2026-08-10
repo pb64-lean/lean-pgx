@@ -1,4 +1,8 @@
-import Pg
+module
+
+public import Pg
+
+public section
 
 /-!
 # PostgreSQL container codecs

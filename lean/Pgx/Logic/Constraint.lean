@@ -1,5 +1,9 @@
-import Pgx.Logic.State
-import Pgx.Constraint.IR
+module
+
+public import Pgx.Logic.State
+public import Pgx.Constraint.IR
+
+public section
 
 /-!
 # Relational PostgreSQL constraint semantics

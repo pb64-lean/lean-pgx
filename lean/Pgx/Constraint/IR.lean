@@ -1,4 +1,8 @@
-import Pgx.IR.Core
+module
+
+public import Pgx.IR.Core
+
+public section
 
 /-!
 # Typed local PostgreSQL constraint expressions
@@ -170,7 +174,7 @@ inductive SqlTruth where
 namespace SqlTruth
 
 /-- A PostgreSQL `CHECK` rejects only false; null/unknown passes. -/
-def checkPasses : SqlTruth → Prop
+@[expose] def checkPasses : SqlTruth → Prop
   | .false => False
   | .true | .unknown => True
 

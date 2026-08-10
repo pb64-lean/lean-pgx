@@ -1,6 +1,10 @@
-import Pgx.IR
-import Pgx.Constraint.Semantics
-import Pg
+module
+
+public import Pgx.IR
+public import Pgx.Constraint.Semantics
+public import Pg
+
+public section
 
 /-!
 # Checked PostgreSQL descriptors

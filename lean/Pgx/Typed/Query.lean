@@ -1,6 +1,10 @@
-import Pgx.Typed.Catalog
-import Pg.Crypto.Sha256
-import Pg.Crypto.Hex
+module
+
+public import Pgx.Typed.Catalog
+public import Pg.Crypto.Sha256
+public import Pg.Crypto.Hex
+
+public section
 
 /-!
 # Checked prepared-query execution

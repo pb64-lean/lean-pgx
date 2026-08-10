@@ -1,8 +1,12 @@
-import Pgx.Typed.Descriptors
-import Pgx.Typed.Containers
-import Pgx.Typed.Composite
-import Pgx.Typed.Catalog
-import Pgx.Typed.Query
+module
+
+public import Pgx.Typed.Descriptors
+public import Pgx.Typed.Containers
+public import Pgx.Typed.Composite
+public import Pgx.Typed.Catalog
+public import Pgx.Typed.Query
+
+public section
 
 /-!
 # Pgx.Typed
