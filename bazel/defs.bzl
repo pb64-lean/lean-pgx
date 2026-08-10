@@ -5,7 +5,7 @@ migration inputs, and probes literal query files.  Nothing in the ordinary
 build connects to a developer or production database.
 """
 
-load("@rules_lean//lean:defs.bzl", "lean_library")
+load("@rules_lean//lean:defs.bzl", "LeanGeneratedSourceInfo", "lean_library")
 
 PgQuerySetInfo = provider(
     doc = "Literal SQL query inputs and their declarative manifest.",
@@ -434,6 +434,7 @@ def _lean_pg_generate_impl(ctx):
             contract_hash = depset([contract_out]),
             compatibility_hash = depset([compatibility_out]),
         ),
+        LeanGeneratedSourceInfo(lean_srcs = depset(lean_srcs)),
         LeanPgGenInfo(
             lean_srcs = depset(lean_srcs),
             schema_ir = ir_out,
@@ -452,6 +453,7 @@ def _lean_pg_generate_impl(ctx):
 
 _lean_pg_generate = rule(
     implementation = _lean_pg_generate_impl,
+    provides = [LeanGeneratedSourceInfo, LeanPgGenInfo],
     attrs = {
         "module_prefix": attr.string(mandatory = True),
         "output_basename": attr.string(mandatory = True),
