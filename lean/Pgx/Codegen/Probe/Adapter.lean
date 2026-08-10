@@ -118,7 +118,7 @@ def constraintCatalogSql (adapter : Adapter) : String :=
 /-- Constraint-column query for this server major.  PostgreSQL 18's native
 `NOT NULL` rows use `conkey`, just like the other local constraint kinds. -/
 def constraintColumnSql (adapter : Adapter) : String :=
-  "SELECT con.oid::text, false::text, key.ordinality::text, a.attname " ++
+  "SELECT con.oid, false::text, key.ordinality, a.attname " ++
   "FROM pg_catalog.pg_constraint AS con " ++
   "CROSS JOIN LATERAL pg_catalog.unnest(con.conkey) " ++
   "WITH ORDINALITY AS key(attnum, ordinality) " ++
@@ -126,7 +126,7 @@ def constraintColumnSql (adapter : Adapter) : String :=
   "ON a.attrelid = con.conrelid AND a.attnum = key.attnum " ++
   "WHERE con.conrelid <> 0 AND con.contype IN (" ++
   adapter.constraintTypeList ++ ") UNION ALL " ++
-  "SELECT con.oid::text, true::text, key.ordinality::text, a.attname " ++
+  "SELECT con.oid, true::text, key.ordinality, a.attname " ++
   "FROM pg_catalog.pg_constraint AS con " ++
   "CROSS JOIN LATERAL pg_catalog.unnest(con.confkey) " ++
   "WITH ORDINALITY AS key(attnum, ordinality) " ++
@@ -138,7 +138,7 @@ def constraintColumnSql (adapter : Adapter) : String :=
 the PostgreSQL default of applying `SET NULL`/`SET DEFAULT` to every key
 column; an explicitly stored subset retains declaration order. -/
 def constraintDeleteSetColumnSql : String :=
-  "SELECT con.oid::text, key.ordinality::text, a.attname " ++
+  "SELECT con.oid, key.ordinality, a.attname " ++
   "FROM pg_catalog.pg_constraint AS con " ++
   "CROSS JOIN LATERAL pg_catalog.unnest(con.confdelsetcols) " ++
   "WITH ORDINALITY AS key(attnum, ordinality) " ++
@@ -152,8 +152,8 @@ only to the transient probe, which replaces them with symbolic operator and
 operand type identities before constructing `DatabaseIR`. -/
 def constraintOperatorSql : String :=
   let branch (field tag : String) :=
-    "SELECT con.oid::text, '" ++ tag ++ "'::text, item.ordinality::text, " ++
-    "op.oid::text, ons.nspname, op.oprname, op.oprleft::text, op.oprright::text " ++
+    "SELECT con.oid, '" ++ tag ++ "'::text, item.ordinality, " ++
+    "op.oid, ons.nspname, op.oprname, op.oprleft, op.oprright " ++
     "FROM pg_catalog.pg_constraint AS con " ++
     "CROSS JOIN LATERAL pg_catalog.unnest(con." ++ field ++ ") " ++
     "WITH ORDINALITY AS item(operator_oid, ordinality) " ++
@@ -217,18 +217,30 @@ def normalizeConstraints (adapter : Adapter)
       unless adapter.supportsNativeNotNull do
         throw s!"PostgreSQL {adapter.serverMajor} adapter received a native NOT NULL constraint"
       let key ← notNullKey constraint
+      unless constraint.enforced && constraint.validated do
+        throw s!"native NOT NULL constraint {constraint.relation}.{constraint.name} \
+          must be enforced and validated before lean-pgx can treat the column as non-null"
       unless attributes.contains key do
         throw s!"native NOT NULL constraint for {key.relation}.{key.column} \
           is absent from pg_attribute"
       if nativeKeys.contains key then
         throw s!"duplicate native NOT NULL constraint for {key.relation}.{key.column}"
       nativeKeys := nativeKeys.push key
-      result := result.push (canonicalNotNull key (some constraint))
+      let normalized := canonicalNotNull key (some constraint)
+      if result.any (fun existing => existing.key == normalized.key) then
+        throw s!"duplicate normalized constraint identity {normalized.key}"
+      result := result.push normalized
     else
+      if result.any (fun existing => existing.key == constraint.key) then
+        throw s!"duplicate normalized constraint identity {constraint.key}"
       result := result.push constraint
   for key in attributes do
     unless nativeKeys.contains key do
-      result := result.push (canonicalNotNull key)
+      let normalized := canonicalNotNull key
+      if result.any (fun existing => existing.key == normalized.key) then
+        throw s!"synthetic NOT NULL identity {normalized.key} collides with a \
+          PostgreSQL constraint name"
+      result := result.push normalized
   pure result
 
 end Adapter

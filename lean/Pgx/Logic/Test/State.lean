@@ -82,6 +82,42 @@ private theorem transition_spec_describes_insert :
     spec.Accepts initial () (initial.insert .users 30) := by
   exact ⟨trivial, rfl⟩
 
+private theorem insert_spec_requires_post_integrity :
+    let spec := Pgx.Logic.DbSpec.insert (schema := schema) (.users : Table) 30
+      (fun state : Pgx.Logic.State schema => (state.rows .users).size = 4)
+    spec.Accepts initial () (initial.insert .users 30) := by
+  exact ⟨trivial, rfl, by decide⟩
+
+private theorem delete_spec_tracks_occurrence_identity :
+    let spec := Pgx.Logic.DbSpec.deleteOccurrence (schema := schema)
+      initial .users secondDuplicate
+      (fun state : Pgx.Logic.State schema => (state.rows .users).size = 2)
+    spec.Accepts initial () (initial.deleteOccurrence .users secondDuplicate) := by
+  refine ⟨rfl, rfl, rfl, ?_⟩
+  have size := Array.size_eraseIdx secondDuplicate.index.val
+    secondDuplicate.index.isLt
+  simpa [Pgx.Logic.State.deleteOccurrence, initial] using size
+
+private theorem lifecycle_excludes_not_valid_whole_states :
+    let lifecycle : Pgx.Logic.ConstraintLifecycle := {
+      enforced := true
+      validated := false
+    }
+    lifecycle.requiresWholeState .transactionEnd = false := by
+  decide
+
+private theorem deferred_lifecycle_uses_transaction_end :
+    let lifecycle : Pgx.Logic.ConstraintLifecycle := {
+      enforced := true
+      validated := true
+      deferrable := true
+      initiallyDeferred := true
+    }
+    lifecycle.defaultTiming = .transactionEnd ∧
+      lifecycle.requiresWholeState .defaultStatementEnd = false ∧
+      lifecycle.requiresWholeState .transactionEnd = true := by
+  decide
+
 def main : IO Unit := do
   assert! firstDuplicate.row == 10
   assert! secondDuplicate.row == 10
@@ -90,6 +126,9 @@ def main : IO Unit := do
   assert! (initial.deleteOccurrence .users secondDuplicate).rows .users == #[10, 20]
   assert! (initial.updateOccurrence .users firstDuplicate 99).rows .users == #[99, 10, 20]
   assert! (initial.occurrences .users).size == 3
+  assert! (Pgx.Logic.ConstraintLifecycle.defaultTiming {
+    deferrable := true, initiallyDeferred := true
+  }) == .transactionEnd
   IO.println "PASS array-backed relational state kernel"
 
 end Pgx.Logic.Test.State

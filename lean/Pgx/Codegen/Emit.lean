@@ -97,6 +97,24 @@ private structure NamedQuery where
   query : Pgx.QueryIR
   moduleName : String
 
+private structure LogicalTable where
+  relation : Pgx.RelationIR
+  names : NamedRelation
+  caseName : String
+
+private structure NamedRelationalConstraint where
+  constraint : Pgx.ConstraintIR
+  declarationName : String
+  fieldName : String
+  unsupportedReason : Option String := none
+  deriving Inhabited
+
+private structure LogicalKeyField where
+  sourceName : String
+  leanName : String
+  rowField : String
+  leanType : String
+
 private structure NamingPlan where
   modulePrefix : String
   prefixPath : String
@@ -178,6 +196,15 @@ private def collationKeyExpr (key : Pgx.CollationKey) : String :=
 private def qualifiedNameExpr (key : Pgx.QualifiedName) : String :=
   recordExpr s!"schema := {stringLiteral key.schema}, name := {stringLiteral key.name}"
 
+private def operatorKeyExpr (key : Pgx.OperatorKey) : String :=
+  recordExpr s!"schema := {stringLiteral key.schema}, name := {stringLiteral key.name}, leftType := {typeKeyExpr key.leftType}, rightType := {typeKeyExpr key.rightType}"
+
+private def constraintKeyExpr (key : Pgx.ConstraintKey) : String :=
+  recordExpr s!"relation := {relationKeyExpr key.relation}, name := {stringLiteral key.name}"
+
+private def indexKeyExpr (key : Pgx.IndexKey) : String :=
+  recordExpr s!"schema := {stringLiteral key.schema}, name := {stringLiteral key.name}"
+
 private def routineKeyExpr (key : Pgx.RoutineKey) : String :=
   recordExpr s!"schema := {stringLiteral key.schema}, name := {stringLiteral key.name}, inputTypes := {arrayExpr (key.inputTypes.map typeRefExpr)}"
 
@@ -241,6 +268,30 @@ private def constraintKindExpr : Pgx.ConstraintKind → String
   | .unique => "unique"
   | .foreignKey => "foreignKey"
   | .exclusion => "exclusion"
+
+private def uniqueNullPolicyExpr : Pgx.UniqueNullPolicy → String
+  | .distinct => "distinct"
+  | .notDistinct => "notDistinct"
+
+private def foreignKeyMatchExpr : Pgx.ForeignKeyMatch → String
+  | .simple => "simple"
+  | .full => "full"
+  | .partialMatch => "partialMatch"
+
+private def foreignKeyActionExpr : Pgx.ForeignKeyAction → String
+  | .noAction => "noAction"
+  | .restrict => "restrict"
+  | .cascade => "cascade"
+  | .setNull => "setNull"
+  | .setDefault => "setDefault"
+
+private def indexOrderExpr : Pgx.IndexOrder → String
+  | .ascending => "ascending"
+  | .descending => "descending"
+
+private def indexNullsOrderExpr : Pgx.IndexNullsOrder → String
+  | .first => "first"
+  | .last => "last"
 
 private def scalarKindExpr : Pgx.Constraint.ScalarKind → String
   | .boolean => "Pgx.Constraint.ScalarKind.boolean"
@@ -318,19 +369,45 @@ private partial def truthExprExpr : Pgx.Constraint.TruthExpr → String
       s!"Pgx.Constraint.TruthExpr.or ({truthExprExpr left}) ({truthExprExpr right})"
   | .not value => s!"Pgx.Constraint.TruthExpr.not ({truthExprExpr value})"
 
+private def indexKeyElementExpr (element : Pgx.IndexKeyElementIR) : String :=
+  let column := optionExpr (element.column.map stringLiteral)
+  let expression := optionExpr (element.expression.map stringLiteral)
+  let collation := optionExpr (element.collation.map collationKeyExpr)
+  let opclass := optionExpr (element.opclass.map qualifiedNameExpr)
+  let equalityOperator := optionExpr (element.equalityOperator.map operatorKeyExpr)
+  recordExpr s!"ordinal := {element.ordinal}, column := {column}, expression := {expression}, collation := {collation}, opclass := {opclass}, equalityOperator := {equalityOperator}, order := .{indexOrderExpr element.order}, nullsOrder := .{indexNullsOrderExpr element.nullsOrder}"
+
+private def exclusionElementExpr (element : Pgx.ExclusionElementIR) : String :=
+  recordExpr s!"key := {indexKeyElementExpr element.key}, operator := {operatorKeyExpr element.operator}"
+
 private def constraintExpr (constraint : Pgx.ConstraintIR) : String :=
   let columns := arrayExpr (constraint.columns.map stringLiteral)
   let referencedRelation := optionExpr (constraint.referencedRelation.map relationKeyExpr)
   let referencedColumns := arrayExpr (constraint.referencedColumns.map stringLiteral)
   let expression := optionExpr (constraint.expression.map stringLiteral)
   let localExpression := optionExpr (constraint.localExpression.map truthExprExpr)
-  recordExpr s!"relation := {relationKeyExpr constraint.relation}, name := {stringLiteral constraint.name}, kind := .{constraintKindExpr constraint.kind}, columns := {columns}, referencedRelation := {referencedRelation}, referencedColumns := {referencedColumns}, expression := {expression}, localExpression := {localExpression}, validated := {boolExpr constraint.validated}"
+  let parent := optionExpr (constraint.parent.map constraintKeyExpr)
+  let supportingIndex := optionExpr (constraint.supportingIndex.map indexKeyExpr)
+  let deleteSetColumns := arrayExpr
+    (constraint.foreignKeyDeleteSetColumns.map stringLiteral)
+  let pfOperators := arrayExpr
+    (constraint.referencedToReferencingOperators.map operatorKeyExpr)
+  let ppOperators := arrayExpr
+    (constraint.referencedEqualityOperators.map operatorKeyExpr)
+  let ffOperators := arrayExpr
+    (constraint.referencingEqualityOperators.map operatorKeyExpr)
+  let exclusionElements := arrayExpr
+    (constraint.exclusionElements.map exclusionElementExpr)
+  recordExpr s!"relation := {relationKeyExpr constraint.relation}, name := {stringLiteral constraint.name}, kind := .{constraintKindExpr constraint.kind}, columns := {columns}, referencedRelation := {referencedRelation}, referencedColumns := {referencedColumns}, expression := {expression}, localExpression := {localExpression}, enforced := {boolExpr constraint.enforced}, validated := {boolExpr constraint.validated}, deferrable := {boolExpr constraint.deferrable}, initiallyDeferred := {boolExpr constraint.initiallyDeferred}, parent := {parent}, isLocal := {boolExpr constraint.isLocal}, inheritanceCount := {constraint.inheritanceCount}, noInherit := {boolExpr constraint.noInherit}, period := {boolExpr constraint.period}, supportingIndex := {supportingIndex}, uniqueNullPolicy := .{uniqueNullPolicyExpr constraint.uniqueNullPolicy}, foreignKeyMatch := .{foreignKeyMatchExpr constraint.foreignKeyMatch}, foreignKeyOnUpdate := .{foreignKeyActionExpr constraint.foreignKeyOnUpdate}, foreignKeyOnDelete := .{foreignKeyActionExpr constraint.foreignKeyOnDelete}, foreignKeyDeleteSetColumns := {deleteSetColumns}, referencedToReferencingOperators := {pfOperators}, referencedEqualityOperators := {ppOperators}, referencingEqualityOperators := {ffOperators}, exclusionElements := {exclusionElements}"
 
 private def indexExpr (index : Pgx.IndexIR) : String :=
   let columns := arrayExpr (index.columns.map stringLiteral)
+  let keyElements := arrayExpr (index.keyElements.map indexKeyElementExpr)
+  let includedColumns := arrayExpr (index.includedColumns.map stringLiteral)
+  let accessMethod := optionExpr (index.accessMethod.map stringLiteral)
   let predicate := optionExpr (index.predicate.map stringLiteral)
   let expression := optionExpr (index.expression.map stringLiteral)
-  recordExpr s!"relation := {relationKeyExpr index.relation}, name := {stringLiteral index.name}, unique := {boolExpr index.unique}, primary := {boolExpr index.primary}, valid := {boolExpr index.valid}, columns := {columns}, predicate := {predicate}, expression := {expression}"
+  recordExpr s!"relation := {relationKeyExpr index.relation}, name := {stringLiteral index.name}, unique := {boolExpr index.unique}, primary := {boolExpr index.primary}, exclusion := {boolExpr index.exclusion}, valid := {boolExpr index.valid}, immediate := {boolExpr index.immediate}, ready := {boolExpr index.ready}, live := {boolExpr index.live}, uniqueNullPolicy := .{uniqueNullPolicyExpr index.uniqueNullPolicy}, accessMethod := {accessMethod}, columns := {columns}, keyElements := {keyElements}, includedColumns := {includedColumns}, predicate := {predicate}, expression := {expression}"
 
 private def viewCheckOptionExpr : Pgx.ViewCheckOption → String
   | .none => "none"
@@ -964,6 +1041,95 @@ private def buildNamingPlan (modulePrefix : String)
     relations := buildRelations schemas db
     queries := buildQueries db
   }
+
+private def logicalTables (plan : NamingPlan) (db : Pgx.DatabaseIR) :
+    Array LogicalTable := Id.run do
+  let mut scope : Scope := {}
+  let mut result : Array LogicalTable := #[]
+  for relation in db.relations do
+    let some names := plan.relations.find? (fun value => value.key == relation.key)
+      | continue
+    let preferred := lowerCamel (names.schemaName ++ "_" ++ names.relationName) "table"
+    let (caseName, next) := scope.claim preferred
+    scope := next
+    result := result.push { relation, names, caseName }
+  return result
+
+private def relationalConstraint (constraint : Pgx.ConstraintIR) : Bool :=
+  constraint.kind == .primaryKey || constraint.kind == .unique ||
+    constraint.kind == .foreignKey || constraint.kind == .exclusion
+
+private def missingColumn? (relation : Pgx.RelationIR)
+    (columns : Array String) : Option String :=
+  columns.find? (fun name => !relation.columns.any (fun column => column.name == name))
+
+private def relationalUnsupportedReason? (db : Pgx.DatabaseIR)
+    (constraint : Pgx.ConstraintIR) : Option String :=
+  if constraint.period then
+    some "temporal PERIOD/WITHOUT OVERLAPS semantics are not modeled"
+  else
+    match relation? db constraint.relation with
+    | none => some s!"owning relation {constraint.relation} is outside the generated state"
+    | some relation =>
+      match constraint.kind with
+      | .primaryKey | .unique =>
+          if constraint.columns.isEmpty then
+            some "the key column vector is empty"
+          else
+            (missingColumn? relation constraint.columns).map fun name =>
+              s!"key column {name} is absent from the owning relation"
+      | .foreignKey =>
+          if constraint.foreignKeyMatch == .partialMatch then
+            some "MATCH PARTIAL semantics are not supported"
+          else if constraint.columns.isEmpty then
+            some "the referencing key column vector is empty"
+          else if constraint.columns.size != constraint.referencedColumns.size then
+            some "referencing and referenced key vectors have different widths"
+          else
+            match missingColumn? relation constraint.columns with
+            | some name => some s!"referencing column {name} is absent"
+            | none =>
+              match constraint.referencedRelation with
+              | none => some "the referenced relation is absent"
+              | some key =>
+                match relation? db key with
+                | none => some s!"referenced relation {key} is outside the generated state"
+                | some referenced =>
+                  (missingColumn? referenced constraint.referencedColumns).map fun name =>
+                    s!"referenced column {name} is absent"
+      | .exclusion =>
+          if constraint.exclusionElements.isEmpty then
+            some "the exclusion operator vector is empty"
+          else if constraint.exclusionElements.any (fun element =>
+              element.key.column.isNone || element.key.expression.isSome) then
+            some "expression-based exclusion keys are outside the column-only model"
+          else
+            let columns := constraint.exclusionElements.filterMap (·.key.column)
+            (missingColumn? relation columns).map fun name =>
+              s!"exclusion column {name} is absent"
+      | .check | .notNull => some "the constraint is row-local, not relational"
+
+private def namedRelationalConstraints (db : Pgx.DatabaseIR) :
+    Array NamedRelationalConstraint := Id.run do
+  let mut declarationScope : Scope := {}
+  let mut fieldScope : Scope := { used := #["mk"] }
+  let mut result : Array NamedRelationalConstraint := #[]
+  for constraint in db.constraints do
+    if relationalConstraint constraint then
+      let preferred := upperCamel constraint.relation.schema ++
+        upperCamel constraint.relation.name ++ upperCamel constraint.name
+      let (declarationName, nextDeclarations) := declarationScope.claim preferred
+      declarationScope := nextDeclarations
+      let (fieldName, nextFields) := fieldScope.claim
+        (lowerCamel declarationName "constraint")
+      fieldScope := nextFields
+      result := result.push {
+        constraint
+        declarationName
+        fieldName
+        unsupportedReason := relationalUnsupportedReason? db constraint
+      }
+  return result
 
 private def domainDependencyPending (db : Pgx.DatabaseIR)
     (pending : Array Pgx.DomainIR) (domain : Pgx.DomainIR) : Bool :=
@@ -2004,6 +2170,8 @@ private def emitSchema (plan : NamingPlan) (db : Pgx.DatabaseIR) :
     s!"  session := {sessionExpr db.session}",
     s!"  types := {plan.modulePrefix}.Types.staticTypes",
     s!"  relations := {arrayExpr relationDescriptors}",
+    s!"  constraints := {arrayExpr (db.constraints.map constraintExpr)}",
+    s!"  indexes := {arrayExpr (db.indexes.map indexExpr)}",
     s!"  views := {arrayExpr (db.views.map viewExpr)}",
     s!"  routines := {arrayExpr (db.routines.map routineExpr)}",
     s!"  requiredExtensions := {requiredExtensionsExpr db}",
@@ -2021,10 +2189,145 @@ private def emitSchema (plan : NamingPlan) (db : Pgx.DatabaseIR) :
   ]
   pure (sourceText lines)
 
-private def emitConstraints (plan : NamingPlan) (db : Pgx.DatabaseIR) : String :=
-  sourceText [
+private def logicalTable? (tables : Array LogicalTable)
+    (key : Pgx.RelationKey) : Option LogicalTable :=
+  tables.find? (fun table => table.relation.key == key)
+
+private def logicalRowType (plan : NamingPlan) (table : LogicalTable) : String :=
+  s!"{plan.modulePrefix}.Schema.{table.names.schemaName}.{table.names.relationName}.Data"
+
+private def logicalKeyFields (plan : NamingPlan) (db : Pgx.DatabaseIR)
+    (relation : Pgx.RelationIR) (columns : Array String) :
+    Except CodegenError (Array LogicalKeyField) := do
+  let rowFields := allocatedNames (relation.columns.map (·.name)) "column"
+  let keyFields := allocatedNames columns "key"
+  let mut result : Array LogicalKeyField := #[]
+  for index in [:columns.size] do
+    let sourceName := columns[index]!
+    let some columnIndex := relation.columns.findIdx? (fun column =>
+        column.name == sourceName)
+      | throw (.malformedIR s!"relational constraint on {relation.key}"
+          s!"column {sourceName} is absent")
+    let column := relation.columns[columnIndex]!
+    result := result.push {
+      sourceName
+      leanName := keyFields[index]!
+      rowField := rowFields[columnIndex]!
+      leanType := ← fieldType plan db column.ty column.nullable
+    }
+  pure result
+
+private def keyStructureLines (name rowType projector : String)
+    (fields : Array LogicalKeyField) : List String := Id.run do
+  let mut lines := [s!"structure {name} where"]
+  for field in fields do
+    lines := lines ++ [s!"  {field.leanName} : {field.leanType}"]
+  lines := lines ++ ["", s!"def {projector} (row : {rowType}) : {name} := " ++ "{ " ++
+    commaSep (fields.map fun field =>
+      s!"{field.leanName} := row.{field.rowField}") ++ " }", ""]
+  return lines
+
+private def lifecycleExpr (constraint : Pgx.ConstraintIR) : String :=
+  recordExpr s!"enforced := {boolExpr constraint.enforced}, validated := {boolExpr constraint.validated}, deferrable := {boolExpr constraint.deferrable}, initiallyDeferred := {boolExpr constraint.initiallyDeferred}"
+
+private def emitRelationalKeyModel (plan : NamingPlan) (db : Pgx.DatabaseIR)
+    (tables : Array LogicalTable) (named : NamedRelationalConstraint) :
+    Except CodegenError (List String × String) := do
+  let constraint := named.constraint
+  let some table := logicalTable? tables constraint.relation
+    | throw (.malformedIR s!"constraint {constraint.key}"
+        "owning logical table is absent")
+  let rowType := logicalRowType plan table
+  let mut lines : List String := [s!"namespace {named.declarationName}", ""]
+  let comparatorType ← match constraint.kind with
+    | .unique => do
+      let fields ← logicalKeyFields plan db table.relation constraint.columns
+      lines := lines ++ keyStructureLines "Key" rowType "key" fields
+      pure s!"Pgx.Logic.Constraint.UniqueComparator {named.declarationName}.Key"
+    | .primaryKey => do
+      let fields ← logicalKeyFields plan db table.relation constraint.columns
+      lines := lines ++ keyStructureLines "Key" rowType "key" fields
+      pure s!"Pgx.Logic.Constraint.PrimaryKeyComparator {named.declarationName}.Key"
+    | .foreignKey => do
+      let some referencedKey := constraint.referencedRelation
+        | throw (.malformedIR s!"constraint {constraint.key}"
+            "referenced relation is absent")
+      let some referencedTable := logicalTable? tables referencedKey
+        | throw (.malformedIR s!"constraint {constraint.key}"
+            "referenced logical table is absent")
+      let childFields ← logicalKeyFields plan db table.relation constraint.columns
+      let parentFields ← logicalKeyFields plan db referencedTable.relation
+        constraint.referencedColumns
+      lines := lines ++ keyStructureLines "ChildKey" rowType "childKey" childFields
+      lines := lines ++ keyStructureLines "ParentKey"
+        (logicalRowType plan referencedTable) "parentKey" parentFields
+      pure s!"Pgx.Logic.Constraint.ForeignKeyComparator {named.declarationName}.ChildKey {named.declarationName}.ParentKey"
+    | .exclusion => do
+      let columns := constraint.exclusionElements.filterMap (·.key.column)
+      let fields ← logicalKeyFields plan db table.relation columns
+      lines := lines ++ keyStructureLines "Key" rowType "key" fields
+      pure s!"Pgx.Logic.Constraint.ExclusionComparator {named.declarationName}.Key"
+    | .check | .notNull =>
+      throw (.malformedIR s!"constraint {constraint.key}"
+        "row-local constraint reached relational emission")
+  lines := lines ++ [
+    "def lifecycle : Pgx.Logic.ConstraintLifecycle :=",
+    s!"  {lifecycleExpr constraint}",
+    "",
+    s!"end {named.declarationName}",
+    ""
+  ]
+  pure (lines, comparatorType)
+
+private def relationalHoldsLines (tables : Array LogicalTable)
+    (named : NamedRelationalConstraint) : Except CodegenError (List String) := do
+  let constraint := named.constraint
+  let some table := logicalTable? tables constraint.relation
+    | throw (.malformedIR s!"constraint {constraint.key}"
+        "owning logical table is absent")
+  let tableCase := "." ++ table.caseName
+  let body ← match constraint.kind with
+    | .unique =>
+      pure s!"Pgx.Logic.Constraint.Unique state {tableCase} key semantics.{named.fieldName} .{uniqueNullPolicyExpr constraint.uniqueNullPolicy}"
+    | .primaryKey =>
+      pure s!"Pgx.Logic.Constraint.PrimaryKey state {tableCase} key semantics.{named.fieldName}"
+    | .foreignKey => do
+      let some referenced := constraint.referencedRelation
+        | throw (.malformedIR s!"constraint {constraint.key}"
+            "referenced relation is absent")
+      let some referencedTable := logicalTable? tables referenced
+        | throw (.malformedIR s!"constraint {constraint.key}"
+            "referenced logical table is absent")
+      let mode := match constraint.foreignKeyMatch with
+        | .simple => "simple"
+        | .full => "full"
+        | .partialMatch => "simple"
+      pure s!"Pgx.Logic.Constraint.ForeignKey state {tableCase} .{referencedTable.caseName} .{mode} childKey parentKey semantics.{named.fieldName}"
+    | .exclusion =>
+      pure s!"Pgx.Logic.Constraint.Exclusion state {tableCase} key semantics.{named.fieldName}"
+    | .check | .notNull =>
+      throw (.malformedIR s!"constraint {constraint.key}"
+        "row-local constraint reached relational emission")
+  pure [
+    s!"namespace {named.declarationName}",
+    "",
+    "def Holds (semantics : Semantics) (state : State) : Prop :=",
+    s!"  {body}",
+    "",
+    s!"end {named.declarationName}",
+    ""
+  ]
+
+private def emitConstraints (plan : NamingPlan) (db : Pgx.DatabaseIR) :
+    Except CodegenError String := do
+  let tables := logicalTables plan db
+  let named := namedRelationalConstraints db
+  let modeled := named.filter (·.unsupportedReason.isNone)
+  let unsupported := named.filter (·.unsupportedReason.isSome)
+  let mut lines : List String := [
     generatedHeader,
     s!"import {plan.modulePrefix}.Schema",
+    "import Pgx.Logic.All",
     "",
     s!"namespace {plan.modulePrefix}.Constraints",
     "",
@@ -2043,8 +2346,129 @@ private def emitConstraints (plan : NamingPlan) (db : Pgx.DatabaseIR) : String :
     "def extensionCodecPackages : Array Pgx.ExtensionCodecPackageIR :=",
     s!"  {arrayExpr (db.extensionCodecPackages.map extensionCodecPackageExpr)}",
     "",
-    s!"end {plan.modulePrefix}.Constraints"
+    s!"end {plan.modulePrefix}.Constraints",
+    "",
+    s!"namespace {plan.modulePrefix}.Logic",
+    "",
+    "/-- Generated record types are possible row values; this tag selects",
+    "the table relation in a particular immutable logical state. -/",
+    "inductive Table where"
   ]
+  for table in tables do lines := lines ++ [s!"  | {table.caseName}"]
+  lines := lines ++ ["  deriving Repr, BEq, DecidableEq", ""]
+  if tables.isEmpty then
+    lines := lines ++ [
+      "def Row (table : Table) : Type := nomatch table",
+      ""
+    ]
+  else
+    lines := lines ++ ["def Row : Table → Type"]
+    for table in tables do
+      lines := lines ++ [s!"  | .{table.caseName} => {logicalRowType plan table}"]
+    lines := lines ++ [""]
+  lines := lines ++ [
+    "def schema : Pgx.Logic.Schema where",
+    "  Table := Table",
+    "  Row := Row",
+    "  tableDecidableEq := inferInstance",
+    "",
+    "abbrev State := Pgx.Logic.State schema",
+    ""
+  ]
+  for table in tables do
+    lines := lines ++ [
+      s!"namespace {table.names.schemaName}.{table.names.relationName}",
+      "",
+      s!"abbrev At (state : State) := Pgx.Logic.RowAt state .{table.caseName}",
+      s!"abbrev OccAt (state : State) := Pgx.Logic.OccAt state .{table.caseName}",
+      "",
+      s!"end {table.names.schemaName}.{table.names.relationName}",
+      ""
+    ]
+  let mut comparatorTypes : Array String := #[]
+  for value in modeled do
+    let (modelLines, comparatorType) ← emitRelationalKeyModel plan db tables value
+    lines := lines ++ modelLines
+    comparatorTypes := comparatorTypes.push comparatorType
+  if modeled.isEmpty then
+    lines := lines ++ ["abbrev Semantics := Unit", ""]
+  else
+    lines := lines ++ [
+      "/-- Explicit interpretations of the exact PostgreSQL operators recorded",
+      "in the relational descriptors.  Live execution never manufactures one. -/",
+      "structure Semantics where"
+    ]
+    for index in [:modeled.size] do
+      lines := lines ++ [s!"  {modeled[index]!.fieldName} : {comparatorTypes[index]!}"]
+    lines := lines ++ [""]
+  for value in modeled do
+    lines := lines ++ (← relationalHoldsLines tables value)
+  lines := lines ++ [
+    "def modeledConstraints : Array Pgx.ConstraintKey :=",
+    s!"  {arrayExpr (modeled.map fun value => constraintKeyExpr value.constraint.key)}",
+    "",
+    "def unsupportedRelationalConstraints : Array (Pgx.ConstraintKey × String) :=",
+    s!"  {arrayExpr (unsupported.map fun value =>
+      "(" ++ constraintKeyExpr value.constraint.key ++ ", " ++
+        stringLiteral value.unsupportedReason.get! ++ ")")}",
+    ""
+  ]
+  if modeled.isEmpty then
+    lines := lines ++ [
+      "abbrev IntegrityContext (_semantics : Semantics)",
+      "    (_phase : Pgx.Logic.ConstraintLifecycle.Phase)",
+      "    (_state : State) : Prop := True",
+      ""
+    ]
+  else
+    lines := lines ++ [
+      "/-- Whole-state obligations only for supported, enforced, validated",
+      "constraints which are due at the selected catalog-default phase. -/",
+      "structure IntegrityContext (semantics : Semantics)",
+      "    (phase : Pgx.Logic.ConstraintLifecycle.Phase)",
+      "    (state : State) : Prop where"
+    ]
+    for value in modeled do
+      lines := lines ++ [
+        s!"  {value.fieldName} : {value.declarationName}.lifecycle.requiresWholeState phase = true →",
+        s!"    {value.declarationName}.Holds semantics state"
+      ]
+    lines := lines ++ [""]
+  lines := lines ++ [
+    "abbrev Integrity := IntegrityContext",
+    ""
+  ]
+  for table in tables do
+    let rowType := logicalRowType plan table
+    lines := lines ++ [
+      s!"namespace {table.names.schemaName}.{table.names.relationName}",
+      "",
+      "def insertSpec (semantics : Semantics)",
+      "    (phase : Pgx.Logic.ConstraintLifecycle.Phase)",
+      s!"    (row : {rowType}) : Pgx.Logic.DbSpec schema Unit :=",
+      s!"  Pgx.Logic.DbSpec.insert .{table.caseName} row (Integrity semantics phase)",
+      "",
+      "def deleteSpec (semantics : Semantics)",
+      "    (phase : Pgx.Logic.ConstraintLifecycle.Phase)",
+      "    (before : State)",
+      s!"    (occurrence : Pgx.Logic.OccAt before .{table.caseName}) :",
+      "    Pgx.Logic.DbSpec schema Unit :=",
+      s!"  Pgx.Logic.DbSpec.deleteOccurrence before .{table.caseName} occurrence",
+      "    (Integrity semantics phase)",
+      "",
+      "def updateSpec (semantics : Semantics)",
+      "    (phase : Pgx.Logic.ConstraintLifecycle.Phase)",
+      "    (before : State)",
+      s!"    (occurrence : Pgx.Logic.OccAt before .{table.caseName})",
+      s!"    (replacement : {rowType}) : Pgx.Logic.DbSpec schema Unit :=",
+      s!"  Pgx.Logic.DbSpec.updateOccurrence before .{table.caseName} occurrence replacement",
+      "    (Integrity semantics phase)",
+      "",
+      s!"end {table.names.schemaName}.{table.names.relationName}",
+      ""
+    ]
+  lines := lines ++ [s!"end {plan.modulePrefix}.Logic"]
+  pure (sourceText lines)
 
 private def codecExpr (use : TypeUse) (nullable : Bool) : Option String :=
   use.codec.map fun codec => if nullable then s!"({codec}).option" else codec
@@ -2289,7 +2713,7 @@ def emitDatabase (modulePrefix : String) (database : Pgx.DatabaseIR) :
   let types := makeSource (plan.prefixPath ++ "/Types.lean") typesModule (← emitTypes plan db)
   let schema := makeSource (plan.prefixPath ++ "/Schema.lean") schemaModule (← emitSchema plan db)
   let constraints := makeSource (plan.prefixPath ++ "/Constraints.lean") constraintsModule
-    (emitConstraints plan db)
+    (← emitConstraints plan db)
   let mut queries : Array GeneratedSource := #[]
   for named in plan.queries do
     let moduleName := plan.modulePrefix ++ ".Queries." ++ named.moduleName

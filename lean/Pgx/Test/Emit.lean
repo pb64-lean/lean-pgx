@@ -244,6 +244,19 @@ private def shuffled : DatabaseIR := {
 private def generated : Except CodegenError GeneratedSources :=
   emitDatabase "app_db" fixture
 
+private def unsupportedRelationalFixture : DatabaseIR := {
+  fixture with
+  constraints := fixture.constraints.push {
+    relation := usersKey
+    name := "users_parent_partial_fk"
+    kind := .foreignKey
+    columns := #["id"]
+    referencedRelation := some usersKey
+    referencedColumns := #["id"]
+    foreignKeyMatch := .partialMatch
+  }
+}
+
 private def unsupported : DatabaseIR := {
   fixture with
   queries := fixture.queries.map fun query =>
@@ -624,6 +637,10 @@ def main : IO UInt32 := do
       { fixture with supportedServerMajors := #[] } with
     | .ok value => pure value
     | .error error => throw (IO.userError (toString error))
+  let unsupportedRelationalSources ←
+      match emitDatabase "app_db" unsupportedRelationalFixture with
+      | .ok value => pure value
+      | .error error => throw (IO.userError (toString error))
   milestone3Tests
 
   -- Fixed output layout and a compact full-file golden for the root module.
@@ -674,10 +691,39 @@ def main : IO UInt32 := do
   assert! sources.schema.contents.contains "abbrev Row := { value : Data // ValidPred value }"
   assert! sources.schema.contents.contains "users_id_positive"
   assert! sources.schema.contents.contains "Pgx.Constraint.evaluateCharacterTypmod (some (16))"
-  assert! !(sources.schema.contents.contains "users_pkey")
-  assert! !(sources.schema.contents.contains "users_email_key")
+  assert! sources.schema.contents.contains "users_pkey"
+  assert! sources.schema.contents.contains "users_email_key"
+  assert! sources.schema.contents.contains "constraints := #["
+  assert! sources.schema.contents.contains "indexes := #["
   assert! sources.constraints.contents.contains "def indexes : Array Pgx.IndexIR"
   assert! sources.constraints.contents.contains "localExpression := some ("
+  assert! sources.constraints.contents.contains "inductive Table where"
+  assert! sources.constraints.contents.contains "| auditUserEvents"
+  assert! sources.constraints.contents.contains "| appUsers"
+  assert! sources.constraints.contents.contains
+    "abbrev At (state : State) := Pgx.Logic.RowAt state .appUsers"
+  assert! sources.constraints.contents.contains
+    "namespace AppUsersUsersEmailKey"
+  assert! sources.constraints.contents.contains "structure Key where"
+  assert! sources.constraints.contents.contains
+    "Pgx.Logic.Constraint.Unique state .appUsers"
+  assert! sources.constraints.contents.contains
+    "Pgx.Logic.Constraint.PrimaryKey state .appUsers"
+  assert! sources.constraints.contents.contains "structure Semantics where"
+  assert! sources.constraints.contents.contains "structure IntegrityContext"
+  assert! sources.constraints.contents.contains "def modeledConstraints"
+  assert! sources.constraints.contents.contains "def unsupportedRelationalConstraints"
+  assert! unsupportedRelationalSources.constraints.contents.contains
+    "def unsupportedRelationalConstraints : Array (Pgx.ConstraintKey × String) :=\n  #[({ relation := { schema := \"app\", name := \"users\" }, name := \"users_parent_partial_fk\" }, \"MATCH PARTIAL semantics are not supported\")]"
+  assert! !(unsupportedRelationalSources.constraints.contents.contains
+    "namespace AppUsersUsersParentPartialFk")
+  assert! !(unsupportedRelationalSources.constraints.contents.contains
+    "AppUsersUsersParentPartialFk.Holds")
+  assert! sources.constraints.contents.contains "def insertSpec"
+  assert! sources.constraints.contents.contains "def deleteSpec"
+  assert! sources.constraints.contents.contains "def updateSpec"
+  assert! sources.constraints.contents.contains
+    "Live execution never manufactures one."
   assert! sources.queries.any (fun source =>
     source.contents.contains "Pgx.Typed.fetchOptional spec conn params")
   assert! sources.queries.any (fun source =>

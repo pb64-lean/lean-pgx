@@ -25,11 +25,12 @@ private abbrev schema : Schema := {
 private def state : State schema where
   rows
     | .items => #[0, 1]
-    | .parents => #[]
+    | .parents => #[()]
     | .children => #[()]
 
 private def firstItem : OccAt state .items := ⟨⟨0, by decide⟩⟩
 private def secondItem : OccAt state .items := ⟨⟨1, by decide⟩⟩
+private def onlyParent : OccAt state .parents := ⟨⟨0, by decide⟩⟩
 private def onlyChild : OccAt state .children := ⟨⟨0, by decide⟩⟩
 
 private theorem itemsDistinct : DistinctOccurrences firstItem secondItem := by
@@ -64,6 +65,14 @@ private theorem duplicateNullsNotDistinct :
   have conflict := unique firstItem secondItem itemsDistinct
   exact Bool.noConfusion conflict
 
+/-! Duplicate non-null keys violate ordinary UNIQUE semantics. -/
+private theorem duplicateNonNullsRejected :
+    ¬ Unique state .items (fun _ => (some 7 : Option Nat))
+      nullableUnique .distinct := by
+  intro unique
+  have conflict := unique firstItem secondItem itemsDistinct
+  exact Bool.noConfusion conflict
+
 private def primaryDistinct : PrimaryKeyComparator Nat := {
   allNotNull := fun _ => true
   equal := fun _ _ => .false
@@ -72,6 +81,11 @@ private def primaryDistinct : PrimaryKeyComparator Nat := {
 private def primaryNull : PrimaryKeyComparator Unit := {
   allNotNull := fun _ => false
   equal := fun _ _ => .false
+}
+
+private def primaryDuplicate : PrimaryKeyComparator Nat := {
+  allNotNull := fun _ => true
+  equal := fun _ _ => .true
 }
 
 private theorem primaryAcceptsNonNullDistinctKeys :
@@ -89,6 +103,13 @@ private theorem primaryRejectsNullKey :
   have nonnull := primary.1 firstItem
   exact Bool.noConfusion nonnull
 
+/-! A primary key rejects distinct occurrences with the same non-null key. -/
+private theorem primaryRejectsDuplicateNonNullKey :
+    ¬ PrimaryKey state .items (fun _ => 7) primaryDuplicate := by
+  intro primary
+  have conflict := primary.2 firstItem secondItem itemsDistinct
+  exact Bool.noConfusion conflict
+
 private def partialForeignKey : ForeignKeyComparator Unit Unit := {
   nullShape := fun _ => .partialNulls
   compare := fun _ _ => .false
@@ -98,6 +119,20 @@ private def allNullForeignKey : ForeignKeyComparator Unit Unit := {
   nullShape := fun _ => .allNulls
   compare := fun _ _ => .false
 }
+
+private def nonNullForeignKey : ForeignKeyComparator Unit Unit := {
+  nullShape := fun _ => .noNulls
+  compare := fun _ _ => .true
+}
+
+private def missingParentState : State schema where
+  rows
+    | .items => #[]
+    | .parents => #[]
+    | .children => #[()]
+
+private def missingParentChild : OccAt missingParentState .children :=
+  ⟨⟨0, by decide⟩⟩
 
 /-! MATCH SIMPLE exempts a key with even one null component. -/
 private theorem matchSimpleAcceptsPartialNull :
@@ -120,6 +155,21 @@ private theorem matchFullAcceptsAllNull :
       (fun _ => ()) allNullForeignKey := by
   intro child
   trivial
+
+/-! A non-null child key is accepted when an actual parent witnesses it. -/
+private theorem nonNullForeignKeyFindsParent :
+    ForeignKey state .children .parents .simple (fun _ => ())
+      (fun _ => ()) nonNullForeignKey := by
+  intro child
+  exact ⟨onlyParent, rfl⟩
+
+/-! A non-null child key is rejected when no parent occurrence can witness it. -/
+private theorem nonNullForeignKeyRejectsMissingParent :
+    ¬ ForeignKey missingParentState .children .parents .simple (fun _ => ())
+      (fun _ => ()) nonNullForeignKey := by
+  intro foreignKey
+  rcases foreignKey missingParentChild with ⟨parent, matched⟩
+  exact Fin.elim0 parent.index
 
 private def exclusionUnknown : ExclusionComparator Unit := {
   compare := fun _ _ => #[.true, .unknown]
@@ -172,11 +222,15 @@ def main : IO UInt32 := do
   assert! exclusionTrue.conflicts () () == true
   let _ := duplicateNullsDistinct
   let _ := duplicateNullsNotDistinct
+  let _ := duplicateNonNullsRejected
   let _ := primaryAcceptsNonNullDistinctKeys
   let _ := primaryRejectsNullKey
+  let _ := primaryRejectsDuplicateNonNullKey
   let _ := matchSimpleAcceptsPartialNull
   let _ := matchFullRejectsPartialNull
   let _ := matchFullAcceptsAllNull
+  let _ := nonNullForeignKeyFindsParent
+  let _ := nonNullForeignKeyRejectsMissingParent
   let _ := exclusionAcceptsUnknown
   let _ := exclusionAcceptsFalse
   let _ := exclusionRejectsAllTrue

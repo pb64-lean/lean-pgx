@@ -753,6 +753,7 @@ def lean_pg_library(
         deps = [
             "@lean-pgx//lean:pg_typed",
             "@lean-pgx//lean/Pgx/Constraint:semantics",
+            "@lean-pgx//lean/Pgx/Logic:logic",
         ] + (deps or []),
         visibility = visibility,
         **kwargs

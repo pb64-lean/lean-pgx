@@ -539,6 +539,8 @@ private structure CatalogRelation where
 private structure CatalogConstraint where
   oid : UInt32
   ir : Pgx.ConstraintIR
+  localColumnOrdinal : Nat := 0
+  referencedColumnOrdinal : Nat := 0
   /-- `conexclop`, kept separate until it can be aligned with the supporting
   index's normalized key elements. -/
   exclusionOperators : Array Pgx.OperatorKey := #[]
@@ -1486,7 +1488,16 @@ private def loadConstraints (conn : Pg.Connection)
             let value := constraints[index]!
             let expected := if referenced then value.ir.referencedColumns.size + 1
               else value.ir.columns.size + 1
-            unless ordinal == expected do
+            let lastOrdinal := if referenced then value.referencedColumnOrdinal
+              else value.localColumnOrdinal
+            -- `conkey` uses zero for an expression key.  The attribute join
+            -- omits those entries for exclusion constraints, while the rich
+            -- index key vector below retains their exact positions.
+            let ordinalValid := if !referenced && value.ir.kind == .exclusion then
+                ordinal > lastOrdinal
+              else
+                ordinal == expected
+            unless ordinalValid do
               return .error (.catalog s!"constraint {value.ir.relation}.{value.ir.name}: \
                 expected column ordinal {expected}, received {ordinal}")
             let ir := if referenced then
@@ -1494,7 +1505,11 @@ private def loadConstraints (conn : Pg.Connection)
                   referencedColumns := value.ir.referencedColumns.push name }
               else
                 { value.ir with columns := value.ir.columns.push name }
-            constraints := constraints.set! index { value with ir }
+            let updated := if referenced then
+                { value with ir, referencedColumnOrdinal := ordinal }
+              else
+                { value with ir, localColumnOrdinal := ordinal }
+            constraints := constraints.set! index updated
       match ← queryOne conn "read foreign-key delete-set columns"
           Adapter.constraintDeleteSetColumnSql with
       | .error error => return .error error
@@ -1661,7 +1676,7 @@ private def indexCatalogSql : String :=
   "ORDER BY i.indexrelid"
 
 private def indexColumnSql : String :=
-  "SELECT i.indexrelid::text, key.ordinality::text, " ++
+  "SELECT i.indexrelid, key.ordinality, " ++
   "(key.ordinality <= i.indnkeyatts)::text, a.attname, " ++
   "CASE WHEN key.attnum = 0 THEN " ++
   "pg_catalog.pg_get_indexdef(i.indexrelid, key.ordinality::integer, true) END, " ++
@@ -1675,9 +1690,9 @@ private def indexColumnSql : String :=
   "LEFT JOIN pg_catalog.pg_attribute AS a " ++
   "ON a.attrelid = i.indrelid AND a.attnum = key.attnum " ++
   "LEFT JOIN LATERAL pg_catalog.unnest(i.indcollation) " ++
-  "WITH ORDINALITY AS collation(oid, ordinality) " ++
-  "ON collation.ordinality = key.ordinality " ++
-  "LEFT JOIN pg_catalog.pg_collation AS coll ON coll.oid = collation.oid " ++
+  "WITH ORDINALITY AS coll_item(oid, ordinality) " ++
+  "ON coll_item.ordinality = key.ordinality " ++
+  "LEFT JOIN pg_catalog.pg_collation AS coll ON coll.oid = coll_item.oid " ++
   "LEFT JOIN pg_catalog.pg_namespace AS cns ON cns.oid = coll.collnamespace " ++
   "LEFT JOIN LATERAL pg_catalog.unnest(i.indclass) " ++
   "WITH ORDINALITY AS opclass(oid, ordinality) " ++

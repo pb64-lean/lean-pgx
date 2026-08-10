@@ -19,6 +19,48 @@ inductive ObligationTiming where
   | transactionEnd
   deriving Repr, BEq, DecidableEq, Inhabited
 
+/-- Static lifecycle facts recovered from `pg_constraint`.  They describe
+when a whole-state relational proposition may be required; they do not assert
+that the proposition holds for an external database. -/
+structure ConstraintLifecycle where
+  enforced : Bool := true
+  validated : Bool := true
+  deferrable : Bool := false
+  initiallyDeferred : Bool := false
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+namespace ConstraintLifecycle
+
+/-- PostgreSQL's default checking point before any transaction-local
+`SET CONSTRAINTS` override. -/
+def defaultTiming (lifecycle : ConstraintLifecycle) : ObligationTiming :=
+  if lifecycle.deferrable && lifecycle.initiallyDeferred then
+    .transactionEnd
+  else
+    .statementEnd
+
+/-- Phases at which generated whole-state integrity contexts are useful.
+`defaultStatementEnd` deliberately means the catalog's default timing; a
+transaction which changes a deferrable constraint's mode must select its own
+obligations explicitly. -/
+inductive Phase where
+  | existingSnapshot
+  | defaultStatementEnd
+  | transactionEnd
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+/-- Whether a supported constraint contributes a whole-state proposition at
+the selected phase.  `NOT VALID` constraints are excluded because PostgreSQL
+does not promise that pre-existing rows satisfy them. -/
+def requiresWholeState (lifecycle : ConstraintLifecycle) : Phase → Bool
+  | .existingSnapshot => lifecycle.enforced && lifecycle.validated
+  | .defaultStatementEnd =>
+      lifecycle.enforced && lifecycle.validated &&
+        lifecycle.defaultTiming == .statementEnd
+  | .transactionEnd => lifecycle.enforced && lifecycle.validated
+
+end ConstraintLifecycle
+
 /-- The primitive mutation classes used by generated transition metadata. -/
 inductive MutationKind where
   | insert
@@ -77,6 +119,35 @@ def pure (value : result) : DbSpec schema result where
 def transition (step : State schema → State schema) : DbSpec schema Unit where
   pre := fun _ => True
   post := fun before _ after => after = step before
+
+/-- Insert one logical occurrence and require an explicit post-state
+integrity predicate. -/
+def insert (table : schema.Table) (row : schema.Row table)
+    (integrity : State schema → Prop) : DbSpec schema Unit where
+  pre := fun _ => True
+  post := fun before _ after =>
+    after = before.insert table row ∧ integrity after
+
+/-- Delete one identified occurrence from a fixed pre-state.  Fixing the
+state keeps occurrence identity well-typed and makes the specification
+independent of any live PostgreSQL row identifier. -/
+def deleteOccurrence (before : State schema) (table : schema.Table)
+    (occurrence : OccAt before table) (integrity : State schema → Prop) :
+    DbSpec schema Unit where
+  pre := fun actual => actual = before
+  post := fun actual _ after =>
+    actual = before ∧
+      after = before.deleteOccurrence table occurrence ∧ integrity after
+
+/-- Update one identified occurrence in a fixed pre-state and require the
+chosen post-state integrity predicate. -/
+def updateOccurrence (before : State schema) (table : schema.Table)
+    (occurrence : OccAt before table) (replacement : schema.Row table)
+    (integrity : State schema → Prop) : DbSpec schema Unit where
+  pre := fun actual => actual = before
+  post := fun actual _ after =>
+    actual = before ∧
+      after = before.updateOccurrence table occurrence replacement ∧ integrity after
 
 end DbSpec
 

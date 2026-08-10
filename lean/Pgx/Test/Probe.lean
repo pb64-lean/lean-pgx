@@ -180,8 +180,8 @@ private def checkRelationalCatalogAdapters : IO Unit := do
   assert! Adapter.constraintOperatorSql.contains "con.conffeqop"
   assert! Adapter.constraintOperatorSql.contains "con.conexclop"
 
-private def checkInheritedNotNullNormalization : IO Unit := do
-  let inheritedNative : Pgx.ConstraintIR := {
+private def checkUnsafeNativeNotNullRejection : IO Unit := do
+  let unsafeNative : Pgx.ConstraintIR := {
     nativeNotNull with
     enforced := false
     validated := false
@@ -193,18 +193,27 @@ private def checkInheritedNotNullNormalization : IO Unit := do
     inheritanceCount := 1
     noInherit := true
   }
-  match Pg18.adapter.normalizeConstraints #[inheritedNative]
+  match Pg18.adapter.normalizeConstraints #[unsafeNative]
       #[{ relation, column := "email" }] with
-  | .error message => panic! message
-  | .ok #[normalized] => do
-      assert! normalized.name == "<not-null:email>"
-      assert! !normalized.enforced
-      assert! !normalized.validated
-      assert! !normalized.isLocal
-      assert! normalized.inheritanceCount == 1
-      assert! normalized.noInherit
-      assert! normalized.parent == inheritedNative.parent
-  | .ok _ => panic! "unexpected inherited NOT NULL normalization result"
+  | .error message =>
+      assert! message.contains "must be enforced and validated"
+  | .ok _ => panic! "PostgreSQL 18 accepted an unsafe native NOT NULL constraint"
+  match Pg18.adapter.normalizeConstraints
+      #[{ nativeNotNull with validated := false }]
+      #[{ relation, column := "email" }] with
+  | .error message =>
+      assert! message.contains "must be enforced and validated"
+  | .ok _ => panic! "PostgreSQL 18 accepted an unvalidated native NOT NULL constraint"
+  let collidingCheck : Pgx.ConstraintIR := {
+    relation
+    name := "<not-null:email>"
+    kind := .check
+  }
+  match Pg18.adapter.normalizeConstraints #[collidingCheck, nativeNotNull]
+      #[{ relation, column := "email" }] with
+  | .error message =>
+      assert! message.contains "duplicate normalized constraint identity"
+  | .ok _ => panic! "synthetic NOT NULL identity collision was accepted"
 
 def main : IO UInt32 := do
   assert! (validateConfig validConfig).isOk
@@ -283,7 +292,7 @@ def main : IO UInt32 := do
       constraint.kind == .notNull && constraint.columns == #["email"]
     | panic! "normalized email NOT NULL constraint is missing"
   assert! email.name == "<not-null:email>"
-  checkInheritedNotNullNormalization
+  checkUnsafeNativeNotNullRejection
   match Pg17.adapter.normalizeConstraints
       #[commonConstraint, nativeNotNull] attributeNotNull with
   | .error _ => pure ()

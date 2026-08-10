@@ -337,7 +337,7 @@ def main : IO UInt32 := do
   }
   assert! reversed.renderSnapshot == sampleDatabase.renderSnapshot
   assert! isError (DatabaseIR.parseSnapshot
-    (snapshot.replace "\"formatVersion\": 3" "\"formatVersion\": 99"))
+    (snapshot.replace "\"formatVersion\": 4" "\"formatVersion\": 99"))
 
   let manifest ← match Pgx.Codegen.Manifest.parse validManifest with
     | .ok manifest => pure manifest
