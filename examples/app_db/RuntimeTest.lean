@@ -404,6 +404,31 @@ private def exerciseStoredConstraintViolations
     "email_address_shape"
     (← AppDb.Queries.FindUserByEmail.run conn { email := "x" })
 
+  -- Return the relation-constraint catalog to the generated contract before
+  -- later fresh attachments.  The invalid rows have served their decoder
+  -- tests and must be removed before the validated table constraints can be
+  -- recreated.  This disposable fixture leaves the dropped domain CHECK in
+  -- place: PostgreSQL cannot add it back while an array of that domain exists,
+  -- and domain CHECKs are revalidated locally rather than attachment metadata.
+  let _ ← pg! "remove invalid stored-check fixtures" (← raw.exec
+    "DELETE FROM app.users WHERE email::text IN (\
+      'invalid-positive@example.com', 'invalid-row@example.com', \
+      'invalid-multicol@example.com', 'x')")
+  let _ ← pg! "remove negative organization fixture" (← raw.exec
+    "DELETE FROM app.organizations WHERE id = -1")
+  let _ ← pg! "restore NOT VALID CHECK fixture" (← raw.exec
+    "ALTER TABLE app.users \
+      ADD CONSTRAINT users_organization_id_positive \
+      CHECK (organization_id > 0) NOT VALID")
+  let _ ← pg! "restore display-name CHECK fixture" (← raw.exec
+    "ALTER TABLE app.users \
+      ADD CONSTRAINT users_display_name_not_blank \
+      CHECK (char_length(btrim(display_name)) > 0)")
+  let _ ← pg! "restore multi-column CHECK fixture" (← raw.exec
+    "ALTER TABLE app.users \
+      ADD CONSTRAINT users_disabled_name_required \
+      CHECK (status <> 'disabled'::app.user_status OR display_name IS NOT NULL)")
+
 private def expectQueryDrift
     (conn : Pgx.Typed.CheckedConnection AppDb.database) : Async Unit := do
   match ← AppDb.Queries.FindUserByEmail.run conn { email := "runtime@example.com" } with
@@ -425,6 +450,30 @@ private def expectSchemaDriftContaining (expected : String)
         fail s!"fresh attachment reported unrelated schema drift: {message}"
   | .error error => fail s!"fresh attachment returned the wrong error: {error}"
   | .ok _ => fail "fresh attachment unexpectedly accepted the drifted schema"
+
+private def exerciseRelationalMetadataDrift
+    (config : Pg.ConnectConfig) (raw : Pg.Connection) : Async Unit := do
+  let _ ← pg! "drift foreign-key checking phase" (← raw.exec
+    "ALTER TABLE app.user_profiles \
+      ALTER CONSTRAINT user_profiles_user_fk INITIALLY IMMEDIATE")
+  withConnection config (expectSchemaDriftContaining
+    "constraint metadata drift for app.user_profiles.user_profiles_user_fk")
+  let _ ← pg! "restore foreign-key checking phase" (← raw.exec
+    "ALTER TABLE app.user_profiles \
+      ALTER CONSTRAINT user_profiles_user_fk INITIALLY DEFERRED")
+  withConnection config fun conn => do
+    let _ ← attach! "reattach after restoring constraint metadata" conn
+    pure ()
+
+  let _ ← pg! "rename semantic unique index" (← raw.exec
+    "ALTER INDEX app.users_email_key RENAME TO users_email_key_drifted")
+  withConnection config (expectSchemaDriftContaining
+    "required relational index metadata is missing")
+  let _ ← pg! "restore semantic unique index name" (← raw.exec
+    "ALTER INDEX app.users_email_key_drifted RENAME TO users_email_key")
+  withConnection config fun conn => do
+    let _ ← attach! "reattach after restoring semantic index metadata" conn
+    pure ()
 
 private def exerciseSemanticMetadataDrift
     (config : Pg.ConnectConfig) (raw : Pg.Connection) : Async Unit := do
@@ -515,6 +564,7 @@ private def runAcceptance (options : Options) : Async Unit := do
     exerciseNullableCheck checked organizationId
     exerciseSelfJoinProvenance checked organizationId
     exerciseBroaderTypes checked
+    exerciseRelationalMetadataDrift config raw
     exerciseSemanticMetadataDrift config raw
     exerciseRangeMetadataDrift config raw
     exerciseStoredConstraintViolations raw checked organizationId

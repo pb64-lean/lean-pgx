@@ -46,7 +46,8 @@ CREATE TABLE app.type_samples (
   nickname app.citext NOT NULL,
   aliases app.citext[] NOT NULL,
   labels varchar(8)[] NOT NULL,
-  CONSTRAINT type_samples_pkey PRIMARY KEY (id)
+  CONSTRAINT type_samples_pkey PRIMARY KEY (id),
+  CONSTRAINT type_samples_score_excl EXCLUDE USING gist (score WITH &&)
 );
 
 CREATE VIEW app.type_sample_summary AS

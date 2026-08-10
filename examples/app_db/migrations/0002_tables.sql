@@ -41,7 +41,8 @@ CREATE TABLE app.user_profiles (
   updated_at timestamp with time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT user_profiles_pkey PRIMARY KEY (user_id),
   CONSTRAINT user_profiles_user_fk FOREIGN KEY (user_id)
-    REFERENCES app.users (id) ON DELETE CASCADE,
+    REFERENCES app.users (id) ON DELETE CASCADE
+    DEFERRABLE INITIALLY DEFERRED,
   CONSTRAINT user_profiles_avatar_present CHECK (avatar_url IS NOT NULL),
   CONSTRAINT user_profiles_bio_length CHECK (char_length(bio) <= 500)
 );

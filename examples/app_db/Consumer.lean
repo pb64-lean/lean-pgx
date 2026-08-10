@@ -71,6 +71,48 @@ theorem validateSchemaUserComplete
       AppDb.Schema.App.Users.validate value = .ok refined :=
   AppDb.Schema.App.Users.validate_complete valid
 
+/-! Milestone-4 state-indexed rows and relational specifications.  Comparator
+semantics remain explicit inputs and are never obtained from a live response. -/
+
+abbrev LogicalState := AppDb.Logic.State
+
+abbrev UserAt (state : LogicalState) :=
+  AppDb.Logic.App.Users.At state
+
+abbrev UserOccurrenceAt (state : LogicalState) :=
+  AppDb.Logic.App.Users.OccAt state
+
+def usersPrimaryKeyHolds
+    (semantics : AppDb.Logic.Semantics)
+    (state : LogicalState) : Prop :=
+  AppDb.Logic.AppUsersUsersPkey.Holds semantics state
+
+def usersOrganizationForeignKeyHolds
+    (semantics : AppDb.Logic.Semantics)
+    (state : LogicalState) : Prop :=
+  AppDb.Logic.AppUsersUsersOrganizationFk.Holds semantics state
+
+def typeSamplesScoreExclusionHolds
+    (semantics : AppDb.Logic.Semantics)
+    (state : LogicalState) : Prop :=
+  AppDb.Logic.AppTypeSamplesTypeSamplesScoreExcl.Holds semantics state
+
+def insertUserSpec
+    (semantics : AppDb.Logic.Semantics)
+    (phase : Pgx.Logic.ConstraintLifecycle.Phase)
+    (row : AppDb.Schema.App.Users.Data) :
+    Pgx.Logic.DbSpec AppDb.Logic.schema Unit :=
+  AppDb.Logic.App.Users.insertSpec semantics phase row
+
+def updateUserSpec
+    (semantics : AppDb.Logic.Semantics)
+    (phase : Pgx.Logic.ConstraintLifecycle.Phase)
+    (before : LogicalState)
+    (occurrence : UserOccurrenceAt before)
+    (replacement : AppDb.Schema.App.Users.Data) :
+    Pgx.Logic.DbSpec AppDb.Logic.schema Unit :=
+  AppDb.Logic.App.Users.updateSpec semantics phase before occurrence replacement
+
 /-! `execute`: branded and nullable parameter fields, with no result row. -/
 
 def createOrganizationId
