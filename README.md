@@ -46,6 +46,14 @@ checkouts. The local module pins PostgreSQL, `socat`, and the action lifecycle
 utilities through one Nix revision; the ordinary build does not use a
 developer or production database.
 
+Lake and Lean-aware editors use `nightly-2026-04-25`, the official toolchain
+built from the same upstream Lean commit (`24bef91f9a20a45f074729e869461d374687de1c`)
+as the Nix toolchain registered for Bazel. Install it with
+`elan toolchain install leanprover/lean4-nightly:nightly-2026-04-25` before
+opening the checkout, and restart an existing language server after changing
+toolchains. The `lean4-nightly` spelling is intentional: Lean4IJ maps the
+selector directly to Elan's on-disk nightly directory.
+
 ```starlark
 load(
     "@lean-pgx//bazel:defs.bzl",

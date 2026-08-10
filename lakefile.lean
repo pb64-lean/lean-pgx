@@ -11,21 +11,6 @@ package «lean-pgx» where
 
 require «pg-lean» from "../pg-lean"
 
-/- pg-lean's current Lake model omits the Tls library that its connection
-   module imports.  Expose the sibling source root here for editor builds;
-   Bazel continues to use tls13-lean's authoritative targets. -/
-lean_lib «Tls» where
-  srcDir := "../tls13-lean"
-  roots := #[
-    `Tls.Record,
-    `Tls.Record.Laws,
-    `Tls.Handshake,
-    `Tls.Client,
-    `Tls.Client.Laws,
-    `Tls.Server,
-    `Tls.Server.Laws
-  ]
-
 @[default_target]
 lean_lib «Pgx» where
   srcDir := "lean"
