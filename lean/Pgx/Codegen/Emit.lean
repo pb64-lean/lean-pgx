@@ -428,6 +428,76 @@ private def wireBaseRef (db : Pgx.DatabaseIR) (ref : Pgx.TypeRef) :
     Except CodegenError Pgx.TypeRef :=
   wireBaseRefAux db ref #[]
 
+/- `true` represents SQL NULL.  Domain expressions contain no column
+bindings, but retaining both states for a defensive forged column keeps this
+analysis conservative. -/
+private def strictNullStates (left right : Array Bool) : Array Bool := Id.run do
+  let mut states : Array Bool := #[]
+  for l in left do
+    for r in right do states := pushUnique states (l || r)
+  return states
+
+private partial def valueNullStates : Pgx.Constraint.ValueExpr → Array Bool
+  | .column .. => #[false, true]
+  | .domainValue .. => #[true]
+  | .literal .null _ => #[true]
+  | .literal _ _ => #[false]
+  | .cast _ value _ | .neg value _ | .charLength value _ | .btrim value _ =>
+      valueNullStates value
+  | .add left right _ | .sub left right _ | .position left right _ =>
+      strictNullStates (valueNullStates left) (valueNullStates right)
+
+private partial def booleanLiteralAtNull? : Pgx.Constraint.ValueExpr → Option Bool
+  | .literal (.boolean value) _ => some value
+  | .cast _ value _ => booleanLiteralAtNull? value
+  | _ => none
+
+private def combineTruthStates (left right : Array Pgx.Constraint.SqlTruth)
+    (combine : Pgx.Constraint.SqlTruth → Pgx.Constraint.SqlTruth →
+      Pgx.Constraint.SqlTruth) : Array Pgx.Constraint.SqlTruth := Id.run do
+  let mut states : Array Pgx.Constraint.SqlTruth := #[]
+  for l in left do
+    for r in right do states := pushUnique states (combine l r)
+  return states
+
+private partial def truthStatesAtNull : Pgx.Constraint.TruthExpr →
+    Array Pgx.Constraint.SqlTruth
+  | .constant none => #[.unknown]
+  | .constant (some true) => #[.true]
+  | .constant (some false) => #[.false]
+  | .fromBoolean value =>
+      match booleanLiteralAtNull? value with
+      | some true => #[.true]
+      | some false => #[.false]
+      | none => Id.run do
+        let mut states : Array Pgx.Constraint.SqlTruth := #[]
+        for isNull in valueNullStates value do
+          if isNull then states := pushUnique states .unknown
+          else
+            states := pushUnique (pushUnique states .true) .false
+        return states
+  | .compare _ left right => Id.run do
+      let mut states : Array Pgx.Constraint.SqlTruth := #[]
+      for l in valueNullStates left do
+        for r in valueNullStates right do
+          if l || r then states := pushUnique states .unknown
+          else states := pushUnique (pushUnique states .true) .false
+      return states
+  | .isNull value =>
+      valueNullStates value |>.map (fun isNull => if isNull then .true else .false)
+  | .isNotNull value =>
+      valueNullStates value |>.map (fun isNull => if isNull then .false else .true)
+  | .and left right =>
+      combineTruthStates (truthStatesAtNull left) (truthStatesAtNull right)
+        Pgx.Constraint.SqlTruth.conjunction
+  | .or left right =>
+      combineTruthStates (truthStatesAtNull left) (truthStatesAtNull right)
+        Pgx.Constraint.SqlTruth.disjunction
+  | .not value => truthStatesAtNull value |>.map (fun truth => truth.negate)
+
+private def constraintMayRejectNull (expression : Pgx.Constraint.TruthExpr) : Bool :=
+  (truthStatesAtNull expression).contains .false
+
 private partial def typeRejectsNullAux (db : Pgx.DatabaseIR) (key : Pgx.TypeKey)
     (seen : Array Pgx.TypeKey) : Bool :=
   if seen.contains key then false
@@ -435,7 +505,10 @@ private partial def typeRejectsNullAux (db : Pgx.DatabaseIR) (key : Pgx.TypeKey)
     match db.domain? key with
     | none => false
     | some domain =>
-        domain.notNull || typeRejectsNullAux db domain.base.key (seen.push key)
+        domain.notNull ||
+          domain.localConstraints.any (fun constraint =>
+            constraintMayRejectNull constraint.expression) ||
+          typeRejectsNullAux db domain.base.key (seen.push key)
 
 private def typeRejectsNull (db : Pgx.DatabaseIR) (key : Pgx.TypeKey) : Bool :=
   typeRejectsNullAux db key #[]

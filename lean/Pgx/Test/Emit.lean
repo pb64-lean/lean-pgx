@@ -58,6 +58,12 @@ private def emailConstraint : DomainConstraintIR := {
     (.cast .identity (.literal (.integer 0) int4Scalar) int4Scalar)
 }
 
+private def emailPresentConstraint : DomainConstraintIR := {
+  name := "email_present"
+  source := "CHECK ((VALUE IS NOT NULL))"
+  expression := .isNotNull (.domainValue emailScalar true)
+}
+
 private def userIdConstraint : DomainConstraintIR := {
   name := "user_id_positive"
   source := "CHECK ((VALUE > 0))"
@@ -93,9 +99,9 @@ private def fixtureBase : DatabaseIR := {
   }]
   domains := #[
     { key := reviewedStatusKey, base := ref statusKey, notNull := true },
-    { key := emailKey, base := text, notNull := true,
-      constraints := #[emailConstraint.source],
-      localConstraints := #[emailConstraint] },
+    { key := emailKey, base := text, notNull := false,
+      constraints := #[emailPresentConstraint.source, emailConstraint.source],
+      localConstraints := #[emailPresentConstraint, emailConstraint] },
     { key := userIdKey, base := int8, notNull := true,
       constraints := #[userIdConstraint.source],
       localConstraints := #[userIdConstraint] }
