@@ -1534,11 +1534,20 @@ private def emitRange (plan : NamingPlan) (db : Pgx.DatabaseIR)
     | throw (.unsupportedType value.key "range declaration")
   let localName := (named.leanType.splitOn ".").getLast!
   let subtype ← resolveTypeUse plan db value.subtype.key
-  let mut lines := [
-    s!"namespace {localName}",
-    "",
-    s!"abbrev Value := Pgx.Typed.PgRange ({subtype.leanType})",
-    "",
+  let rangeType := s!"Pgx.Typed.PgRange ({subtype.leanType})"
+  let boundCheck? := (typmodCheck? db value.subtype "item" true
+      s!"{value.key.display} bound type modifier").map fun check => {
+    check with
+    evaluate := s!"Pgx.Constraint.evaluateRangeBounds (fun item => {check.evaluate}) value"
+  }
+  let mut lines := [s!"namespace {localName}", ""]
+  match boundCheck? with
+  | some check =>
+      lines := lines ++ [s!"abbrev Data := {rangeType}", ""]
+      lines := lines ++ emitValidator "Data" "Value" #[check]
+  | none =>
+      lines := lines ++ [s!"abbrev Value := {rangeType}", ""]
+  lines := lines ++ [
     "def descriptor : Pgx.Typed.StaticTypeDesc :=",
     s!"  {typeDescExpr db value.key}",
     ""
@@ -1550,12 +1559,13 @@ private def emitRange (plan : NamingPlan) (db : Pgx.DatabaseIR)
     "  encode resolve _ value := do",
     "    let encoded ← Pgx.Typed.fromEncodeStringError <|",
     "      Pgx.Typed.encodeRangeText",
-    "        (fun item => Pgx.Typed.asStringError (encodeSubtype resolve item)) value",
+    s!"        (fun item => Pgx.Typed.asStringError (encodeSubtype resolve item)) \
+      {if boundCheck?.isSome then "value.val" else "value"}",
     "    pure { format := 0, value := some encoded.toUTF8 }",
     "  decode resolve _ format value := do",
     "    let some bytes := value",
     s!"      | throw (.decode {stringLiteral ("unexpected NULL for range " ++ value.key.display)})",
-    "    if format == 0 then",
+    "    let decoded ← if format == 0 then",
     "      let some text := String.fromUTF8? bytes",
     s!"        | throw (.decode {stringLiteral ("range text is not UTF-8 for " ++ value.key.display)})",
     "      Pgx.Typed.fromDecodeStringError <|",
@@ -1568,8 +1578,17 @@ private def emitRange (plan : NamingPlan) (db : Pgx.DatabaseIR)
     "          (fun oid item => Pgx.Typed.asStringError",
     "            (decodeSubtypeBinary resolve oid item)) bytes",
     "    else",
-    s!"      throw (.decode {stringLiteral ("unsupported wire format for range " ++ value.key.display)})",
-    "",
+    s!"      throw (.decode {stringLiteral ("unsupported wire format for range " ++ value.key.display)})"
+  ]
+  if boundCheck?.isSome then
+    lines := lines ++ [
+      "    match validate decoded with",
+      "    | .ok refined => pure refined",
+      "    | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)"
+    ]
+  else
+    lines := lines ++ ["    pure decoded"]
+  lines := lines ++ ["",
     s!"end {localName}",
     "",
     s!"abbrev {localName} := {localName}.Value",
@@ -1585,11 +1604,20 @@ private def emitMultirange (plan : NamingPlan) (db : Pgx.DatabaseIR)
     | throw (.malformedIR s!"multirange {value.key}" "linked range is absent")
   let localName := (named.leanType.splitOn ".").getLast!
   let subtype ← resolveTypeUse plan db range.subtype.key
-  let mut lines := [
-    s!"namespace {localName}",
-    "",
-    s!"abbrev Value := Pgx.Typed.PgMultirange ({subtype.leanType})",
-    "",
+  let multirangeType := s!"Pgx.Typed.PgMultirange ({subtype.leanType})"
+  let boundCheck? := (typmodCheck? db range.subtype "item" true
+      s!"{value.key.display} bound type modifier").map fun check => {
+    check with
+    evaluate := s!"Pgx.Constraint.evaluateMultirangeBounds (fun item => {check.evaluate}) value"
+  }
+  let mut lines := [s!"namespace {localName}", ""]
+  match boundCheck? with
+  | some check =>
+      lines := lines ++ [s!"abbrev Data := {multirangeType}", ""]
+      lines := lines ++ emitValidator "Data" "Value" #[check]
+  | none =>
+      lines := lines ++ [s!"abbrev Value := {multirangeType}", ""]
+  lines := lines ++ [
     "def descriptor : Pgx.Typed.StaticTypeDesc :=",
     s!"  {typeDescExpr db value.key}",
     ""
@@ -1601,12 +1629,13 @@ private def emitMultirange (plan : NamingPlan) (db : Pgx.DatabaseIR)
     "  encode resolve _ value := do",
     "    let encoded ← Pgx.Typed.fromEncodeStringError <|",
     "      Pgx.Typed.encodeMultirangeText",
-    "        (fun item => Pgx.Typed.asStringError (encodeSubtype resolve item)) value",
+    s!"        (fun item => Pgx.Typed.asStringError (encodeSubtype resolve item)) \
+      {if boundCheck?.isSome then "value.val" else "value"}",
     "    pure { format := 0, value := some encoded.toUTF8 }",
     "  decode resolve _ format value := do",
     "    let some bytes := value",
     s!"      | throw (.decode {stringLiteral ("unexpected NULL for multirange " ++ value.key.display)})",
-    "    if format == 0 then",
+    "    let decoded ← if format == 0 then",
     "      let some text := String.fromUTF8? bytes",
     s!"        | throw (.decode {stringLiteral ("multirange text is not UTF-8 for " ++ value.key.display)})",
     "      Pgx.Typed.fromDecodeStringError <|",
@@ -1619,8 +1648,17 @@ private def emitMultirange (plan : NamingPlan) (db : Pgx.DatabaseIR)
     "          (fun oid item => Pgx.Typed.asStringError",
     "            (decodeSubtypeBinary resolve oid item)) bytes",
     "    else",
-    s!"      throw (.decode {stringLiteral ("unsupported wire format for multirange " ++ value.key.display)})",
-    "",
+    s!"      throw (.decode {stringLiteral ("unsupported wire format for multirange " ++ value.key.display)})"
+  ]
+  if boundCheck?.isSome then
+    lines := lines ++ [
+      "    match validate decoded with",
+      "    | .ok refined => pure refined",
+      "    | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)"
+    ]
+  else
+    lines := lines ++ ["    pure decoded"]
+  lines := lines ++ ["",
     s!"end {localName}",
     "",
     s!"abbrev {localName} := {localName}.Value",

@@ -1,4 +1,5 @@
 import Pgx.Constraint.IR
+import Pgx.Typed.Containers
 import Pg.Types.Numeric
 import Pg.Types.Interval
 
@@ -139,6 +140,31 @@ def evaluateArrayElements
 occur as elements of an array of that domain. -/
 def arrayElementsNotNull (values : Array (Option α)) : SqlTruth :=
   if values.any (fun value => value.isNone) then .false else .true
+
+/-- Apply a scalar refinement to every finite bound of a range.  Infinite
+bounds and the distinguished empty range contain no scalar value to check. -/
+def evaluateRangeBounds
+    (evaluate : Option α → Except EvaluationError SqlTruth) :
+    Pgx.Typed.PgRange α → Except EvaluationError SqlTruth
+  | .empty => pure .true
+  | .span lower upper => do
+      let lowerTruth ← match lower with
+        | none => pure .true
+        | some bound => evaluate (some bound.value)
+      let upperTruth ← match upper with
+        | none => pure .true
+        | some bound => evaluate (some bound.value)
+      pure (lowerTruth.conjunction upperTruth)
+
+/-- Apply a scalar refinement to all finite bounds of every range in a
+multirange. -/
+def evaluateMultirangeBounds
+    (evaluate : Option α → Except EvaluationError SqlTruth)
+    (values : Pgx.Typed.PgMultirange α) : Except EvaluationError SqlTruth := do
+  let mut result := SqlTruth.true
+  for value in values do
+    result := result.conjunction (← evaluateRangeBounds evaluate value)
+  pure result
 
 def equalNullable [BEq α] (left right : Option α) : SqlTruth :=
   match left, right with

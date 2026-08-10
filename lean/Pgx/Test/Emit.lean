@@ -420,9 +420,9 @@ private def m3Fixture : DatabaseIR := {
   }]
   ranges := #[{
     key := scoreRangeKey
-    subtype := int4
+    subtype := time
     multirange := scoreMultirangeKey
-    subtypeOpclass := { schema := "pg_catalog", name := "int4_ops" }
+    subtypeOpclass := { schema := "pg_catalog", name := "time_ops" }
   }]
   multiranges := #[{
     key := scoreMultirangeKey
@@ -553,11 +553,15 @@ private def milestone3Tests : IO Unit := do
   assert! sources.types.contents.contains "Pgx.Typed.renderCompositeText"
   assert! sources.types.contents.contains "Pgx.Typed.parseCompositeTextArity 7"
   assert! sources.types.contents.contains
-    "abbrev Value := Pgx.Typed.PgRange (Int32)"
+    "abbrev Data := Pgx.Typed.PgRange (Std.Time.PlainTime)"
+  assert! sources.types.contents.contains
+    "evaluateRangeBounds (fun item => Pgx.Constraint.evaluateTimeTypmod (none)"
   assert! sources.types.contents.contains "rangeMultirange := some ("
   assert! sources.types.contents.contains "Pgx.Typed.decodeRangeBinary subtype.oid"
   assert! sources.types.contents.contains
-    "abbrev Value := Pgx.Typed.PgMultirange (Int32)"
+    "abbrev Data := Pgx.Typed.PgMultirange (Std.Time.PlainTime)"
+  assert! sources.types.contents.contains
+    "evaluateMultirangeBounds (fun item => Pgx.Constraint.evaluateTimeTypmod (none)"
   assert! sources.types.contents.contains "multirangeRange := some ("
   assert! sources.types.contents.contains "Pgx.Typed.decodeMultirangeBinary subtype.oid"
 

@@ -138,6 +138,18 @@ def main : IO UInt32 := do
   assert! okEq (evaluateTimestampTypmod none (some 999)) .false
   assert! okEq (evaluateTimeTypmod (some 0) none) .unknown
 
+  let alignedRange : Pgx.Typed.PgRange Int :=
+    .span (some { value := 1000, inclusive := true })
+      (some { value := 2000, inclusive := false })
+  let lossyRange : Pgx.Typed.PgRange Int :=
+    .span (some { value := 999, inclusive := true }) none
+  assert! okEq (evaluateRangeBounds (evaluateTimeTypmod none) alignedRange) .true
+  assert! okEq (evaluateRangeBounds (evaluateTimeTypmod none) lossyRange) .false
+  assert! okEq (evaluateRangeBounds (evaluateTimeTypmod none)
+    (Pgx.Typed.PgRange.empty : Pgx.Typed.PgRange Int)) .true
+  assert! okEq (evaluateMultirangeBounds (evaluateTimeTypmod none)
+    #[alignedRange, lossyRange]) .false
+
   -- Interval range and precision share one Int32.  Full range with precision
   -- three is (0x7fff << 16) | 3; 0xffff means full precision.
   assert! okEq (decodeRawIntervalPrecisionTypmod (-1)) (none : Option Nat)

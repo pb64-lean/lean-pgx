@@ -16,6 +16,7 @@ lean_library(
     srcs = ["Semantics.lean"],
     deps = [
         ":ir",
+        "//lean/Pgx/Typed:containers",
         "@pg_lean//:pg_lean",
     ],
     strip_module_prefix = "lean",
