@@ -261,6 +261,101 @@ def tag : ConstraintKind → String
 
 end ConstraintKind
 
+/-- Whether nulls compare as distinct values for a unique index/constraint. -/
+inductive UniqueNullPolicy where
+  | distinct
+  | notDistinct
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+namespace UniqueNullPolicy
+
+def tag : UniqueNullPolicy → String
+  | .distinct => "distinct"
+  | .notDistinct => "not-distinct"
+
+end UniqueNullPolicy
+
+inductive ForeignKeyMatch where
+  | simple
+  | full
+  | partialMatch
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+namespace ForeignKeyMatch
+
+def tag : ForeignKeyMatch → String
+  | .simple => "simple"
+  | .full => "full"
+  | .partialMatch => "partial"
+
+end ForeignKeyMatch
+
+inductive ForeignKeyAction where
+  | noAction
+  | restrict
+  | cascade
+  | setNull
+  | setDefault
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+namespace ForeignKeyAction
+
+def tag : ForeignKeyAction → String
+  | .noAction => "no-action"
+  | .restrict => "restrict"
+  | .cascade => "cascade"
+  | .setNull => "set-null"
+  | .setDefault => "set-default"
+
+end ForeignKeyAction
+
+inductive IndexOrder where
+  | ascending
+  | descending
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+namespace IndexOrder
+
+def tag : IndexOrder → String
+  | .ascending => "ascending"
+  | .descending => "descending"
+
+end IndexOrder
+
+inductive IndexNullsOrder where
+  | first
+  | last
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+namespace IndexNullsOrder
+
+def tag : IndexNullsOrder → String
+  | .first => "first"
+  | .last => "last"
+
+end IndexNullsOrder
+
+/-- One key (not INCLUDE) element of a normalized index definition.  A key
+is either a named column or an expression.  The resolved equality operator is
+retained explicitly: relational uniqueness must not be inferred from Lean's
+equality for the decoded column type. -/
+structure IndexKeyElementIR where
+  ordinal : Nat
+  column : Option String := none
+  expression : Option String := none
+  collation : Option CollationKey := none
+  opclass : Option QualifiedName := none
+  equalityOperator : Option OperatorKey := none
+  order : IndexOrder := .ascending
+  nullsOrder : IndexNullsOrder := .last
+  deriving Repr, BEq, Inhabited
+
+/-- One aligned element of an exclusion constraint. -/
+structure ExclusionElementIR where
+  key : IndexKeyElementIR
+  operator : OperatorKey
+  deriving Repr, BEq, Inhabited
+
 structure ConstraintIR where
   relation : RelationKey
   name : String
@@ -272,19 +367,73 @@ structure ConstraintIR where
   /-- Typed local expression for `.check`; cross-row and non-check kinds keep
   this field empty and are never misrepresented as row predicates. -/
   localExpression : Option Pgx.Constraint.TruthExpr := none
+  enforced : Bool := true
   validated : Bool := true
+  deferrable : Bool := false
+  initiallyDeferred : Bool := false
+  /-- Parent constraint for a partition or inheritance child. -/
+  parent : Option ConstraintKey := none
+  isLocal : Bool := true
+  inheritanceCount : Nat := 0
+  noInherit : Bool := false
+  period : Bool := false
+  /-- Index implementing a primary, unique, foreign-key, or exclusion
+  constraint when PostgreSQL records one. -/
+  supportingIndex : Option IndexKey := none
+  uniqueNullPolicy : UniqueNullPolicy := .distinct
+  foreignKeyMatch : ForeignKeyMatch := .simple
+  foreignKeyOnUpdate : ForeignKeyAction := .noAction
+  foreignKeyOnDelete : ForeignKeyAction := .noAction
+  /-- Referencing columns affected by a `DELETE ... SET NULL/DEFAULT` action.
+  This collection is set-like, unlike the aligned key/operator vectors. -/
+  foreignKeyDeleteSetColumns : Array String := #[]
+  /-- Equality operators aligned with the key columns (`conpfeqop`). -/
+  referencedToReferencingOperators : Array OperatorKey := #[]
+  /-- Referenced-key equality operators (`conppeqop`). -/
+  referencedEqualityOperators : Array OperatorKey := #[]
+  /-- Referencing-key equality operators (`conffeqop`). -/
+  referencingEqualityOperators : Array OperatorKey := #[]
+  exclusionElements : Array ExclusionElementIR := #[]
   deriving Repr, BEq, Inhabited
+
+namespace ConstraintIR
+
+def key (constraint : ConstraintIR) : ConstraintKey := {
+  relation := constraint.relation
+  name := constraint.name
+}
+
+end ConstraintIR
 
 structure IndexIR where
   relation : RelationKey
   name : String
   unique : Bool
   primary : Bool
+  exclusion : Bool := false
   valid : Bool
+  immediate : Bool := true
+  ready : Bool := true
+  live : Bool := true
+  uniqueNullPolicy : UniqueNullPolicy := .distinct
+  accessMethod : Option String := none
   columns : Array String := #[]
+  keyElements : Array IndexKeyElementIR := #[]
+  /-- Non-key INCLUDE columns, separated using `indnkeyatts`.  They do not
+  participate in uniqueness or exclusion semantics. -/
+  includedColumns : Array String := #[]
   predicate : Option String := none
   expression : Option String := none
   deriving Repr, BEq, Inhabited
+
+namespace IndexIR
+
+def key (index : IndexIR) : IndexKey := {
+  schema := index.relation.schema
+  name := index.name
+}
+
+end IndexIR
 
 inductive Cardinality where
   | execute
@@ -381,9 +530,9 @@ structure ExtensionCodecPackageIR where
   deriving Repr, BEq, Inhabited
 
 structure DatabaseIR where
-  /-- Version 3 adds symbolic component types, semantic view/routine metadata,
-  and extension-codec package provenance. -/
-  formatVersion : Nat := 3
+  /-- Version 4 adds normalized symbolic relational-constraint and supporting
+  index semantics. -/
+  formatVersion : Nat := 4
   serverMajor : Nat
   /-- Server majors which passed the generated contract's compatibility
   checks.  Empty is retained only for snapshots written before this field was
@@ -439,6 +588,16 @@ private def routineKeyAtom (key : RoutineKey) : String :=
   atom key.schema ++ atom key.name ++ arrayAtom typeRefAtom key.inputTypes
 
 private def qualifiedNameAtom (key : QualifiedName) : String :=
+  atom key.schema ++ atom key.name
+
+private def operatorKeyAtom (key : OperatorKey) : String :=
+  atom key.schema ++ atom key.name ++ typeKeyAtom key.leftType ++
+    typeKeyAtom key.rightType
+
+private def constraintKeyAtom (key : ConstraintKey) : String :=
+  relationKeyAtom key.relation ++ atom key.name
+
+private def indexKeyAtom (key : IndexKey) : String :=
   atom key.schema ++ atom key.name
 
 private def schemaAtom (schema : SchemaIR) : String :=
@@ -583,17 +742,42 @@ private def routineAtom (value : RoutineIR) : String :=
     boolAtom value.dynamicRecord ++ boolAtom value.strict ++
     atom value.volatility ++ atom value.parallel ++ boolAtom value.securityDefiner
 
+private def indexKeyElementAtom (value : IndexKeyElementIR) : String :=
+  atom (toString value.ordinal) ++ optionAtom atom value.column ++
+    optionAtom atom value.expression ++ optionAtom collationKeyAtom value.collation ++
+    optionAtom qualifiedNameAtom value.opclass ++
+    optionAtom operatorKeyAtom value.equalityOperator ++ atom value.order.tag ++
+    atom value.nullsOrder.tag
+
+private def exclusionElementAtom (value : ExclusionElementIR) : String :=
+  indexKeyElementAtom value.key ++ operatorKeyAtom value.operator
+
 private def constraintAtom (value : ConstraintIR) : String :=
   relationKeyAtom value.relation ++ atom value.name ++ atom value.kind.tag ++
     arrayAtom id value.columns ++ optionAtom relationKeyAtom value.referencedRelation ++
     arrayAtom id value.referencedColumns ++ optionAtom atom value.expression ++
     optionAtom truthExprAtom value.localExpression ++
-    boolAtom value.validated
+    boolAtom value.enforced ++ boolAtom value.validated ++
+    boolAtom value.deferrable ++ boolAtom value.initiallyDeferred ++
+    optionAtom constraintKeyAtom value.parent ++ boolAtom value.isLocal ++
+    atom (toString value.inheritanceCount) ++ boolAtom value.noInherit ++
+    boolAtom value.period ++ optionAtom indexKeyAtom value.supportingIndex ++
+    atom value.uniqueNullPolicy.tag ++ atom value.foreignKeyMatch.tag ++
+    atom value.foreignKeyOnUpdate.tag ++ atom value.foreignKeyOnDelete.tag ++
+    arrayAtom id value.foreignKeyDeleteSetColumns ++
+    arrayAtom operatorKeyAtom value.referencedToReferencingOperators ++
+    arrayAtom operatorKeyAtom value.referencedEqualityOperators ++
+    arrayAtom operatorKeyAtom value.referencingEqualityOperators ++
+    arrayAtom exclusionElementAtom value.exclusionElements
 
 private def indexAtom (value : IndexIR) : String :=
   relationKeyAtom value.relation ++ atom value.name ++ boolAtom value.unique ++
-    boolAtom value.primary ++ boolAtom value.valid ++ arrayAtom id value.columns ++
-    optionAtom atom value.predicate ++ optionAtom atom value.expression
+    boolAtom value.primary ++ boolAtom value.exclusion ++ boolAtom value.valid ++
+    boolAtom value.immediate ++ boolAtom value.ready ++ boolAtom value.live ++
+    atom value.uniqueNullPolicy.tag ++ optionAtom atom value.accessMethod ++
+    arrayAtom id value.columns ++ arrayAtom indexKeyElementAtom value.keyElements ++
+    arrayAtom id value.includedColumns ++ optionAtom atom value.predicate ++
+    optionAtom atom value.expression
 
 private def overrideAtom (value : TypeOverrideIR) : String :=
   typeKeyAtom value.key ++ atom value.leanType ++ atom value.codec ++
@@ -651,6 +835,20 @@ private def paramLess (left right : ParamIR) : Bool :=
       | .gt => false
       | .eq => compare (paramAtom left) (paramAtom right) == Ordering.lt
 
+private def indexKeyElementLess
+    (left right : IndexKeyElementIR) : Bool :=
+  match compare left.ordinal right.ordinal with
+  | .lt => true
+  | .gt => false
+  | .eq => compare (indexKeyElementAtom left) (indexKeyElementAtom right) == Ordering.lt
+
+private def exclusionElementLess
+    (left right : ExclusionElementIR) : Bool :=
+  match compare left.key.ordinal right.key.ordinal with
+  | .lt => true
+  | .gt => false
+  | .eq => compare (exclusionElementAtom left) (exclusionElementAtom right) == Ordering.lt
+
 private def normalizeDomain (domain : DomainIR) : DomainIR :=
   { domain with
     constraints := sortByAtom id domain.constraints
@@ -674,16 +872,30 @@ private def normalizeComposite (value : CompositeIR) : CompositeIR :=
 private def normalizePackage (value : ExtensionCodecPackageIR) : ExtensionCodecPackageIR :=
   { value with types := sortByAtom typeKeyAtom value.types }
 
+private def normalizeConstraint (value : ConstraintIR) : ConstraintIR :=
+  { value with
+    foreignKeyDeleteSetColumns :=
+      sortByAtom id value.foreignKeyDeleteSetColumns
+    exclusionElements :=
+      value.exclusionElements.toList.mergeSort exclusionElementLess |>.toArray }
+
+private def normalizeIndex (value : IndexIR) : IndexIR :=
+  { value with
+    keyElements := value.keyElements.toList.mergeSort indexKeyElementLess |>.toArray
+    includedColumns := sortByAtom id value.includedColumns }
+
 /-- Put every unordered IR collection in a stable order before serialization.
 Arrays whose order is part of PostgreSQL semantics (including enum labels,
-query result columns, constraint/index columns, and `search_path`) are
-deliberately preserved. -/
+query result columns, constraint/index columns, aligned operator vectors, and
+`search_path`) are deliberately preserved. -/
 def DatabaseIR.normalize (db : DatabaseIR) : DatabaseIR :=
   let domains := db.domains.map normalizeDomain
   let composites := db.composites.map normalizeComposite
   let relations := db.relations.map normalizeRelation
   let queries := db.queries.map normalizeQuery
   let packages := db.extensionCodecPackages.map normalizePackage
+  let constraints := db.constraints.map normalizeConstraint
+  let indexes := db.indexes.map normalizeIndex
   { db with
     supportedServerMajors := sortNats db.supportedServerMajors
     serverFeatures := sortByAtom id db.serverFeatures
@@ -697,8 +909,8 @@ def DatabaseIR.normalize (db : DatabaseIR) : DatabaseIR :=
     relations := sortByAtom relationAtom relations
     views := sortByAtom viewAtom db.views
     routines := sortByAtom routineAtom db.routines
-    constraints := sortByAtom constraintAtom db.constraints
-    indexes := sortByAtom indexAtom db.indexes
+    constraints := sortByAtom constraintAtom constraints
+    indexes := sortByAtom indexAtom indexes
     queries := sortByAtom queryAtom queries
     requiredExtensions := sortByAtom (fun value => atom value.1 ++ atom value.2)
       db.requiredExtensions
@@ -718,7 +930,8 @@ private def databaseMaterial (includeServerMajor : Bool) (db : DatabaseIR) : Str
     arrayAtom relationAtom db.relations ++ arrayAtom viewAtom db.views ++
     arrayAtom routineAtom db.routines ++
     arrayAtom constraintAtom db.constraints ++
-    arrayAtom indexAtom (db.indexes.filter fun value => value.unique || value.primary) ++
+    arrayAtom indexAtom (db.indexes.filter fun value =>
+      value.unique || value.primary || value.exclusion) ++
     arrayAtom queryAtom db.queries ++ arrayAtom (fun value =>
       atom value.1 ++ atom value.2) db.requiredExtensions ++
     arrayAtom overrideAtom db.typeOverrides ++

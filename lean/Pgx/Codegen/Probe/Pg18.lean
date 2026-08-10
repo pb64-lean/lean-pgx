@@ -7,6 +7,8 @@ the shared adapter boundary canonicalizes them before emission. -/
 def adapter : Adapter := {
   serverMajor := 18
   notNullCatalog := .nativeConstraint
+  constraintEnforcementCatalog := true
+  temporalConstraintCatalog := true
 }
 
 end Pgx.Codegen.Probe.Pg18

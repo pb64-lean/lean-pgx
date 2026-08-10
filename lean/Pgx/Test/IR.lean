@@ -14,6 +14,27 @@ private def status : TypeRef :=
 private def positiveId : TypeRef :=
   { key := { schema := "app", name := "positive_id", kind := .domain } }
 
+private def int4Eq : OperatorKey := {
+  schema := "pg_catalog"
+  name := "="
+  leftType := int4.key
+  rightType := int4.key
+}
+
+private def int4Ne : OperatorKey := {
+  schema := "pg_catalog"
+  name := "<>"
+  leftType := int4.key
+  rightType := int4.key
+}
+
+private def int4IndexElement (ordinal : Nat) (column : String) : IndexKeyElementIR := {
+  ordinal
+  column := some column
+  opclass := some { schema := "pg_catalog", name := "int4_ops" }
+  equalityOperator := some int4Eq
+}
+
 private def statusArrayKey : TypeKey :=
   { schema := "app", name := "_status", kind := .array }
 
@@ -95,8 +116,19 @@ private def sample : DatabaseIR := {
     name := "users_pkey"
     kind := .primaryKey
     columns := #["id"]
+    supportingIndex := some { schema := "app", name := "users_pkey" }
   }]
-  indexes := #[]
+  indexes := #[{
+    relation := { schema := "app", name := "users" }
+    name := "users_pkey"
+    unique := true
+    primary := true
+    valid := true
+    accessMethod := some "btree"
+    columns := #["id"]
+    keyElements := #[int4IndexElement 1 "id"]
+    includedColumns := #["status"]
+  }]
   queries := #[{
     name := "GetUser"
     sql := "select id from app.users where id = $1"
@@ -159,6 +191,14 @@ private def shuffledFixture : DatabaseIR := {
     name := "events_actor_not_null"
     kind := .notNull
     columns := #["actor"]
+    parent := some {
+      relation := { schema := "app", name := "users" }
+      name := "users_pkey"
+    }
+    isLocal := false
+    inheritanceCount := 1
+    noInherit := true
+    period := true
   }
   indexes := #[
     {
@@ -168,6 +208,11 @@ private def shuffledFixture : DatabaseIR := {
       primary := false
       valid := true
       columns := #["id"]
+      keyElements := #[
+        int4IndexElement 2 "status",
+        int4IndexElement 1 "id"
+      ]
+      includedColumns := #["status", "id"]
     },
     {
       relation := { schema := "audit", name := "events" }
@@ -219,8 +264,14 @@ private def shuffled (db : DatabaseIR) : DatabaseIR := {
     { relation with columns := relation.columns.reverse }
   views := db.views.reverse
   routines := db.routines.reverse
-  constraints := db.constraints.reverse
-  indexes := db.indexes.reverse
+  constraints := db.constraints.reverse.map fun constraint =>
+    { constraint with
+      foreignKeyDeleteSetColumns := constraint.foreignKeyDeleteSetColumns.reverse
+      exclusionElements := constraint.exclusionElements.reverse }
+  indexes := db.indexes.reverse.map fun index =>
+    { index with
+      keyElements := index.keyElements.reverse
+      includedColumns := index.includedColumns.reverse }
   queries := db.queries.reverse.map fun query =>
     { query with
       params := query.params.reverse
@@ -232,7 +283,98 @@ private def shuffled (db : DatabaseIR) : DatabaseIR := {
     { package with types := package.types.reverse }
 }
 
+private def foreignKeyConstraint : ConstraintIR := {
+  relation := { schema := "app", name := "orders" }
+  name := "orders_user_fkey"
+  kind := .foreignKey
+  columns := #["tenant_id", "user_id"]
+  referencedRelation := some { schema := "app", name := "users" }
+  referencedColumns := #["tenant_id", "id"]
+  enforced := true
+  validated := false
+  deferrable := true
+  initiallyDeferred := true
+  parent := some {
+    relation := { schema := "app", name := "orders_parent" }
+    name := "orders_parent_user_fkey"
+  }
+  isLocal := false
+  inheritanceCount := 1
+  period := true
+  supportingIndex := some { schema := "app", name := "users_tenant_id_key" }
+  foreignKeyMatch := .full
+  foreignKeyOnUpdate := .cascade
+  foreignKeyOnDelete := .setNull
+  foreignKeyDeleteSetColumns := #["user_id", "tenant_id"]
+  referencedToReferencingOperators := #[int4Eq, int4Ne]
+  referencedEqualityOperators := #[int4Eq, int4Ne]
+  referencingEqualityOperators := #[int4Ne, int4Eq]
+}
+
+private def exclusionConstraint : ConstraintIR := {
+  relation := { schema := "app", name := "bookings" }
+  name := "bookings_no_overlap"
+  kind := .exclusion
+  columns := #["room_id", "during"]
+  supportingIndex := some { schema := "app", name := "bookings_no_overlap" }
+  exclusionElements := #[
+    { key := int4IndexElement 2 "during", operator := int4Ne },
+    { key := int4IndexElement 1 "room_id", operator := int4Eq }
+  ]
+}
+
+private def exclusionIndex : IndexIR := {
+  relation := { schema := "app", name := "bookings" }
+  name := "bookings_no_overlap"
+  unique := false
+  primary := false
+  exclusion := true
+  valid := true
+  immediate := false
+  ready := true
+  live := true
+  accessMethod := some "gist"
+  columns := #["room_id", "during"]
+  keyElements := #[
+    int4IndexElement 2 "during",
+    int4IndexElement 1 "room_id"
+  ]
+  includedColumns := #["owner_id", "note"]
+}
+
+private def uniqueConstraint : ConstraintIR := {
+  relation := { schema := "app", name := "users" }
+  name := "users_tenant_id_key"
+  kind := .unique
+  columns := #["tenant_id", "id"]
+  supportingIndex := some { schema := "app", name := "users_tenant_id_key" }
+  uniqueNullPolicy := .notDistinct
+}
+
+private def uniqueIndex : IndexIR := {
+  relation := { schema := "app", name := "users" }
+  name := "users_tenant_id_key"
+  unique := true
+  primary := false
+  valid := true
+  uniqueNullPolicy := .notDistinct
+  accessMethod := some "btree"
+  columns := #["tenant_id", "id"]
+  keyElements := #[
+    int4IndexElement 1 "tenant_id",
+    int4IndexElement 2 "id"
+  ]
+}
+
+private def relationalFixture : DatabaseIR := {
+  sample with
+  constraints := sample.constraints ++
+    #[uniqueConstraint, foreignKeyConstraint, exclusionConstraint]
+  indexes := sample.indexes ++ #[uniqueIndex, exclusionIndex]
+}
+
 def main : IO UInt32 := do
+  assert! sample.formatVersion == 4
   assert! sample.contractHash.length == 64
   assert! sample.compatibilityHash.length == 64
   assert! sample.contractHash == sample.contractHash
@@ -273,6 +415,62 @@ def main : IO UInt32 := do
   assert! shuffledFixture.normalize == reordered.normalize
   assert! shuffledFixture.contractHash == reordered.contractHash
   assert! shuffledFixture.compatibilityHash == reordered.compatibilityHash
+  let reorderedRelational := shuffled relationalFixture
+  assert! relationalFixture.normalize == reorderedRelational.normalize
+  assert! relationalFixture.contractHash == reorderedRelational.contractHash
+  let changedFkAction : DatabaseIR := {
+    relationalFixture with
+    constraints := relationalFixture.constraints.map fun constraint =>
+      if constraint.name == "orders_user_fkey" then
+        { constraint with foreignKeyOnDelete := .cascade }
+      else constraint
+  }
+  assert! relationalFixture.contractHash != changedFkAction.contractHash
+  let changedOperatorVector : DatabaseIR := {
+    relationalFixture with
+    constraints := relationalFixture.constraints.map fun constraint =>
+      if constraint.name == "orders_user_fkey" then
+        { constraint with
+          referencedToReferencingOperators :=
+            constraint.referencedToReferencingOperators.reverse }
+      else constraint
+  }
+  assert! relationalFixture.contractHash != changedOperatorVector.contractHash
+  let changedEqualityOperator : DatabaseIR := {
+    relationalFixture with
+    indexes := relationalFixture.indexes.map fun index =>
+      if index.name == "users_tenant_id_key" then
+        { index with keyElements := index.keyElements.map fun element =>
+            if element.ordinal == 1 then
+              { element with equalityOperator := some int4Ne }
+            else element }
+      else index
+  }
+  assert! relationalFixture.contractHash != changedEqualityOperator.contractHash
+  let changedNullPolicy : DatabaseIR := {
+    relationalFixture with
+    constraints := relationalFixture.constraints.map fun constraint =>
+      if constraint.name == "users_tenant_id_key" then
+        { constraint with uniqueNullPolicy := .distinct }
+      else constraint
+  }
+  assert! relationalFixture.contractHash != changedNullPolicy.contractHash
+  let changedExclusionState : DatabaseIR := {
+    relationalFixture with
+    indexes := relationalFixture.indexes.map fun index =>
+      if index.name == "bookings_no_overlap" then
+        { index with ready := false }
+      else index
+  }
+  assert! relationalFixture.contractHash != changedExclusionState.contractHash
+  let changedIncludes : DatabaseIR := {
+    relationalFixture with
+    indexes := relationalFixture.indexes.map fun index =>
+      if index.name == "users_tenant_id_key" then
+        { index with includedColumns := index.includedColumns.push "display_name" }
+      else index
+  }
+  assert! relationalFixture.contractHash != changedIncludes.contractHash
   let previousMajor : DatabaseIR := { sample with serverMajor := 17 }
   assert! sample.contractHash != previousMajor.contractHash
   assert! sample.compatibilityHash == previousMajor.compatibilityHash

@@ -243,6 +243,49 @@ instance : FromJson QualifiedName where
       name := ← requiredField json "name"
     }
 
+instance : ToJson OperatorKey where
+  toJson value := Json.mkObj [
+    ("schema", toJson value.schema),
+    ("name", toJson value.name),
+    ("leftType", toJson value.leftType),
+    ("rightType", toJson value.rightType)
+  ]
+
+instance : FromJson OperatorKey where
+  fromJson? json := do
+    pure {
+      schema := ← requiredField json "schema"
+      name := ← requiredField json "name"
+      leftType := ← requiredField json "leftType"
+      rightType := ← requiredField json "rightType"
+    }
+
+instance : ToJson ConstraintKey where
+  toJson value := Json.mkObj [
+    ("relation", toJson value.relation),
+    ("name", toJson value.name)
+  ]
+
+instance : FromJson ConstraintKey where
+  fromJson? json := do
+    pure {
+      relation := ← requiredField json "relation"
+      name := ← requiredField json "name"
+    }
+
+instance : ToJson IndexKey where
+  toJson value := Json.mkObj [
+    ("schema", toJson value.schema),
+    ("name", toJson value.name)
+  ]
+
+instance : FromJson IndexKey where
+  fromJson? json := do
+    pure {
+      schema := ← requiredField json "schema"
+      name := ← requiredField json "name"
+    }
+
 instance : ToJson RangeIR where
   toJson value := Json.mkObj [
     ("key", toJson value.key),
@@ -754,6 +797,93 @@ instance : FromJson ConstraintKind where
     | "exclusion" => some .exclusion
     | _ => none
 
+instance : ToJson UniqueNullPolicy where
+  toJson value := Json.str value.tag
+
+instance : FromJson UniqueNullPolicy where
+  fromJson? := tagFromJson "unique null policy" fun
+    | "distinct" => some .distinct
+    | "not-distinct" => some .notDistinct
+    | _ => none
+
+instance : ToJson ForeignKeyMatch where
+  toJson value := Json.str value.tag
+
+instance : FromJson ForeignKeyMatch where
+  fromJson? := tagFromJson "foreign-key match type" fun
+    | "simple" => some .simple
+    | "full" => some .full
+    | "partial" => some .partialMatch
+    | _ => none
+
+instance : ToJson ForeignKeyAction where
+  toJson value := Json.str value.tag
+
+instance : FromJson ForeignKeyAction where
+  fromJson? := tagFromJson "foreign-key action" fun
+    | "no-action" => some .noAction
+    | "restrict" => some .restrict
+    | "cascade" => some .cascade
+    | "set-null" => some .setNull
+    | "set-default" => some .setDefault
+    | _ => none
+
+instance : ToJson IndexOrder where
+  toJson value := Json.str value.tag
+
+instance : FromJson IndexOrder where
+  fromJson? := tagFromJson "index order" fun
+    | "ascending" => some .ascending
+    | "descending" => some .descending
+    | _ => none
+
+instance : ToJson IndexNullsOrder where
+  toJson value := Json.str value.tag
+
+instance : FromJson IndexNullsOrder where
+  fromJson? := tagFromJson "index nulls order" fun
+    | "first" => some .first
+    | "last" => some .last
+    | _ => none
+
+instance : ToJson IndexKeyElementIR where
+  toJson value := Json.mkObj [
+    ("ordinal", toJson value.ordinal),
+    ("column", toJson value.column),
+    ("expression", toJson value.expression),
+    ("collation", toJson value.collation),
+    ("opclass", toJson value.opclass),
+    ("equalityOperator", toJson value.equalityOperator),
+    ("order", toJson value.order),
+    ("nullsOrder", toJson value.nullsOrder)
+  ]
+
+instance : FromJson IndexKeyElementIR where
+  fromJson? json := do
+    pure {
+      ordinal := ← requiredField json "ordinal"
+      column := ← optionalField json "column" none
+      expression := ← optionalField json "expression" none
+      collation := ← optionalField json "collation" none
+      opclass := ← optionalField json "opclass" none
+      equalityOperator := ← optionalField json "equalityOperator" none
+      order := ← optionalField json "order" .ascending
+      nullsOrder := ← optionalField json "nullsOrder" .last
+    }
+
+instance : ToJson ExclusionElementIR where
+  toJson value := Json.mkObj [
+    ("key", toJson value.key),
+    ("operator", toJson value.operator)
+  ]
+
+instance : FromJson ExclusionElementIR where
+  fromJson? json := do
+    pure {
+      key := ← requiredField json "key"
+      operator := ← requiredField json "operator"
+    }
+
 instance : ToJson ConstraintIR where
   toJson value := Json.mkObj [
     ("relation", toJson value.relation),
@@ -764,7 +894,26 @@ instance : ToJson ConstraintIR where
     ("referencedColumns", toJson value.referencedColumns),
     ("expression", toJson value.expression),
     ("localExpression", toJson value.localExpression),
-    ("validated", toJson value.validated)
+    ("enforced", toJson value.enforced),
+    ("validated", toJson value.validated),
+    ("deferrable", toJson value.deferrable),
+    ("initiallyDeferred", toJson value.initiallyDeferred),
+    ("parent", toJson value.parent),
+    ("isLocal", toJson value.isLocal),
+    ("inheritanceCount", toJson value.inheritanceCount),
+    ("noInherit", toJson value.noInherit),
+    ("period", toJson value.period),
+    ("supportingIndex", toJson value.supportingIndex),
+    ("uniqueNullPolicy", toJson value.uniqueNullPolicy),
+    ("foreignKeyMatch", toJson value.foreignKeyMatch),
+    ("foreignKeyOnUpdate", toJson value.foreignKeyOnUpdate),
+    ("foreignKeyOnDelete", toJson value.foreignKeyOnDelete),
+    ("foreignKeyDeleteSetColumns", toJson value.foreignKeyDeleteSetColumns),
+    ("referencedToReferencingOperators",
+      toJson value.referencedToReferencingOperators),
+    ("referencedEqualityOperators", toJson value.referencedEqualityOperators),
+    ("referencingEqualityOperators", toJson value.referencingEqualityOperators),
+    ("exclusionElements", toJson value.exclusionElements)
   ]
 
 instance : FromJson ConstraintIR where
@@ -778,7 +927,29 @@ instance : FromJson ConstraintIR where
       referencedColumns := ← optionalField json "referencedColumns" #[]
       expression := ← optionalField json "expression" none
       localExpression := ← optionalField json "localExpression" none
+      enforced := ← optionalField json "enforced" true
       validated := ← optionalField json "validated" true
+      deferrable := ← optionalField json "deferrable" false
+      initiallyDeferred := ← optionalField json "initiallyDeferred" false
+      parent := ← optionalField json "parent" none
+      isLocal := ← optionalField json "isLocal" true
+      inheritanceCount := ← optionalField json "inheritanceCount" 0
+      noInherit := ← optionalField json "noInherit" false
+      period := ← optionalField json "period" false
+      supportingIndex := ← optionalField json "supportingIndex" none
+      uniqueNullPolicy := ← optionalField json "uniqueNullPolicy" .distinct
+      foreignKeyMatch := ← optionalField json "foreignKeyMatch" .simple
+      foreignKeyOnUpdate := ← optionalField json "foreignKeyOnUpdate" .noAction
+      foreignKeyOnDelete := ← optionalField json "foreignKeyOnDelete" .noAction
+      foreignKeyDeleteSetColumns :=
+        ← optionalField json "foreignKeyDeleteSetColumns" #[]
+      referencedToReferencingOperators :=
+        ← optionalField json "referencedToReferencingOperators" #[]
+      referencedEqualityOperators :=
+        ← optionalField json "referencedEqualityOperators" #[]
+      referencingEqualityOperators :=
+        ← optionalField json "referencingEqualityOperators" #[]
+      exclusionElements := ← optionalField json "exclusionElements" #[]
     }
 
 instance : ToJson IndexIR where
@@ -787,8 +958,16 @@ instance : ToJson IndexIR where
     ("name", toJson value.name),
     ("unique", toJson value.unique),
     ("primary", toJson value.primary),
+    ("exclusion", toJson value.exclusion),
     ("valid", toJson value.valid),
+    ("immediate", toJson value.immediate),
+    ("ready", toJson value.ready),
+    ("live", toJson value.live),
+    ("uniqueNullPolicy", toJson value.uniqueNullPolicy),
+    ("accessMethod", toJson value.accessMethod),
     ("columns", toJson value.columns),
+    ("keyElements", toJson value.keyElements),
+    ("includedColumns", toJson value.includedColumns),
     ("predicate", toJson value.predicate),
     ("expression", toJson value.expression)
   ]
@@ -800,8 +979,16 @@ instance : FromJson IndexIR where
       name := ← requiredField json "name"
       unique := ← requiredField json "unique"
       primary := ← requiredField json "primary"
+      exclusion := ← optionalField json "exclusion" false
       valid := ← requiredField json "valid"
+      immediate := ← optionalField json "immediate" true
+      ready := ← optionalField json "ready" true
+      live := ← optionalField json "live" true
+      uniqueNullPolicy := ← optionalField json "uniqueNullPolicy" .distinct
+      accessMethod := ← optionalField json "accessMethod" none
       columns := ← optionalField json "columns" #[]
+      keyElements := ← optionalField json "keyElements" #[]
+      includedColumns := ← optionalField json "includedColumns" #[]
       predicate := ← optionalField json "predicate" none
       expression := ← optionalField json "expression" none
     }
@@ -1056,7 +1243,7 @@ def renderSnapshotCompact (database : DatabaseIR) : String :=
 def parseSnapshotJson (json : Json) : Except String DatabaseIR := do
   let database : DatabaseIR ← fromJson? json
   if database.formatVersion == 1 || database.formatVersion == 2 ||
-      database.formatVersion == 3 then
+      database.formatVersion == 3 || database.formatVersion == 4 then
     pure database.normalize
   else
     throw s!"unsupported Pgx IR format version {database.formatVersion}"

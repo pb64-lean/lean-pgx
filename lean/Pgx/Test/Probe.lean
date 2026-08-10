@@ -145,6 +145,67 @@ private def twoRelationPlan : String :=
   "\"Schema\":\"app\",\"Relation Name\":\"profiles\"," ++
   "\"Alias\":\"p\"}]}]}}]"
 
+private def checkRelationalCatalogAdapters : IO Unit := do
+  assert! !Pg17.adapter.supportsNativeNotNull
+  assert! Pg18.adapter.supportsNativeNotNull
+  assert! !Pg17.adapter.supportsConstraintEnforcement
+  assert! Pg18.adapter.supportsConstraintEnforcement
+  assert! !Pg17.adapter.supportsTemporalConstraints
+  assert! Pg18.adapter.supportsTemporalConstraints
+  assert! !Pg17.adapter.constraintTypeTags.contains "n"
+  assert! Pg18.adapter.constraintTypeTags.contains "n"
+  for adapter in #[Pg17.adapter, Pg18.adapter] do
+    let sql := adapter.constraintCatalogSql
+    assert! sql.contains "pg_catalog.pg_depend"
+    assert! sql.contains "pg_catalog.pg_proc"
+    assert! sql.contains "pg_catalog.pg_operator"
+    assert! sql.contains "pg_catalog.pg_constraint'::pg_catalog.regclass"
+    assert! sql.contains "con.condeferrable"
+    assert! sql.contains "con.condeferred"
+    assert! sql.contains "con.conparentid"
+    assert! sql.contains "con.conislocal"
+    assert! sql.contains "con.coninhcount"
+    assert! sql.contains "con.connoinherit"
+    assert! sql.contains "con.confmatchtype"
+    assert! sql.contains "con.confupdtype"
+    assert! sql.contains "con.confdeltype"
+    assert! sql.contains "i.indnullsnotdistinct"
+  assert! !Pg17.adapter.constraintCatalogSql.contains "con.conenforced"
+  assert! !Pg17.adapter.constraintCatalogSql.contains "con.conperiod"
+  assert! Pg18.adapter.constraintCatalogSql.contains "con.conenforced"
+  assert! Pg18.adapter.constraintCatalogSql.contains "con.conperiod"
+  assert! Adapter.constraintDeleteSetColumnSql.contains "con.confdelsetcols"
+  assert! Adapter.constraintOperatorSql.contains "con.conpfeqop"
+  assert! Adapter.constraintOperatorSql.contains "con.conppeqop"
+  assert! Adapter.constraintOperatorSql.contains "con.conffeqop"
+  assert! Adapter.constraintOperatorSql.contains "con.conexclop"
+
+private def checkInheritedNotNullNormalization : IO Unit := do
+  let inheritedNative : Pgx.ConstraintIR := {
+    nativeNotNull with
+    enforced := false
+    validated := false
+    parent := some {
+      relation := { schema := "app", name := "parent_users" }
+      name := "parent_email_required"
+    }
+    isLocal := false
+    inheritanceCount := 1
+    noInherit := true
+  }
+  match Pg18.adapter.normalizeConstraints #[inheritedNative]
+      #[{ relation, column := "email" }] with
+  | .error message => panic! message
+  | .ok #[normalized] => do
+      assert! normalized.name == "<not-null:email>"
+      assert! !normalized.enforced
+      assert! !normalized.validated
+      assert! !normalized.isLocal
+      assert! normalized.inheritanceCount == 1
+      assert! normalized.noInherit
+      assert! normalized.parent == inheritedNative.parent
+  | .ok _ => panic! "unexpected inherited NOT NULL normalization result"
+
 def main : IO UInt32 := do
   assert! (validateConfig validConfig).isOk
   assert! (validateConfig packageConfig).isOk
@@ -175,16 +236,7 @@ def main : IO UInt32 := do
   assert! rendered.contains "category=unsupported-function"
   assert! rendered.contains "offset=7"
   assert! rendered.contains unsupportedSource
-  assert! !Pg17.adapter.supportsNativeNotNull
-  assert! Pg18.adapter.supportsNativeNotNull
-  assert! !Pg17.adapter.constraintTypeTags.contains "n"
-  assert! Pg18.adapter.constraintTypeTags.contains "n"
-  for adapter in #[Pg17.adapter, Pg18.adapter] do
-    let sql := adapter.constraintCatalogSql
-    assert! sql.contains "pg_catalog.pg_depend"
-    assert! sql.contains "pg_catalog.pg_proc"
-    assert! sql.contains "pg_catalog.pg_operator"
-    assert! sql.contains "pg_catalog.pg_constraint'::pg_catalog.regclass"
+  checkRelationalCatalogAdapters
   let dependencySource := "CHECK (btrim(display_name) <> '')"
   match validateLocalConstraintDependencies "app.users" "name_check"
       dependencySource true false with
@@ -231,6 +283,7 @@ def main : IO UInt32 := do
       constraint.kind == .notNull && constraint.columns == #["email"]
     | panic! "normalized email NOT NULL constraint is missing"
   assert! email.name == "<not-null:email>"
+  checkInheritedNotNullNormalization
   match Pg17.adapter.normalizeConstraints
       #[commonConstraint, nativeNotNull] attributeNotNull with
   | .error _ => pure ()

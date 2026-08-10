@@ -263,6 +263,22 @@ private def parseConstraintKind (adapter : Adapter) (context value : String) :
       s!"{context}: PostgreSQL {adapter.serverMajor} adapter does not support \
         constraint kind {value}")
 
+private def parseForeignKeyMatch (context : String) : String →
+    Except Error Pgx.ForeignKeyMatch
+  | "s" => pure .simple
+  | "f" => pure .full
+  | "p" => pure .partialMatch
+  | value => throw (.catalog s!"{context}: unknown foreign-key match type {value}")
+
+private def parseForeignKeyAction (context : String) : String →
+    Except Error Pgx.ForeignKeyAction
+  | "a" => pure .noAction
+  | "r" => pure .restrict
+  | "c" => pure .cascade
+  | "n" => pure .setNull
+  | "d" => pure .setDefault
+  | value => throw (.catalog s!"{context}: unknown foreign-key action {value}")
+
 private def kindSql (alias : String) : String :=
   s!"CASE WHEN {alias}.typcategory = 'A' AND {alias}.typelem <> 0 \
      AND {alias}.typinput = 'pg_catalog.array_in'::pg_catalog.regproc \
@@ -523,10 +539,14 @@ private structure CatalogRelation where
 private structure CatalogConstraint where
   oid : UInt32
   ir : Pgx.ConstraintIR
+  /-- `conexclop`, kept separate until it can be aligned with the supporting
+  index's normalized key elements. -/
+  exclusionOperators : Array Pgx.OperatorKey := #[]
   deriving Inhabited
 
 private structure CatalogIndex where
   oid : UInt32
+  key : Pgx.IndexKey
   ir : Pgx.IndexIR
   deriving Inhabited
 
@@ -593,6 +613,15 @@ private def typeRefByOid (types : Array CatalogType) (context : String)
   let some value := typeByOid? types oid
     | throw (.catalog s!"{context}: OID {oid} does not identify a catalog type")
   pure { key := value.key, typmod }
+
+private def operatorKeyByOperandOids (types : Array CatalogType)
+    (context schema name : String) (leftOid rightOid : UInt32) :
+    Except Error Pgx.OperatorKey := do
+  let some left := typeByOid? types leftOid
+    | throw (.catalog s!"{context}: operator {schema}.{name} has missing left type OID {leftOid}")
+  let some right := typeByOid? types rightOid
+    | throw (.catalog s!"{context}: operator {schema}.{name} has missing right type OID {rightOid}")
+  pure { schema, name, leftType := left.key, rightType := right.key }
 
 private def relationByKey? (relations : Array CatalogRelation)
     (key : Pgx.RelationKey) : Option CatalogRelation :=
@@ -1321,6 +1350,8 @@ private def loadViews (conn : Pg.Connection) (schemas : Array String)
 private def loadConstraints (conn : Pg.Connection)
     (adapter : Adapter)
     (relations : Array CatalogRelation)
+    (types : Array CatalogType)
+    (indexes : Array CatalogIndex)
     (enums : Array Pgx.EnumIR)
     (domains : Array Pgx.DomainIR) :
     Async (Except Error (Array Pgx.ConstraintIR)) := do
@@ -1353,6 +1384,60 @@ private def loadConstraints (conn : Pg.Connection)
           (← cell "read pg_constraint" row 9)
         let operatorDependency ← parseBool "read pg_constraint"
           (← cell "read pg_constraint" row 10)
+        let enforced ← parseBool "read pg_constraint"
+          (← cell "read pg_constraint" row 11)
+        let deferrable ← parseBool "read pg_constraint"
+          (← cell "read pg_constraint" row 12)
+        let initiallyDeferred ← parseBool "read pg_constraint"
+          (← cell "read pg_constraint" row 13)
+        if initiallyDeferred && !deferrable then
+          throw (.catalog s!"constraint {relation}.{name} is initially deferred but not deferrable")
+        let parentSchema ← cell? "read pg_constraint" row 14
+        let parentRelationName ← cell? "read pg_constraint" row 15
+        let parentName ← cell? "read pg_constraint" row 16
+        let parent ← match parentSchema, parentRelationName, parentName with
+          | none, none, none => pure none
+          | some schema, some relationName, some name => pure (some {
+              relation := { schema, name := relationName }
+              name
+            })
+          | _, _, _ => throw (.catalog
+              "read pg_constraint: incomplete parent constraint identity")
+        let isLocal ← parseBool "read pg_constraint"
+          (← cell "read pg_constraint" row 17)
+        let inheritanceCount ← parseNat "read pg_constraint"
+          (← cell "read pg_constraint" row 18)
+        let noInherit ← parseBool "read pg_constraint"
+          (← cell "read pg_constraint" row 19)
+        let period ← parseBool "read pg_constraint"
+          (← cell "read pg_constraint" row 20)
+        let indexSchema ← cell? "read pg_constraint" row 21
+        let indexName ← cell? "read pg_constraint" row 22
+        let supportingIndex ← match indexSchema, indexName with
+          | none, none => pure none
+          | some schema, some name => pure (some { schema, name })
+          | _, _ => throw (.catalog
+              "read pg_constraint: incomplete supporting index identity")
+        let foreignKeyMatch ← match ← cell? "read pg_constraint" row 23 with
+          | some value => parseForeignKeyMatch "read pg_constraint" value
+          | none =>
+            if kind == .foreignKey then
+              throw (.catalog s!"foreign key {relation}.{name} has no match type")
+            else pure .simple
+        let foreignKeyOnUpdate ← match ← cell? "read pg_constraint" row 24 with
+          | some value => parseForeignKeyAction "read pg_constraint" value
+          | none =>
+            if kind == .foreignKey then
+              throw (.catalog s!"foreign key {relation}.{name} has no update action")
+            else pure .noAction
+        let foreignKeyOnDelete ← match ← cell? "read pg_constraint" row 25 with
+          | some value => parseForeignKeyAction "read pg_constraint" value
+          | none =>
+            if kind == .foreignKey then
+              throw (.catalog s!"foreign key {relation}.{name} has no delete action")
+            else pure .noAction
+        let nullsNotDistinct ← parseBool "read pg_constraint"
+          (← cell "read pg_constraint" row 26)
         let localExpression ← if kind == .check then
           let some source := expression
             | throw (.catalog s!"check constraint {relation}.{name} has no definition")
@@ -1369,7 +1454,11 @@ private def loadConstraints (conn : Pg.Connection)
               throw (.unsupportedConstraint relation.display name source diagnostic)
         else pure none
         pure { oid, ir := {
-          relation, name, kind, referencedRelation, expression, localExpression, validated
+          relation, name, kind, referencedRelation, expression, localExpression
+          enforced, validated, deferrable, initiallyDeferred, parent, isLocal
+          inheritanceCount, noInherit, period, supportingIndex
+          uniqueNullPolicy := if nullsNotDistinct then .notDistinct else .distinct
+          foreignKeyMatch, foreignKeyOnUpdate, foreignKeyOnDelete
         } }
       match parsed with
       | .error error => return .error error
@@ -1380,25 +1469,169 @@ private def loadConstraints (conn : Pg.Connection)
     | .error error => pure (.error error)
     | .ok columnRows =>
       for row in columnRows.rows do
-        let parsed : Except Error (UInt32 × Bool × String) := do
+        let parsed : Except Error (UInt32 × Bool × Nat × String) := do
           pure (← parseUInt32 "read constraint columns"
               (← cell "read constraint columns" row 0),
             ← parseBool "read constraint columns"
               (← cell "read constraint columns" row 1),
+            ← parseNat "read constraint columns"
+              (← cell "read constraint columns" row 2),
             ← cell "read constraint columns" row 3)
         match parsed with
         | .error error => return .error error
-        | .ok (oid, referenced, name) =>
+        | .ok (oid, referenced, ordinal, name) =>
           match constraints.findIdx? (fun value => value.oid == oid) with
           | none => pure ()
           | some index =>
             let value := constraints[index]!
+            let expected := if referenced then value.ir.referencedColumns.size + 1
+              else value.ir.columns.size + 1
+            unless ordinal == expected do
+              return .error (.catalog s!"constraint {value.ir.relation}.{value.ir.name}: \
+                expected column ordinal {expected}, received {ordinal}")
             let ir := if referenced then
-              { value.ir with
-                referencedColumns := value.ir.referencedColumns.push name }
-            else
-              { value.ir with columns := value.ir.columns.push name }
+                { value.ir with
+                  referencedColumns := value.ir.referencedColumns.push name }
+              else
+                { value.ir with columns := value.ir.columns.push name }
             constraints := constraints.set! index { value with ir }
+      match ← queryOne conn "read foreign-key delete-set columns"
+          Adapter.constraintDeleteSetColumnSql with
+      | .error error => return .error error
+      | .ok deleteRows =>
+        for row in deleteRows.rows do
+          let parsed : Except Error (UInt32 × Nat × String) := do
+            pure (← parseUInt32 "read foreign-key delete-set columns"
+                (← cell "read foreign-key delete-set columns" row 0),
+              ← parseNat "read foreign-key delete-set columns"
+                (← cell "read foreign-key delete-set columns" row 1),
+              ← cell "read foreign-key delete-set columns" row 2)
+          match parsed with
+          | .error error => return .error error
+          | .ok (oid, ordinal, name) =>
+            match constraints.findIdx? (fun value => value.oid == oid) with
+            | none => pure ()
+            | some index =>
+              let value := constraints[index]!
+              let expected := value.ir.foreignKeyDeleteSetColumns.size + 1
+              unless ordinal == expected do
+                return .error (.catalog s!"foreign key {value.ir.relation}.{value.ir.name}: \
+                  expected delete-set column ordinal {expected}, received {ordinal}")
+              constraints := constraints.set! index { value with ir := {
+                value.ir with foreignKeyDeleteSetColumns :=
+                  value.ir.foreignKeyDeleteSetColumns.push name
+              } }
+      match ← queryOne conn "read constraint operators"
+          Adapter.constraintOperatorSql with
+      | .error error => return .error error
+      | .ok operatorRows =>
+        for row in operatorRows.rows do
+          let parsed : Except Error (UInt32 × String × Nat × Pgx.OperatorKey) := do
+            let oid ← parseUInt32 "read constraint operators"
+              (← cell "read constraint operators" row 0)
+            let vector ← cell "read constraint operators" row 1
+            let ordinal ← parseNat "read constraint operators"
+              (← cell "read constraint operators" row 2)
+            let _ ← parseUInt32 "read constraint operators"
+              (← cell "read constraint operators" row 3)
+            let schema ← cell "read constraint operators" row 4
+            let name ← cell "read constraint operators" row 5
+            let leftOid ← parseUInt32 "read constraint operators"
+              (← cell "read constraint operators" row 6)
+            let rightOid ← parseUInt32 "read constraint operators"
+              (← cell "read constraint operators" row 7)
+            let key ← operatorKeyByOperandOids types "read constraint operators"
+              schema name leftOid rightOid
+            pure (oid, vector, ordinal, key)
+          match parsed with
+          | .error error => return .error error
+          | .ok (oid, vector, ordinal, key) =>
+            match constraints.findIdx? (fun value => value.oid == oid) with
+            | none => pure ()
+            | some index =>
+              let value := constraints[index]!
+              let current := match vector with
+                | "pf" => some value.ir.referencedToReferencingOperators
+                | "pp" => some value.ir.referencedEqualityOperators
+                | "ff" => some value.ir.referencingEqualityOperators
+                | "exclude" => some value.exclusionOperators
+                | _ => none
+              let some current := current
+                | return .error (.catalog s!"constraint {value.ir.relation}.{value.ir.name}: \
+                    unknown operator vector {vector}")
+              unless ordinal == current.size + 1 do
+                return .error (.catalog s!"constraint {value.ir.relation}.{value.ir.name}: \
+                  expected {vector} operator ordinal {current.size + 1}, received {ordinal}")
+              let updated := match vector with
+                | "pf" => { value with ir := { value.ir with
+                    referencedToReferencingOperators := current.push key } }
+                | "pp" => { value with ir := { value.ir with
+                    referencedEqualityOperators := current.push key } }
+                | "ff" => { value with ir := { value.ir with
+                    referencingEqualityOperators := current.push key } }
+                | "exclude" => { value with exclusionOperators := current.push key }
+                | _ => value
+              constraints := constraints.set! index updated
+      for index in [:constraints.size] do
+        let value := constraints[index]!
+        let checked : Except Error Pgx.ConstraintIR := match value.ir.kind with
+          | .primaryKey | .unique => do
+            let some key := value.ir.supportingIndex
+              | throw (.catalog s!"constraint {value.ir.relation}.{value.ir.name} has no supporting index")
+            let some supporting := indexes.find? (fun index => index.key == key)
+              | throw (.catalog s!"constraint {value.ir.relation}.{value.ir.name} refers to missing index {key}")
+            unless supporting.ir.relation == value.ir.relation do
+              throw (.catalog s!"constraint {value.ir.relation}.{value.ir.name} is backed by index {key} on {supporting.ir.relation}")
+            unless supporting.ir.uniqueNullPolicy == value.ir.uniqueNullPolicy do
+              throw (.catalog s!"constraint {value.ir.relation}.{value.ir.name} disagrees with index {key} on null uniqueness")
+            unless supporting.ir.keyElements.size == value.ir.columns.size do
+              throw (.catalog s!"constraint {value.ir.relation}.{value.ir.name} has \
+                {value.ir.columns.size} columns but index {key} has \
+                {supporting.ir.keyElements.size} key elements")
+            pure value.ir
+          | .foreignKey => do
+            unless value.ir.referencedRelation.isSome do
+              throw (.catalog s!"foreign key {value.ir.relation}.{value.ir.name} has no referenced relation")
+            let width := value.ir.columns.size
+            unless width > 0 && value.ir.referencedColumns.size == width do
+              throw (.catalog s!"foreign key {value.ir.relation}.{value.ir.name} has unaligned key columns")
+            unless value.ir.referencedToReferencingOperators.size == width &&
+                value.ir.referencedEqualityOperators.size == width &&
+                value.ir.referencingEqualityOperators.size == width do
+              throw (.catalog s!"foreign key {value.ir.relation}.{value.ir.name} has unaligned equality-operator vectors")
+            for name in value.ir.foreignKeyDeleteSetColumns do
+              unless value.ir.columns.contains name do
+                throw (.catalog s!"foreign key {value.ir.relation}.{value.ir.name} has unknown delete-set column {name}")
+            let some key := value.ir.supportingIndex
+              | throw (.catalog s!"foreign key {value.ir.relation}.{value.ir.name} has no referenced index")
+            unless indexes.any (fun index => index.key == key) do
+              throw (.catalog s!"foreign key {value.ir.relation}.{value.ir.name} refers to missing index {key}")
+            pure value.ir
+          | .exclusion => do
+            let some key := value.ir.supportingIndex
+              | throw (.catalog s!"exclusion constraint {value.ir.relation}.{value.ir.name} has no supporting index")
+            let some supporting := indexes.find? (fun index => index.key == key)
+              | throw (.catalog s!"exclusion constraint {value.ir.relation}.{value.ir.name} refers to missing index {key}")
+            unless supporting.ir.relation == value.ir.relation do
+              throw (.catalog s!"exclusion constraint {value.ir.relation}.{value.ir.name} is backed by index {key} on {supporting.ir.relation}")
+            unless supporting.ir.keyElements.size == value.exclusionOperators.size do
+              throw (.catalog s!"exclusion constraint {value.ir.relation}.{value.ir.name} has \
+                {value.exclusionOperators.size} operators but index {key} has \
+                {supporting.ir.keyElements.size} key elements")
+            let mut elements : Array Pgx.ExclusionElementIR := #[]
+            for ordinal in [:supporting.ir.keyElements.size] do
+              elements := elements.push {
+                key := supporting.ir.keyElements[ordinal]!
+                operator := value.exclusionOperators[ordinal]!
+              }
+            pure { value.ir with exclusionElements := elements }
+          | .check | .notNull => do
+            if value.ir.supportingIndex.isSome then
+              throw (.catalog s!"constraint {value.ir.relation}.{value.ir.name} unexpectedly has a supporting index")
+            pure value.ir
+        match checked with
+        | .error error => return .error error
+        | .ok ir => constraints := constraints.set! index { value with ir }
       let mut attributeNotNull : Array AttributeNotNull := #[]
       for relation in relations do
         for index in [:relation.ir.columns.size] do
@@ -1413,29 +1646,67 @@ private def loadConstraints (conn : Pg.Connection)
       | .error message => pure (.error (.catalog message))
 
 private def indexCatalogSql : String :=
-  "SELECT i.indexrelid::text, ns.nspname, c.relname, ic.relname, " ++
-  "i.indisunique::text, i.indisprimary::text, i.indisvalid::text, " ++
+  "SELECT i.indexrelid::text, ns.nspname, c.relname, ins.nspname, ic.relname, " ++
+  "i.indisunique::text, i.indisprimary::text, i.indisexclusion::text, " ++
+  "i.indimmediate::text, i.indisvalid::text, i.indisready::text, " ++
+  "i.indislive::text, i.indnullsnotdistinct::text, am.amname, " ++
   "pg_catalog.pg_get_expr(i.indpred, i.indrelid, true), " ++
-  "pg_catalog.pg_get_expr(i.indexprs, i.indrelid, true) " ++
+  "pg_catalog.pg_get_expr(i.indexprs, i.indrelid, true), i.indnkeyatts::text " ++
   "FROM pg_catalog.pg_index AS i " ++
   "JOIN pg_catalog.pg_class AS c ON c.oid = i.indrelid " ++
   "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = c.relnamespace " ++
   "JOIN pg_catalog.pg_class AS ic ON ic.oid = i.indexrelid " ++
+  "JOIN pg_catalog.pg_namespace AS ins ON ins.oid = ic.relnamespace " ++
+  "JOIN pg_catalog.pg_am AS am ON am.oid = ic.relam " ++
   "ORDER BY i.indexrelid"
 
 private def indexColumnSql : String :=
-  "SELECT i.indexrelid::text, key.ordinality::text, a.attname " ++
+  "SELECT i.indexrelid::text, key.ordinality::text, " ++
+  "(key.ordinality <= i.indnkeyatts)::text, a.attname, " ++
+  "CASE WHEN key.attnum = 0 THEN " ++
+  "pg_catalog.pg_get_indexdef(i.indexrelid, key.ordinality::integer, true) END, " ++
+  "cns.nspname, coll.collname, ons.nspname, opc.opcname, " ++
+  "((COALESCE(opt.value, 0) & 1) <> 0)::text, " ++
+  "((COALESCE(opt.value, 0) & 2) <> 0)::text, " ++
+  "eq.operator_schema, eq.operator_name, eq.left_type::text, eq.right_type::text " ++
   "FROM pg_catalog.pg_index AS i " ++
   "CROSS JOIN LATERAL pg_catalog.unnest(i.indkey) " ++
   "WITH ORDINALITY AS key(attnum, ordinality) " ++
-  "JOIN pg_catalog.pg_attribute AS a " ++
+  "LEFT JOIN pg_catalog.pg_attribute AS a " ++
   "ON a.attrelid = i.indrelid AND a.attnum = key.attnum " ++
-  "WHERE key.attnum > 0 " ++
+  "LEFT JOIN LATERAL pg_catalog.unnest(i.indcollation) " ++
+  "WITH ORDINALITY AS collation(oid, ordinality) " ++
+  "ON collation.ordinality = key.ordinality " ++
+  "LEFT JOIN pg_catalog.pg_collation AS coll ON coll.oid = collation.oid " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS cns ON cns.oid = coll.collnamespace " ++
+  "LEFT JOIN LATERAL pg_catalog.unnest(i.indclass) " ++
+  "WITH ORDINALITY AS opclass(oid, ordinality) " ++
+  "ON opclass.ordinality = key.ordinality " ++
+  "LEFT JOIN pg_catalog.pg_opclass AS opc ON opc.oid = opclass.oid " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS ons ON ons.oid = opc.opcnamespace " ++
+  "LEFT JOIN LATERAL pg_catalog.unnest(i.indoption) " ++
+  "WITH ORDINALITY AS opt(value, ordinality) " ++
+  "ON opt.ordinality = key.ordinality " ++
+  "LEFT JOIN pg_catalog.pg_class AS ic ON ic.oid = i.indexrelid " ++
+  "LEFT JOIN pg_catalog.pg_am AS iam ON iam.oid = ic.relam " ++
+  "LEFT JOIN LATERAL (" ++
+  "SELECT eqns.nspname AS operator_schema, eqop.oprname AS operator_name, " ++
+  "eqop.oprleft AS left_type, eqop.oprright AS right_type " ++
+  "FROM pg_catalog.pg_amop AS eqamop " ++
+  "JOIN pg_catalog.pg_operator AS eqop ON eqop.oid = eqamop.amopopr " ++
+  "JOIN pg_catalog.pg_namespace AS eqns ON eqns.oid = eqop.oprnamespace " ++
+  "WHERE eqamop.amopfamily = opc.opcfamily " ++
+  "AND eqamop.amoplefttype = opc.opcintype " ++
+  "AND eqamop.amoprighttype = opc.opcintype " ++
+  "AND eqamop.amoppurpose = 's' " ++
+  "AND ((iam.amname = 'btree' AND eqamop.amopstrategy = 3) " ++
+  "OR (iam.amname = 'hash' AND eqamop.amopstrategy = 1)) " ++
+  "ORDER BY eqop.oid LIMIT 1) AS eq ON true " ++
   "ORDER BY i.indexrelid, key.ordinality"
 
 private def loadIndexes (conn : Pg.Connection)
-    (relations : Array CatalogRelation) :
-    Async (Except Error (Array Pgx.IndexIR)) := do
+    (relations : Array CatalogRelation) (types : Array CatalogType) :
+    Async (Except Error (Array CatalogIndex)) := do
   match ← queryOne conn "read pg_index" indexCatalogSql with
   | .error error => pure (.error error)
   | .ok rows =>
@@ -1447,14 +1718,25 @@ private def loadIndexes (conn : Pg.Connection)
           schema := ← cell "read pg_index" row 1
           name := ← cell "read pg_index" row 2
         }
-        pure { oid, ir := {
+        let key : Pgx.IndexKey := {
+          schema := ← cell "read pg_index" row 3
+          name := ← cell "read pg_index" row 4
+        }
+        let nullsNotDistinct ← parseBool "read pg_index" (← cell "read pg_index" row 12)
+        pure { oid, key, ir := {
           relation
-          name := ← cell "read pg_index" row 3
-          unique := ← parseBool "read pg_index" (← cell "read pg_index" row 4)
-          primary := ← parseBool "read pg_index" (← cell "read pg_index" row 5)
-          valid := ← parseBool "read pg_index" (← cell "read pg_index" row 6)
-          predicate := ← cell? "read pg_index" row 7
-          expression := ← cell? "read pg_index" row 8
+          name := key.name
+          unique := ← parseBool "read pg_index" (← cell "read pg_index" row 5)
+          primary := ← parseBool "read pg_index" (← cell "read pg_index" row 6)
+          exclusion := ← parseBool "read pg_index" (← cell "read pg_index" row 7)
+          immediate := ← parseBool "read pg_index" (← cell "read pg_index" row 8)
+          valid := ← parseBool "read pg_index" (← cell "read pg_index" row 9)
+          ready := ← parseBool "read pg_index" (← cell "read pg_index" row 10)
+          live := ← parseBool "read pg_index" (← cell "read pg_index" row 11)
+          uniqueNullPolicy := if nullsNotDistinct then .notDistinct else .distinct
+          accessMethod := some (← cell "read pg_index" row 13)
+          predicate := ← cell? "read pg_index" row 14
+          expression := ← cell? "read pg_index" row 15
         } }
       match parsed with
       | .error error => return .error error
@@ -1465,21 +1747,84 @@ private def loadIndexes (conn : Pg.Connection)
     | .error error => pure (.error error)
     | .ok columnRows =>
       for row in columnRows.rows do
-        let parsed : Except Error (UInt32 × String) := do
-          pure (← parseUInt32 "read index columns"
-              (← cell "read index columns" row 0),
-            ← cell "read index columns" row 2)
+        let parsed : Except Error
+            (UInt32 × Bool × Option String × Option String × Option Pgx.CollationKey ×
+              Option Pgx.QualifiedName × Pgx.IndexOrder × Pgx.IndexNullsOrder ×
+              Option Pgx.OperatorKey) := do
+          let oid ← parseUInt32 "read index columns" (← cell "read index columns" row 0)
+          let keyElement ← parseBool "read index columns" (← cell "read index columns" row 2)
+          let name ← cell? "read index columns" row 3
+          let expression ← cell? "read index columns" row 4
+          let collationSchema ← cell? "read index columns" row 5
+          let collationName ← cell? "read index columns" row 6
+          let collation ← match collationSchema, collationName with
+            | none, none => pure none
+            | some schema, some name => pure (some { schema, name })
+            | _, _ => throw (.catalog "read index columns: incomplete collation identity")
+          let opclassSchema ← cell? "read index columns" row 7
+          let opclassName ← cell? "read index columns" row 8
+          let opclass ← match opclassSchema, opclassName with
+            | none, none => pure none
+            | some schema, some name => pure (some { schema, name })
+            | _, _ => throw (.catalog "read index columns: incomplete operator-class identity")
+          let descending ← parseBool "read index columns" (← cell "read index columns" row 9)
+          let nullsFirst ← parseBool "read index columns" (← cell "read index columns" row 10)
+          let operatorSchema ← cell? "read index columns" row 11
+          let operatorName ← cell? "read index columns" row 12
+          let leftOid ← (← cell? "read index columns" row 13).mapM
+            (parseUInt32 "read index equality operator")
+          let rightOid ← (← cell? "read index columns" row 14).mapM
+            (parseUInt32 "read index equality operator")
+          let equalityOperator ← match operatorSchema, operatorName, leftOid, rightOid with
+            | none, none, none, none => pure none
+            | some schema, some name, some leftOid, some rightOid =>
+                some <$> operatorKeyByOperandOids types "read index equality operator"
+                  schema name leftOid rightOid
+            | _, _, _, _ => throw (.catalog
+                "read index columns: incomplete equality-operator identity")
+          pure (oid, keyElement, name, expression, collation, opclass,
+            if descending then .descending else .ascending,
+            if nullsFirst then .first else .last, equalityOperator)
         match parsed with
         | .error error => return .error error
-        | .ok (oid, name) =>
+        | .ok (oid, keyElement, name, expression, collation, opclass,
+            order, nullsOrder, equalityOperator) =>
           match indexes.findIdx? (fun value => value.oid == oid) with
           | none => pure ()
           | some index =>
             let value := indexes[index]!
-            indexes := indexes.set! index {
-              value with ir := { value.ir with columns := value.ir.columns.push name }
-            }
-      pure (.ok (indexes.map (·.ir)))
+            if keyElement then
+              unless name.isSome != expression.isSome do
+                return .error (.catalog
+                  s!"index {value.key.display} key must be exactly one column or expression")
+              let element : Pgx.IndexKeyElementIR := {
+                ordinal := value.ir.keyElements.size + 1
+                column := name
+                expression
+                collation
+                opclass
+                equalityOperator
+                order
+                nullsOrder
+              }
+              indexes := indexes.set! index { value with ir := {
+                value.ir with
+                columns := match name with
+                  | some name => value.ir.columns.push name
+                  | none => value.ir.columns
+                keyElements := value.ir.keyElements.push element
+              } }
+            else
+              let some name := name
+                | return .error (.catalog
+                    s!"index {value.key.display} INCLUDE element is not a column")
+              if expression.isSome then
+                return .error (.catalog
+                  s!"index {value.key.display} INCLUDE column has an expression")
+              indexes := indexes.set! index { value with ir := {
+                value.ir with includedColumns := value.ir.includedColumns.push name
+              } }
+      pure (.ok indexes)
 
 private def loadExtensions (conn : Pg.Connection) (required : Array String) :
     Async (Except Error (Array (String × String))) := do
@@ -1872,12 +2217,14 @@ private def loadSnapshot (conn : Pg.Connection) (config : Config) :
   let views ← match ← loadViews conn config.schemas relations with
     | .error error => return .error error
     | .ok value => pure value
-  let constraints ← match ← loadConstraints conn adapter relations enums domains with
+  let catalogIndexes ← match ← loadIndexes conn relations types with
     | .error error => return .error error
     | .ok value => pure value
-  let indexes ← match ← loadIndexes conn relations with
+  let constraints ← match
+      ← loadConstraints conn adapter relations types catalogIndexes enums domains with
     | .error error => return .error error
     | .ok value => pure value
+  let indexes := catalogIndexes.map (·.ir)
   let extensions ← match ← loadExtensions conn config.requiredExtensions with
     | .error error => return .error error
     | .ok value => pure value

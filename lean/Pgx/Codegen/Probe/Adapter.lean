@@ -22,6 +22,13 @@ inductive NotNullCatalog where
 structure Adapter where
   serverMajor : Nat
   notNullCatalog : NotNullCatalog
+  /-- PostgreSQL 18 added `pg_constraint.conenforced`.  Older supported
+  majors enforce every catalog constraint and must not mention the absent
+  column in their catalog SQL. -/
+  constraintEnforcementCatalog : Bool := false
+  /-- PostgreSQL 18 added temporal `PERIOD`/`WITHOUT OVERLAPS` constraints
+  and the corresponding `pg_constraint.conperiod` bit. -/
+  temporalConstraintCatalog : Bool := false
   deriving Repr, BEq, Inhabited
 
 /-- Version-independent input derived from `pg_attribute.attnotnull`. -/
@@ -34,6 +41,12 @@ namespace Adapter
 
 def supportsNativeNotNull (adapter : Adapter) : Bool :=
   adapter.notNullCatalog == .nativeConstraint
+
+def supportsConstraintEnforcement (adapter : Adapter) : Bool :=
+  adapter.constraintEnforcementCatalog
+
+def supportsTemporalConstraints (adapter : Adapter) : Bool :=
+  adapter.temporalConstraintCatalog
 
 /-- `pg_constraint.contype` tags understood by this adapter. -/
 def constraintTypeTags (adapter : Adapter) : Array String :=
@@ -58,6 +71,14 @@ private def constraintTypeList (adapter : Adapter) : String :=
 
 /-- Relation-constraint query for this server major. -/
 def constraintCatalogSql (adapter : Adapter) : String :=
+  let enforced := if adapter.supportsConstraintEnforcement then
+    "con.conenforced::text"
+  else
+    "true::text"
+  let period := if adapter.supportsTemporalConstraints then
+    "con.conperiod::text"
+  else
+    "false::text"
   "SELECT con.oid::text, ns.nspname, c.relname, con.conname, con.contype::text, " ++
   "rns.nspname, rc.relname, " ++
   "CASE WHEN con.contype IN ('c', 'x') " ++
@@ -71,11 +92,26 @@ def constraintCatalogSql (adapter : Adapter) : String :=
   "WHERE dep.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass " ++
   "AND dep.objid = con.oid " ++
   "AND dep.refclassid = 'pg_catalog.pg_operator'::pg_catalog.regclass))::text " ++
+  ", " ++ enforced ++ ", con.condeferrable::text, con.condeferred::text, " ++
+  "pns.nspname, pc.relname, parent.conname, con.conislocal::text, " ++
+  "con.coninhcount::text, con.connoinherit::text, " ++ period ++ ", " ++
+  "ins.nspname, ic.relname, " ++
+  "CASE WHEN con.contype = 'f' THEN con.confmatchtype::text END, " ++
+  "CASE WHEN con.contype = 'f' THEN con.confupdtype::text END, " ++
+  "CASE WHEN con.contype = 'f' THEN con.confdeltype::text END, " ++
+  "COALESCE(i.indnullsnotdistinct, false)::text " ++
   "FROM pg_catalog.pg_constraint AS con " ++
   "JOIN pg_catalog.pg_class AS c ON c.oid = con.conrelid " ++
   "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = c.relnamespace " ++
   "LEFT JOIN pg_catalog.pg_class AS rc ON rc.oid = NULLIF(con.confrelid, 0) " ++
   "LEFT JOIN pg_catalog.pg_namespace AS rns ON rns.oid = rc.relnamespace " ++
+  "LEFT JOIN pg_catalog.pg_constraint AS parent " ++
+  "ON parent.oid = NULLIF(con.conparentid, 0) " ++
+  "LEFT JOIN pg_catalog.pg_class AS pc ON pc.oid = parent.conrelid " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS pns ON pns.oid = pc.relnamespace " ++
+  "LEFT JOIN pg_catalog.pg_class AS ic ON ic.oid = NULLIF(con.conindid, 0) " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS ins ON ins.oid = ic.relnamespace " ++
+  "LEFT JOIN pg_catalog.pg_index AS i ON i.indexrelid = con.conindid " ++
   "WHERE con.conrelid <> 0 AND con.contype IN (" ++
   adapter.constraintTypeList ++ ") ORDER BY con.oid"
 
@@ -98,21 +134,70 @@ def constraintColumnSql (adapter : Adapter) : String :=
   "ON a.attrelid = con.confrelid AND a.attnum = key.attnum " ++
   "WHERE con.conrelid <> 0 AND con.contype = 'f' ORDER BY 1, 2, 3"
 
+/-- Foreign-key delete-action column subset.  A missing row set represents
+the PostgreSQL default of applying `SET NULL`/`SET DEFAULT` to every key
+column; an explicitly stored subset retains declaration order. -/
+def constraintDeleteSetColumnSql : String :=
+  "SELECT con.oid::text, key.ordinality::text, a.attname " ++
+  "FROM pg_catalog.pg_constraint AS con " ++
+  "CROSS JOIN LATERAL pg_catalog.unnest(con.confdelsetcols) " ++
+  "WITH ORDINALITY AS key(attnum, ordinality) " ++
+  "JOIN pg_catalog.pg_attribute AS a " ++
+  "ON a.attrelid = con.conrelid AND a.attnum = key.attnum " ++
+  "WHERE con.conrelid <> 0 AND con.contype = 'f' " ++
+  "ORDER BY con.oid, key.ordinality"
+
+/-- Resolved operator vectors whose order is semantic.  OIDs are returned
+only to the transient probe, which replaces them with symbolic operator and
+operand type identities before constructing `DatabaseIR`. -/
+def constraintOperatorSql : String :=
+  let branch (field tag : String) :=
+    "SELECT con.oid::text, '" ++ tag ++ "'::text, item.ordinality::text, " ++
+    "op.oid::text, ons.nspname, op.oprname, op.oprleft::text, op.oprright::text " ++
+    "FROM pg_catalog.pg_constraint AS con " ++
+    "CROSS JOIN LATERAL pg_catalog.unnest(con." ++ field ++ ") " ++
+    "WITH ORDINALITY AS item(operator_oid, ordinality) " ++
+    "JOIN pg_catalog.pg_operator AS op ON op.oid = item.operator_oid " ++
+    "JOIN pg_catalog.pg_namespace AS ons ON ons.oid = op.oprnamespace"
+  String.intercalate " UNION ALL " [
+    branch "conpfeqop" "pf",
+    branch "conppeqop" "pp",
+    branch "conffeqop" "ff",
+    branch "conexclop" "exclude"
+  ] ++ " ORDER BY 1, 2, 3"
+
 private def canonicalNotNull (value : AttributeNotNull)
-    (validated : Bool := true) : Pgx.ConstraintIR := {
-  relation := value.relation
-  name := s!"<not-null:{value.column}>"
-  kind := .notNull
-  columns := #[value.column]
-  validated
-}
+    (source : Option Pgx.ConstraintIR := none) : Pgx.ConstraintIR :=
+  let base : Pgx.ConstraintIR := {
+    relation := value.relation
+    name := s!"<not-null:{value.column}>"
+    kind := .notNull
+    columns := #[value.column]
+  }
+  match source with
+  | none => base
+  | some source => { base with
+      enforced := source.enforced
+      validated := source.validated
+      parent := source.parent
+      isLocal := source.isLocal
+      inheritanceCount := source.inheritanceCount
+      noInherit := source.noInherit
+    }
 
 private def notNullKey (constraint : Pgx.ConstraintIR) : Except String AttributeNotNull := do
   unless constraint.columns.size == 1 do
     throw s!"native NOT NULL constraint {constraint.relation}.{constraint.name} \
       must name exactly one column"
   if constraint.referencedRelation.isSome || !constraint.referencedColumns.isEmpty ||
-      constraint.expression.isSome then
+      constraint.expression.isSome || constraint.localExpression.isSome ||
+      constraint.deferrable || constraint.initiallyDeferred || constraint.period ||
+      constraint.supportingIndex.isSome ||
+      !constraint.foreignKeyDeleteSetColumns.isEmpty ||
+      !constraint.referencedToReferencingOperators.isEmpty ||
+      !constraint.referencedEqualityOperators.isEmpty ||
+      !constraint.referencingEqualityOperators.isEmpty ||
+      !constraint.exclusionElements.isEmpty then
     throw s!"native NOT NULL constraint {constraint.relation}.{constraint.name} \
       has unexpected catalog metadata"
   pure { relation := constraint.relation, column := constraint.columns[0]! }
@@ -138,7 +223,7 @@ def normalizeConstraints (adapter : Adapter)
       if nativeKeys.contains key then
         throw s!"duplicate native NOT NULL constraint for {key.relation}.{key.column}"
       nativeKeys := nativeKeys.push key
-      result := result.push (canonicalNotNull key constraint.validated)
+      result := result.push (canonicalNotNull key (some constraint))
     else
       result := result.push constraint
   for key in attributes do
