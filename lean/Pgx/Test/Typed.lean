@@ -142,6 +142,11 @@ private def isError (result : Except Error α) : Bool :=
   | .error _ => true
   | .ok _ => false
 
+private def isSchemaDrift (result : Except Error α) : Bool :=
+  match result with
+  | .error (.schemaDrift _) => true
+  | .error _ | .ok _ => false
+
 private def resolvedCodecTests : IO Unit := do
   let binary42 := ByteArray.mk #[0, 0, 0, 42]
   assert! okEq (int4Codec.encodeText resolveTestType int4 42) "42"
@@ -222,9 +227,149 @@ private def semanticMetadataTests : IO Unit := do
   assert! extensionTypeOwnershipSql.contains "dep.refobjsubid = 0"
   assert! extensionTypeOwnershipSql.contains "dep.deptype = 'e'"
 
+private def relationalMetadataTests : IO Unit := do
+  let int4Eq : Pgx.OperatorKey := {
+    schema := "pg_catalog"
+    name := "="
+    leftType := int4Key
+    rightType := int4Key
+  }
+  let textEq : Pgx.OperatorKey := {
+    schema := "pg_catalog"
+    name := "="
+    leftType := textKey
+    rightType := textKey
+  }
+  let idKey : Pgx.IndexKeyElementIR := {
+    ordinal := 1
+    column := some "id"
+    opclass := some { schema := "pg_catalog", name := "int4_ops" }
+    equalityOperator := some int4Eq
+  }
+  let emailKey : Pgx.IndexKeyElementIR := {
+    ordinal := 2
+    column := some "email"
+    collation := some { schema := "pg_catalog", name := "default" }
+    opclass := some { schema := "pg_catalog", name := "text_ops" }
+    equalityOperator := some textEq
+  }
+  let uniqueIndex : Pgx.IndexIR := {
+    relation := usersKey
+    name := "users_id_email_key"
+    unique := true
+    primary := false
+    valid := true
+    accessMethod := some "btree"
+    columns := #["id", "email"]
+    keyElements := #[idKey, emailKey]
+    includedColumns := #["email", "id"]
+  }
+  let performanceIndex : Pgx.IndexIR := {
+    relation := usersKey
+    name := "users_email_idx"
+    unique := false
+    primary := false
+    valid := true
+    columns := #["email"]
+  }
+  assert! (validateIndexMetadata #[uniqueIndex, performanceIndex]
+    #[{ uniqueIndex with includedColumns := #["id", "email"] }]).isOk
+  assert! isSchemaDrift (validateIndexMetadata #[uniqueIndex]
+    #[{ uniqueIndex with valid := false }])
+  assert! isError (validateIndexMetadata #[uniqueIndex]
+    #[{ uniqueIndex with uniqueNullPolicy := .notDistinct }])
+  assert! isError (validateIndexMetadata #[uniqueIndex]
+    #[{ uniqueIndex with keyElements := #[emailKey, idKey] }])
+  assert! isError (validateIndexMetadata #[uniqueIndex]
+    #[{ uniqueIndex with keyElements := #[idKey,
+      { emailKey with equalityOperator := some int4Eq }] }])
+  assert! isError (validateIndexMetadata #[uniqueIndex, uniqueIndex] #[uniqueIndex, uniqueIndex])
+
+  let organizationsKey : Pgx.RelationKey := { schema := "app", name := "organizations" }
+  let fk : Pgx.ConstraintIR := {
+    relation := usersKey
+    name := "users_org_fkey"
+    kind := .foreignKey
+    columns := #["id", "email"]
+    referencedRelation := some organizationsKey
+    referencedColumns := #["id", "name"]
+    deferrable := true
+    initiallyDeferred := true
+    supportingIndex := some { schema := "app", name := "organizations_id_name_key" }
+    foreignKeyMatch := .full
+    foreignKeyOnUpdate := .cascade
+    foreignKeyOnDelete := .setNull
+    foreignKeyDeleteSetColumns := #["email", "id"]
+    referencedToReferencingOperators := #[int4Eq, textEq]
+    referencedEqualityOperators := #[int4Eq, textEq]
+    referencingEqualityOperators := #[int4Eq, textEq]
+  }
+  let check : Pgx.ConstraintIR := {
+    relation := usersKey
+    name := "users_id_check"
+    kind := .check
+    columns := #["id"]
+    expression := some "CHECK ((id > 0))"
+    localExpression := some (.constant (some true))
+    noInherit := true
+  }
+  assert! (validateConstraintMetadata #[fk, check] #[
+    { check with localExpression := none },
+    { fk with foreignKeyDeleteSetColumns := #["id", "email"] }
+  ]).isOk
+  assert! isSchemaDrift (validateConstraintMetadata #[fk]
+    #[{ fk with validated := false }])
+  assert! isError (validateConstraintMetadata #[fk]
+    #[{ fk with initiallyDeferred := false }])
+  assert! isError (validateConstraintMetadata #[fk]
+    #[{ fk with referencedColumns := fk.referencedColumns.reverse }])
+  assert! isError (validateConstraintMetadata #[fk]
+    #[{ fk with referencedToReferencingOperators :=
+      fk.referencedToReferencingOperators.reverse }])
+  assert! isError (validateConstraintMetadata #[fk, fk] #[fk, fk])
+
+  let nativeNotNull : Pgx.ConstraintIR := {
+    relation := usersKey
+    name := "users_email_not_null"
+    kind := .notNull
+    columns := #["email"]
+  }
+  assert! (validateNotNullReadSafety 18 #[nativeNotNull]).isOk
+  assert! isSchemaDrift (validateNotNullReadSafety 18
+    #[{ nativeNotNull with validated := false }])
+  assert! isError (validateNotNullReadSafety 18
+    #[{ nativeNotNull with enforced := false }])
+  -- PostgreSQL 17 has no native relation NOT NULL catalog row; its canonical
+  -- constraints are synthesized only after `attnotnull` is trusted.
+  assert! (validateNotNullReadSafety 17
+    #[{ nativeNotNull with validated := false }]).isOk
+
+  let pg17 := relationalConstraintCatalogSql 17
+  let pg18 := relationalConstraintCatalogSql 18
+  assert! !pg17.contains "con.conenforced"
+  assert! !pg17.contains "con.conperiod"
+  assert! !pg17.contains "'n'"
+  assert! pg18.contains "con.conenforced"
+  assert! pg18.contains "con.conperiod"
+  assert! pg18.contains "'n'"
+  assert! (relationalConstraintColumnSql 17).contains "WITH ORDINALITY"
+  assert! relationalConstraintDeleteSetColumnSql.contains "confdelsetcols"
+  assert! relationalConstraintOperatorSql.contains "conpfeqop"
+  assert! relationalConstraintOperatorSql.contains "conppeqop"
+  assert! relationalConstraintOperatorSql.contains "conffeqop"
+  assert! relationalConstraintOperatorSql.contains "conexclop"
+  assert! relationalIndexCatalogSql.contains "indnullsnotdistinct"
+  assert! relationalIndexElementSql.contains "indnkeyatts"
+  assert! relationalIndexElementSql.contains "pg_catalog.pg_amop"
+  assert! relationalIndexElementSql.contains "AS coll_item("
+  assert! !relationalIndexElementSql.contains "AS collation("
+  assert! !(relationalConstraintColumnSql 17).contains "item.ordinality::text"
+  assert! !relationalConstraintOperatorSql.contains "item.ordinality::text"
+
 def main : IO UInt32 := do
   resolvedCodecTests
   semanticMetadataTests
+  relationalMetadataTests
   let catalog ← match catalogResult with
     | .ok value => pure value
     | .error error => throw (IO.userError (toString error))

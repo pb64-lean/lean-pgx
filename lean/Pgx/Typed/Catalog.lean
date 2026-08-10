@@ -83,6 +83,32 @@ private def parseBool (context value : String) : Except Error Bool :=
   | "f" | "false" | "off" => pure false
   | _ => throw (drift s!"{context}: expected a boolean, received {value}")
 
+private def parseConstraintKind (context : String) : String →
+    Except Error Pgx.ConstraintKind
+  | "c" => pure .check
+  | "n" => pure .notNull
+  | "p" => pure .primaryKey
+  | "u" => pure .unique
+  | "f" => pure .foreignKey
+  | "x" => pure .exclusion
+  | value => throw (drift s!"{context}: unknown PostgreSQL constraint kind {value}")
+
+private def parseForeignKeyMatch (context : String) : String →
+    Except Error Pgx.ForeignKeyMatch
+  | "s" => pure .simple
+  | "f" => pure .full
+  | "p" => pure .partialMatch
+  | value => throw (drift s!"{context}: unknown foreign-key match type {value}")
+
+private def parseForeignKeyAction (context : String) : String →
+    Except Error Pgx.ForeignKeyAction
+  | "a" => pure .noAction
+  | "r" => pure .restrict
+  | "c" => pure .cascade
+  | "n" => pure .setNull
+  | "d" => pure .setDefault
+  | value => throw (drift s!"{context}: unknown foreign-key action {value}")
+
 private def parseTypeKind (context : String) : String → Except Error Pgx.TypeKind
   | "base" => pure .base
   | "enum" => pure .enum
@@ -149,7 +175,7 @@ private def currentSetting (conn : Pg.Connection) (name : String) :
     pure (cell s!"read session setting {name}" row 0)
 
 private def validateServerMajor (db : DatabaseDesc) (conn : Pg.Connection) :
-    Async (Except Error Unit) := do
+    Async (Except Error Nat) := do
   match ← currentSetting conn "server_version_num" with
   | .error error => pure (.error error)
   | .ok version =>
@@ -157,8 +183,11 @@ private def validateServerMajor (db : DatabaseDesc) (conn : Pg.Connection) :
     | .error error => pure (.error error)
     | .ok versionNumber =>
       let major := versionNumber / 10000
-      if db.serverMajors.contains major then
-        pure (.ok ())
+      if major != 17 && major != 18 then
+        pure (.error (drift
+          s!"unsupported PostgreSQL server major {major}; this runtime understands only 17 and 18"))
+      else if db.serverMajors.contains major then
+        pure (.ok major)
       else
         pure (.error (drift
           s!"unsupported PostgreSQL server major {major}; expected one of {repr db.serverMajors}"))
@@ -494,6 +523,10 @@ private structure LiveColumn where
   attnum : UInt16
   ty : Pgx.TypeRef
   nullable : Bool
+  /-- Relation-level nullability before a domain's own NOT NULL bit is
+  folded into `nullable`.  This is the cross-version source for canonical
+  relation NOT NULL constraints. -/
+  attributeNotNull : Bool
 
 private structure LiveRelation where
   key : Pgx.RelationKey
@@ -512,7 +545,7 @@ private def columnCatalogSql : String :=
   "SELECT ns.nspname, c.relname, a.attname, a.attnum::text, " ++
   "tns.nspname, t.typname, " ++ kindSql "t" ++ ", " ++
   "CASE WHEN a.atttypmod = -1 THEN NULL ELSE a.atttypmod::text END, " ++
-  "(NOT (a.attnotnull OR t.typnotnull))::text " ++
+  "(NOT (a.attnotnull OR t.typnotnull))::text, a.attnotnull::text " ++
   "FROM pg_catalog.pg_class AS c " ++
   "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = c.relnamespace " ++
   "JOIN pg_catalog.pg_attribute AS a ON a.attrelid = c.oid " ++
@@ -545,9 +578,10 @@ private def parseLiveColumn (row : Array (Option ByteArray)) :
     | none => pure none
     | some value => some <$> parseInt32 context value
   let nullable ← parseBool context (← cell context row 8)
+  let attributeNotNull ← parseBool context (← cell context row 9)
   pure ({ schema := relationSchema, name := relationName }, {
     name, attnum, ty := { key := { schema := typeSchema, name := typeName, kind := typeKind }, typmod },
-    nullable
+    nullable, attributeNotNull
   })
 
 private def loadRelations (conn : Pg.Connection) :
@@ -584,6 +618,653 @@ private def liveTypeRefByOid (types : Array LiveType) (context : String)
   unless candidates.size == 1 do
     throw (drift s!"{context}: PostgreSQL type OID {oid} is ambiguous")
   pure { key := ty.key }
+
+private def operatorKeyByOperandOids (types : Array LiveType) (context schema name : String)
+    (leftOid rightOid : UInt32) : Except Error Pgx.OperatorKey := do
+  let leftType := (← liveTypeRefByOid types context leftOid).key
+  let rightType := (← liveTypeRefByOid types context rightOid).key
+  pure { schema, name, leftType, rightType }
+
+/-! ## Relational constraint and index catalogs
+
+These queries intentionally recover symbolic identities rather than retaining
+installation-local OIDs.  The OIDs only join the several catalog result sets
+during attachment.
+-/
+
+/-- Semantic index metadata used by relational constraints. -/
+def relationalIndexCatalogSql : String :=
+  "SELECT i.indexrelid::text, ns.nspname, c.relname, ins.nspname, ic.relname, " ++
+  "i.indisunique::text, i.indisprimary::text, i.indisexclusion::text, " ++
+  "i.indimmediate::text, i.indisvalid::text, i.indisready::text, " ++
+  "i.indislive::text, i.indnullsnotdistinct::text, am.amname, " ++
+  "pg_catalog.pg_get_expr(i.indpred, i.indrelid, true), " ++
+  "pg_catalog.pg_get_expr(i.indexprs, i.indrelid, true) " ++
+  "FROM pg_catalog.pg_index AS i " ++
+  "JOIN pg_catalog.pg_class AS c ON c.oid = i.indrelid " ++
+  "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = c.relnamespace " ++
+  "JOIN pg_catalog.pg_class AS ic ON ic.oid = i.indexrelid " ++
+  "JOIN pg_catalog.pg_namespace AS ins ON ins.oid = ic.relnamespace " ++
+  "JOIN pg_catalog.pg_am AS am ON am.oid = ic.relam " ++
+  "ORDER BY i.indexrelid"
+
+/-- Ordered key and INCLUDE elements.  For btree/hash key elements the
+operator-family equality member is resolved to a symbolic operator overload.
+-/
+def relationalIndexElementSql : String :=
+  "SELECT i.indexrelid::text, item.ordinality::text, " ++
+  "(item.ordinality <= i.indnkeyatts)::text, a.attname, " ++
+  "CASE WHEN item.attnum = 0 THEN " ++
+  "pg_catalog.pg_get_indexdef(i.indexrelid, item.ordinality::integer, true) END, " ++
+  "cns.nspname, coll.collname, ons.nspname, opc.opcname, " ++
+  "((COALESCE(opt.value, 0) & 1) <> 0)::text, " ++
+  "((COALESCE(opt.value, 0) & 2) <> 0)::text, " ++
+  "eq.operator_schema, eq.operator_name, eq.left_type::text, eq.right_type::text " ++
+  "FROM pg_catalog.pg_index AS i " ++
+  "CROSS JOIN LATERAL pg_catalog.unnest(i.indkey) " ++
+  "WITH ORDINALITY AS item(attnum, ordinality) " ++
+  "LEFT JOIN pg_catalog.pg_attribute AS a " ++
+  "ON a.attrelid = i.indrelid AND a.attnum = item.attnum " ++
+  "LEFT JOIN LATERAL pg_catalog.unnest(i.indcollation) " ++
+  "WITH ORDINALITY AS coll_item(oid, ordinality) " ++
+  "ON coll_item.ordinality = item.ordinality " ++
+  "LEFT JOIN pg_catalog.pg_collation AS coll ON coll.oid = coll_item.oid " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS cns ON cns.oid = coll.collnamespace " ++
+  "LEFT JOIN LATERAL pg_catalog.unnest(i.indclass) " ++
+  "WITH ORDINALITY AS opclass(oid, ordinality) " ++
+  "ON opclass.ordinality = item.ordinality " ++
+  "LEFT JOIN pg_catalog.pg_opclass AS opc ON opc.oid = opclass.oid " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS ons ON ons.oid = opc.opcnamespace " ++
+  "LEFT JOIN LATERAL pg_catalog.unnest(i.indoption) " ++
+  "WITH ORDINALITY AS opt(value, ordinality) " ++
+  "ON opt.ordinality = item.ordinality " ++
+  "LEFT JOIN pg_catalog.pg_class AS ic ON ic.oid = i.indexrelid " ++
+  "LEFT JOIN pg_catalog.pg_am AS iam ON iam.oid = ic.relam " ++
+  "LEFT JOIN LATERAL (" ++
+  "SELECT eqns.nspname AS operator_schema, eqop.oprname AS operator_name, " ++
+  "eqop.oprleft AS left_type, eqop.oprright AS right_type " ++
+  "FROM pg_catalog.pg_amop AS eqamop " ++
+  "JOIN pg_catalog.pg_operator AS eqop ON eqop.oid = eqamop.amopopr " ++
+  "JOIN pg_catalog.pg_namespace AS eqns ON eqns.oid = eqop.oprnamespace " ++
+  "WHERE eqamop.amopfamily = opc.opcfamily " ++
+  "AND eqamop.amoplefttype = opc.opcintype " ++
+  "AND eqamop.amoprighttype = opc.opcintype " ++
+  "AND eqamop.amoppurpose = 's' " ++
+  "AND ((iam.amname = 'btree' AND eqamop.amopstrategy = 3) " ++
+  "OR (iam.amname = 'hash' AND eqamop.amopstrategy = 1)) " ++
+  "ORDER BY eqop.oid LIMIT 1) AS eq ON true " ++
+  "ORDER BY i.indexrelid, item.ordinality"
+
+private structure LiveIndex where
+  oid : UInt32
+  key : Pgx.IndexKey
+  ir : Pgx.IndexIR
+  deriving Inhabited
+
+private def loadRelationalIndexes (conn : Pg.Connection)
+    (relations : Array LiveRelation) (types : Array LiveType) :
+    Async (Except Error (Array LiveIndex)) := do
+  match ← queryOne conn "read relational pg_index" relationalIndexCatalogSql with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    let mut indexes : Array LiveIndex := #[]
+    for row in rows.rows do
+      let parsed : Except Error LiveIndex := do
+        let oid ← parseUInt32 "read relational pg_index" (← cell "read relational pg_index" row 0)
+        let relation : Pgx.RelationKey := {
+          schema := ← cell "read relational pg_index" row 1
+          name := ← cell "read relational pg_index" row 2
+        }
+        let indexSchema ← cell "read relational pg_index" row 3
+        let name ← cell "read relational pg_index" row 4
+        unless indexSchema == relation.schema do
+          throw (drift s!"index {indexSchema}.{name} is not in relation schema {relation.schema}")
+        let nullsNotDistinct ← parseBool "read relational pg_index"
+          (← cell "read relational pg_index" row 12)
+        pure {
+          oid
+          key := { schema := indexSchema, name }
+          ir := {
+            relation, name
+            unique := ← parseBool "read relational pg_index"
+              (← cell "read relational pg_index" row 5)
+            primary := ← parseBool "read relational pg_index"
+              (← cell "read relational pg_index" row 6)
+            exclusion := ← parseBool "read relational pg_index"
+              (← cell "read relational pg_index" row 7)
+            immediate := ← parseBool "read relational pg_index"
+              (← cell "read relational pg_index" row 8)
+            valid := ← parseBool "read relational pg_index"
+              (← cell "read relational pg_index" row 9)
+            ready := ← parseBool "read relational pg_index"
+              (← cell "read relational pg_index" row 10)
+            live := ← parseBool "read relational pg_index"
+              (← cell "read relational pg_index" row 11)
+            uniqueNullPolicy := if nullsNotDistinct then .notDistinct else .distinct
+            accessMethod := some (← cell "read relational pg_index" row 13)
+            predicate := ← cell? "read relational pg_index" row 14
+            expression := ← cell? "read relational pg_index" row 15
+          }
+        }
+      match parsed with
+      | .error error => return .error error
+      | .ok value =>
+        if relations.any (fun relation => relation.key == value.ir.relation) then
+          indexes := indexes.push value
+    match ← queryOne conn "read relational index elements" relationalIndexElementSql with
+    | .error error => pure (.error error)
+    | .ok elementRows =>
+      for row in elementRows.rows do
+        let parsed : Except Error
+            (UInt32 × Nat × Bool × Option String × Option String ×
+              Option Pgx.CollationKey × Option Pgx.QualifiedName × Pgx.IndexOrder ×
+              Pgx.IndexNullsOrder × Option Pgx.OperatorKey) := do
+          let context := "read relational index elements"
+          let oid ← parseUInt32 context (← cell context row 0)
+          let ordinal ← parseNat context (← cell context row 1)
+          let keyElement ← parseBool context (← cell context row 2)
+          let column ← cell? context row 3
+          let expression ← cell? context row 4
+          let collationSchema ← cell? context row 5
+          let collationName ← cell? context row 6
+          let collation ← match collationSchema, collationName with
+            | none, none => pure none
+            | some schema, some name => pure (some { schema, name })
+            | _, _ => throw (drift s!"{context}: incomplete collation identity")
+          let opclassSchema ← cell? context row 7
+          let opclassName ← cell? context row 8
+          let opclass ← match opclassSchema, opclassName with
+            | none, none => pure none
+            | some schema, some name => pure (some { schema, name })
+            | _, _ => throw (drift s!"{context}: incomplete operator-class identity")
+          let descending ← parseBool context (← cell context row 9)
+          let nullsFirst ← parseBool context (← cell context row 10)
+          let operatorSchema ← cell? context row 11
+          let operatorName ← cell? context row 12
+          let leftOid ← match ← cell? context row 13 with
+            | none => pure none
+            | some value => some <$> parseUInt32 context value
+          let rightOid ← match ← cell? context row 14 with
+            | none => pure none
+            | some value => some <$> parseUInt32 context value
+          let equalityOperator ← match operatorSchema, operatorName, leftOid, rightOid with
+            | none, none, none, none => pure none
+            | some schema, some name, some leftOid, some rightOid =>
+                some <$> operatorKeyByOperandOids types context schema name leftOid rightOid
+            | _, _, _, _ => throw (drift s!"{context}: incomplete equality-operator identity")
+          pure (oid, ordinal, keyElement, column, expression, collation, opclass,
+            if descending then .descending else .ascending,
+            if nullsFirst then .first else .last, equalityOperator)
+        match parsed with
+        | .error error => return .error error
+        | .ok (oid, ordinal, keyElement, column, expression, collation, opclass,
+            order, nullsOrder, equalityOperator) =>
+          match indexes.findIdx? (fun value => value.oid == oid) with
+          | none => pure ()
+          | some index =>
+            let value := indexes[index]!
+            if keyElement then
+              let expectedOrdinal := value.ir.keyElements.size + 1
+              unless ordinal == expectedOrdinal do
+                return .error (drift s!"index {value.key}: expected key ordinal \
+                  {expectedOrdinal}, received {ordinal}")
+              unless column.isSome != expression.isSome do
+                return .error (drift s!"index {value.key}: key must be exactly one column or expression")
+              let element : Pgx.IndexKeyElementIR := {
+                ordinal, column, expression, collation, opclass, equalityOperator,
+                order, nullsOrder
+              }
+              indexes := indexes.set! index { value with ir := {
+                value.ir with
+                columns := match column with
+                  | some name => value.ir.columns.push name
+                  | none => value.ir.columns
+                keyElements := value.ir.keyElements.push element
+              } }
+            else
+              let expectedOrdinal := value.ir.keyElements.size +
+                value.ir.includedColumns.size + 1
+              unless ordinal == expectedOrdinal do
+                return .error (drift s!"index {value.key}: expected INCLUDE ordinal \
+                  {expectedOrdinal}, received {ordinal}")
+              let some name := column
+                | return .error (drift s!"index {value.key}: INCLUDE element is not a column")
+              if expression.isSome then
+                return .error (drift s!"index {value.key}: INCLUDE column has an expression")
+              indexes := indexes.set! index { value with ir := {
+                value.ir with includedColumns := value.ir.includedColumns.push name
+              } }
+      pure (.ok indexes)
+
+private def relationalConstraintTypeList (serverMajor : Nat) : String :=
+  if serverMajor >= 18 then "'c', 'n', 'p', 'u', 'f', 'x'"
+  else "'c', 'p', 'u', 'f', 'x'"
+
+/-- Versioned relation-constraint query.  PostgreSQL 17 has neither native
+NOT NULL constraint rows nor the `conenforced`/`conperiod` columns, so those
+values are supplied as semantic literals without mentioning absent columns.
+-/
+def relationalConstraintCatalogSql (serverMajor : Nat) : String :=
+  let enforced := if serverMajor >= 18 then "con.conenforced::text" else "true::text"
+  let period := if serverMajor >= 18 then "con.conperiod::text" else "false::text"
+  "SELECT con.oid::text, ns.nspname, c.relname, con.conname, con.contype::text, " ++
+  "rns.nspname, rc.relname, " ++
+  "CASE WHEN con.contype IN ('c', 'x') " ++
+  "THEN pg_catalog.pg_get_constraintdef(con.oid, true) ELSE NULL END, " ++
+  "con.convalidated::text, " ++ enforced ++ ", con.condeferrable::text, " ++
+  "con.condeferred::text, pns.nspname, pc.relname, parent.conname, " ++
+  "con.conislocal::text, con.coninhcount::text, con.connoinherit::text, " ++
+  period ++ ", ins.nspname, ic.relname, " ++
+  "CASE WHEN con.contype = 'f' THEN con.confmatchtype::text END, " ++
+  "CASE WHEN con.contype = 'f' THEN con.confupdtype::text END, " ++
+  "CASE WHEN con.contype = 'f' THEN con.confdeltype::text END, " ++
+  "COALESCE(i.indnullsnotdistinct, false)::text " ++
+  "FROM pg_catalog.pg_constraint AS con " ++
+  "JOIN pg_catalog.pg_class AS c ON c.oid = con.conrelid " ++
+  "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = c.relnamespace " ++
+  "LEFT JOIN pg_catalog.pg_class AS rc ON rc.oid = NULLIF(con.confrelid, 0) " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS rns ON rns.oid = rc.relnamespace " ++
+  "LEFT JOIN pg_catalog.pg_constraint AS parent ON parent.oid = NULLIF(con.conparentid, 0) " ++
+  "LEFT JOIN pg_catalog.pg_class AS pc ON pc.oid = parent.conrelid " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS pns ON pns.oid = pc.relnamespace " ++
+  "LEFT JOIN pg_catalog.pg_class AS ic ON ic.oid = NULLIF(con.conindid, 0) " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS ins ON ins.oid = ic.relnamespace " ++
+  "LEFT JOIN pg_catalog.pg_index AS i ON i.indexrelid = con.conindid " ++
+  "WHERE con.conrelid <> 0 AND con.contype IN (" ++
+  relationalConstraintTypeList serverMajor ++ ") ORDER BY con.oid"
+
+def relationalConstraintColumnSql (serverMajor : Nat) : String :=
+  "SELECT con.oid, false::text, item.ordinality, a.attname " ++
+  "FROM pg_catalog.pg_constraint AS con " ++
+  "CROSS JOIN LATERAL pg_catalog.unnest(con.conkey) " ++
+  "WITH ORDINALITY AS item(attnum, ordinality) " ++
+  "JOIN pg_catalog.pg_attribute AS a " ++
+  "ON a.attrelid = con.conrelid AND a.attnum = item.attnum " ++
+  "WHERE con.conrelid <> 0 AND con.contype IN (" ++
+  relationalConstraintTypeList serverMajor ++ ") UNION ALL " ++
+  "SELECT con.oid, true::text, item.ordinality, a.attname " ++
+  "FROM pg_catalog.pg_constraint AS con " ++
+  "CROSS JOIN LATERAL pg_catalog.unnest(con.confkey) " ++
+  "WITH ORDINALITY AS item(attnum, ordinality) " ++
+  "JOIN pg_catalog.pg_attribute AS a " ++
+  "ON a.attrelid = con.confrelid AND a.attnum = item.attnum " ++
+  "WHERE con.conrelid <> 0 AND con.contype = 'f' ORDER BY 1, 2, 3"
+
+def relationalConstraintDeleteSetColumnSql : String :=
+  "SELECT con.oid::text, item.ordinality::text, a.attname " ++
+  "FROM pg_catalog.pg_constraint AS con " ++
+  "CROSS JOIN LATERAL pg_catalog.unnest(con.confdelsetcols) " ++
+  "WITH ORDINALITY AS item(attnum, ordinality) " ++
+  "JOIN pg_catalog.pg_attribute AS a " ++
+  "ON a.attrelid = con.conrelid AND a.attnum = item.attnum " ++
+  "WHERE con.conrelid <> 0 AND con.contype = 'f' " ++
+  "ORDER BY con.oid, item.ordinality"
+
+def relationalConstraintOperatorSql : String :=
+  let branch (field tag : String) :=
+    "SELECT con.oid, '" ++ tag ++ "'::text, item.ordinality, " ++
+    "ons.nspname, op.oprname, op.oprleft::text, op.oprright::text " ++
+    "FROM pg_catalog.pg_constraint AS con " ++
+    "CROSS JOIN LATERAL pg_catalog.unnest(con." ++ field ++ ") " ++
+    "WITH ORDINALITY AS item(operator_oid, ordinality) " ++
+    "JOIN pg_catalog.pg_operator AS op ON op.oid = item.operator_oid " ++
+    "JOIN pg_catalog.pg_namespace AS ons ON ons.oid = op.oprnamespace"
+  String.intercalate " UNION ALL " [
+    branch "conpfeqop" "pf",
+    branch "conppeqop" "pp",
+    branch "conffeqop" "ff",
+    branch "conexclop" "exclude"
+  ] ++ " ORDER BY 1, 2, 3"
+
+private structure LiveConstraint where
+  oid : UInt32
+  ir : Pgx.ConstraintIR
+  localColumnOrdinal : Nat := 0
+  referencedColumnOrdinal : Nat := 0
+  exclusionOperators : Array Pgx.OperatorKey := #[]
+  deriving Inhabited
+
+private structure RelationNotNull where
+  relation : Pgx.RelationKey
+  column : String
+  deriving BEq
+
+private def canonicalNotNull (value : RelationNotNull)
+    (source : Option Pgx.ConstraintIR := none) : Pgx.ConstraintIR :=
+  let base : Pgx.ConstraintIR := {
+    relation := value.relation
+    name := s!"<not-null:{value.column}>"
+    kind := .notNull
+    columns := #[value.column]
+  }
+  match source with
+  | none => base
+  | some source => { base with
+      enforced := source.enforced
+      validated := source.validated
+      parent := source.parent
+      isLocal := source.isLocal
+      inheritanceCount := source.inheritanceCount
+      noInherit := source.noInherit
+    }
+
+private def nativeNotNullKey (constraint : Pgx.ConstraintIR) :
+    Except Error RelationNotNull := do
+  unless constraint.columns.size == 1 do
+    throw (drift s!"native NOT NULL constraint {constraint.relation}.{constraint.name} \
+      must name exactly one column")
+  if constraint.referencedRelation.isSome || !constraint.referencedColumns.isEmpty ||
+      constraint.expression.isSome || constraint.localExpression.isSome ||
+      constraint.deferrable || constraint.initiallyDeferred || constraint.period ||
+      constraint.supportingIndex.isSome ||
+      !constraint.foreignKeyDeleteSetColumns.isEmpty ||
+      !constraint.referencedToReferencingOperators.isEmpty ||
+      !constraint.referencedEqualityOperators.isEmpty ||
+      !constraint.referencingEqualityOperators.isEmpty ||
+      !constraint.exclusionElements.isEmpty then
+    throw (drift s!"native NOT NULL constraint {constraint.relation}.{constraint.name} \
+      has unexpected catalog metadata")
+  pure { relation := constraint.relation, column := constraint.columns[0]! }
+
+/-- PostgreSQL 18 may set `pg_attribute.attnotnull` for an enforced but
+unvalidated native NOT NULL constraint while pre-existing NULL values remain.
+Until relation nullability is derived from lifecycle-aware metadata, such a
+column cannot safely back a generated non-optional decoder. -/
+def validateNotNullReadSafety (serverMajor : Nat)
+    (constraints : Array Pgx.ConstraintIR) : Except Error Unit := do
+  if serverMajor < 18 then return
+  for constraint in constraints do
+    if constraint.kind == .notNull && (!constraint.validated || !constraint.enforced) then
+      throw (drift s!"cannot trust relation nullability for native NOT NULL \
+        constraint {constraint.relation}.{constraint.name}: enforced={constraint.enforced}, \
+        validated={constraint.validated}")
+
+private def normalizeNotNullConstraints (serverMajor : Nat)
+    (catalog : Array Pgx.ConstraintIR) (relations : Array LiveRelation) :
+    Except Error (Array Pgx.ConstraintIR) := do
+  validateNotNullReadSafety serverMajor catalog
+  let mut attributes : Array RelationNotNull := #[]
+  for relation in relations do
+    for column in relation.columns do
+      if column.attributeNotNull then
+        attributes := attributes.push { relation := relation.key, column := column.name }
+  let mut result : Array Pgx.ConstraintIR := #[]
+  let mut nativeKeys : Array RelationNotNull := #[]
+  for constraint in catalog do
+    if constraint.kind == .notNull then
+      unless serverMajor >= 18 do
+        throw (drift s!"PostgreSQL {serverMajor} returned a native NOT NULL constraint")
+      let key ← nativeNotNullKey constraint
+      unless attributes.contains key do
+        throw (drift s!"native NOT NULL constraint for {key.relation}.{key.column} \
+          is absent from pg_attribute")
+      if nativeKeys.contains key then
+        throw (drift s!"duplicate native NOT NULL constraint for {key.relation}.{key.column}")
+      nativeKeys := nativeKeys.push key
+      let normalized := canonicalNotNull key (some constraint)
+      if result.any (fun existing => existing.key == normalized.key) then
+        throw (drift s!"duplicate normalized constraint identity {normalized.key}")
+      result := result.push normalized
+    else
+      if result.any (fun existing => existing.key == constraint.key) then
+        throw (drift s!"duplicate normalized constraint identity {constraint.key}")
+      result := result.push constraint
+  for key in attributes do
+    unless nativeKeys.contains key do
+      let normalized := canonicalNotNull key
+      if result.any (fun existing => existing.key == normalized.key) then
+        throw (drift s!"synthetic NOT NULL identity {normalized.key} collides \
+          with a PostgreSQL constraint name")
+      result := result.push normalized
+  pure result
+
+private def loadRelationalConstraints (conn : Pg.Connection) (serverMajor : Nat)
+    (relations : Array LiveRelation) (types : Array LiveType)
+    (indexes : Array LiveIndex) :
+    Async (Except Error (Array Pgx.ConstraintIR)) := do
+  match ← queryOne conn "read relational pg_constraint"
+      (relationalConstraintCatalogSql serverMajor) with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    let mut constraints : Array LiveConstraint := #[]
+    for row in rows.rows do
+      let parsed : Except Error LiveConstraint := do
+        let context := "read relational pg_constraint"
+        let oid ← parseUInt32 context (← cell context row 0)
+        let relation : Pgx.RelationKey := {
+          schema := ← cell context row 1
+          name := ← cell context row 2
+        }
+        let name ← cell context row 3
+        let kind ← parseConstraintKind context (← cell context row 4)
+        if kind == .notNull && serverMajor < 18 then
+          throw (drift s!"PostgreSQL {serverMajor} returned a native NOT NULL constraint")
+        let referencedSchema ← cell? context row 5
+        let referencedName ← cell? context row 6
+        let referencedRelation ← match referencedSchema, referencedName with
+          | none, none => pure none
+          | some schema, some name => pure (some { schema, name })
+          | _, _ => throw (drift s!"{context}: incomplete referenced relation identity")
+        let expression ← cell? context row 7
+        let validated ← parseBool context (← cell context row 8)
+        let enforced ← parseBool context (← cell context row 9)
+        let deferrable ← parseBool context (← cell context row 10)
+        let initiallyDeferred ← parseBool context (← cell context row 11)
+        if initiallyDeferred && !deferrable then
+          throw (drift s!"constraint {relation}.{name} is initially deferred but not deferrable")
+        let parentSchema ← cell? context row 12
+        let parentRelationName ← cell? context row 13
+        let parentName ← cell? context row 14
+        let parent ← match parentSchema, parentRelationName, parentName with
+          | none, none, none => pure none
+          | some schema, some relationName, some name => pure (some {
+              relation := { schema, name := relationName }, name
+            })
+          | _, _, _ => throw (drift s!"{context}: incomplete parent constraint identity")
+        let isLocal ← parseBool context (← cell context row 15)
+        let inheritanceCount ← parseNat context (← cell context row 16)
+        let noInherit ← parseBool context (← cell context row 17)
+        let period ← parseBool context (← cell context row 18)
+        let indexSchema ← cell? context row 19
+        let indexName ← cell? context row 20
+        let supportingIndex ← match indexSchema, indexName with
+          | none, none => pure none
+          | some schema, some name => pure (some { schema, name })
+          | _, _ => throw (drift s!"{context}: incomplete supporting index identity")
+        let foreignKeyMatch ← match ← cell? context row 21 with
+          | some value => parseForeignKeyMatch context value
+          | none => do
+            if kind == .foreignKey then
+              throw (drift s!"foreign key {relation}.{name} has no match type")
+            else pure .simple
+        let foreignKeyOnUpdate ← match ← cell? context row 22 with
+          | some value => parseForeignKeyAction context value
+          | none => do
+            if kind == .foreignKey then
+              throw (drift s!"foreign key {relation}.{name} has no update action")
+            else pure .noAction
+        let foreignKeyOnDelete ← match ← cell? context row 23 with
+          | some value => parseForeignKeyAction context value
+          | none => do
+            if kind == .foreignKey then
+              throw (drift s!"foreign key {relation}.{name} has no delete action")
+            else pure .noAction
+        let nullsNotDistinct ← parseBool context (← cell context row 24)
+        pure { oid, ir := {
+          relation, name, kind, referencedRelation, expression,
+          enforced, validated, deferrable, initiallyDeferred, parent, isLocal,
+          inheritanceCount, noInherit, period, supportingIndex,
+          uniqueNullPolicy := if nullsNotDistinct then .notDistinct else .distinct,
+          foreignKeyMatch, foreignKeyOnUpdate, foreignKeyOnDelete
+        } }
+      match parsed with
+      | .error error => return .error error
+      | .ok value =>
+        if relations.any (fun relation => relation.key == value.ir.relation) then
+          constraints := constraints.push value
+    match ← queryOne conn "read relational constraint columns"
+        (relationalConstraintColumnSql serverMajor) with
+    | .error error => pure (.error error)
+    | .ok columnRows =>
+      for row in columnRows.rows do
+        let parsed : Except Error (UInt32 × Bool × Nat × String) := do
+          let context := "read relational constraint columns"
+          pure (← parseUInt32 context (← cell context row 0),
+            ← parseBool context (← cell context row 1),
+            ← parseNat context (← cell context row 2), ← cell context row 3)
+        match parsed with
+        | .error error => return .error error
+        | .ok (oid, referenced, ordinal, name) =>
+          match constraints.findIdx? (fun value => value.oid == oid) with
+          | none => pure ()
+          | some index =>
+            let value := constraints[index]!
+            let expectedOrdinal := if referenced then value.ir.referencedColumns.size + 1
+              else value.ir.columns.size + 1
+            let lastOrdinal := if referenced then value.referencedColumnOrdinal
+              else value.localColumnOrdinal
+            let ordinalValid := if !referenced && value.ir.kind == .exclusion then
+                ordinal > lastOrdinal
+              else
+                ordinal == expectedOrdinal
+            unless ordinalValid do
+              return .error (drift s!"constraint {value.ir.relation}.{value.ir.name}: \
+                invalid column ordinal {ordinal} after {lastOrdinal}")
+            let ir := if referenced then { value.ir with
+                referencedColumns := value.ir.referencedColumns.push name }
+              else { value.ir with columns := value.ir.columns.push name }
+            let value := if referenced then
+                { value with ir, referencedColumnOrdinal := ordinal }
+              else
+                { value with ir, localColumnOrdinal := ordinal }
+            constraints := constraints.set! index value
+      match ← queryOne conn "read foreign-key delete-set columns"
+          relationalConstraintDeleteSetColumnSql with
+      | .error error => pure (.error error)
+      | .ok deleteRows =>
+        for row in deleteRows.rows do
+          let parsed : Except Error (UInt32 × Nat × String) := do
+            let context := "read foreign-key delete-set columns"
+            pure (← parseUInt32 context (← cell context row 0),
+              ← parseNat context (← cell context row 1), ← cell context row 2)
+          match parsed with
+          | .error error => return .error error
+          | .ok (oid, ordinal, name) =>
+            match constraints.findIdx? (fun value => value.oid == oid) with
+            | none => pure ()
+            | some index =>
+              let value := constraints[index]!
+              let expectedOrdinal := value.ir.foreignKeyDeleteSetColumns.size + 1
+              unless ordinal == expectedOrdinal do
+                return .error (drift s!"foreign key {value.ir.relation}.{value.ir.name}: \
+                  expected delete-set ordinal {expectedOrdinal}, received {ordinal}")
+              constraints := constraints.set! index { value with ir := {
+                value.ir with foreignKeyDeleteSetColumns :=
+                  value.ir.foreignKeyDeleteSetColumns.push name
+              } }
+        match ← queryOne conn "read relational constraint operators"
+            relationalConstraintOperatorSql with
+        | .error error => pure (.error error)
+        | .ok operatorRows =>
+          for row in operatorRows.rows do
+            let parsed : Except Error (UInt32 × String × Nat × Pgx.OperatorKey) := do
+              let context := "read relational constraint operators"
+              let oid ← parseUInt32 context (← cell context row 0)
+              let vector ← cell context row 1
+              let ordinal ← parseNat context (← cell context row 2)
+              let schema ← cell context row 3
+              let name ← cell context row 4
+              let leftOid ← parseUInt32 context (← cell context row 5)
+              let rightOid ← parseUInt32 context (← cell context row 6)
+              pure (oid, vector, ordinal, ← operatorKeyByOperandOids types context
+                schema name leftOid rightOid)
+            match parsed with
+            | .error error => return .error error
+            | .ok (oid, vector, ordinal, key) =>
+              match constraints.findIdx? (fun value => value.oid == oid) with
+              | none => pure ()
+              | some index =>
+                let value := constraints[index]!
+                let current? := match vector with
+                  | "pf" => some value.ir.referencedToReferencingOperators
+                  | "pp" => some value.ir.referencedEqualityOperators
+                  | "ff" => some value.ir.referencingEqualityOperators
+                  | "exclude" => some value.exclusionOperators
+                  | _ => none
+                let some current := current?
+                  | return .error (drift s!"constraint {value.ir.relation}.{value.ir.name}: \
+                      unknown operator vector {vector}")
+                unless ordinal == current.size + 1 do
+                  return .error (drift s!"constraint {value.ir.relation}.{value.ir.name}: \
+                    expected {vector} operator ordinal {current.size + 1}, received {ordinal}")
+                let updated := match vector with
+                  | "pf" => { value with ir := { value.ir with
+                      referencedToReferencingOperators := current.push key } }
+                  | "pp" => { value with ir := { value.ir with
+                      referencedEqualityOperators := current.push key } }
+                  | "ff" => { value with ir := { value.ir with
+                      referencingEqualityOperators := current.push key } }
+                  | "exclude" => { value with exclusionOperators := current.push key }
+                  | _ => value
+                constraints := constraints.set! index updated
+          for index in [:constraints.size] do
+            let value := constraints[index]!
+            let checked : Except Error Pgx.ConstraintIR := match value.ir.kind with
+              | .primaryKey | .unique => do
+                let some key := value.ir.supportingIndex
+                  | throw (drift s!"constraint {value.ir.relation}.{value.ir.name} has no supporting index")
+                let some supporting := indexes.find? (fun index => index.key == key)
+                  | throw (drift s!"constraint {value.ir.relation}.{value.ir.name} refers to missing index {key}")
+                unless supporting.ir.relation == value.ir.relation do
+                  throw (drift s!"constraint {value.ir.relation}.{value.ir.name} is backed by index {key} on {supporting.ir.relation}")
+                unless supporting.ir.uniqueNullPolicy == value.ir.uniqueNullPolicy do
+                  throw (drift s!"constraint {value.ir.relation}.{value.ir.name} disagrees with index {key} on null uniqueness")
+                unless supporting.ir.keyElements.size == value.ir.columns.size do
+                  throw (drift s!"constraint {value.ir.relation}.{value.ir.name} has unaligned key columns")
+                pure value.ir
+              | .foreignKey => do
+                unless value.ir.referencedRelation.isSome do
+                  throw (drift s!"foreign key {value.ir.relation}.{value.ir.name} has no referenced relation")
+                let width := value.ir.columns.size
+                unless width > 0 && value.ir.referencedColumns.size == width do
+                  throw (drift s!"foreign key {value.ir.relation}.{value.ir.name} has unaligned key columns")
+                unless value.ir.referencedToReferencingOperators.size == width &&
+                    value.ir.referencedEqualityOperators.size == width &&
+                    value.ir.referencingEqualityOperators.size == width do
+                  throw (drift s!"foreign key {value.ir.relation}.{value.ir.name} has unaligned equality-operator vectors")
+                for name in value.ir.foreignKeyDeleteSetColumns do
+                  unless value.ir.columns.contains name do
+                    throw (drift s!"foreign key {value.ir.relation}.{value.ir.name} has unknown delete-set column {name}")
+                let some key := value.ir.supportingIndex
+                  | throw (drift s!"foreign key {value.ir.relation}.{value.ir.name} has no referenced index")
+                unless indexes.any (fun index => index.key == key) do
+                  throw (drift s!"foreign key {value.ir.relation}.{value.ir.name} refers to missing index {key}")
+                pure value.ir
+              | .exclusion => do
+                let some key := value.ir.supportingIndex
+                  | throw (drift s!"exclusion constraint {value.ir.relation}.{value.ir.name} has no supporting index")
+                let some supporting := indexes.find? (fun index => index.key == key)
+                  | throw (drift s!"exclusion constraint {value.ir.relation}.{value.ir.name} refers to missing index {key}")
+                unless supporting.ir.relation == value.ir.relation do
+                  throw (drift s!"exclusion constraint {value.ir.relation}.{value.ir.name} is backed by index {key} on {supporting.ir.relation}")
+                unless supporting.ir.keyElements.size == value.exclusionOperators.size do
+                  throw (drift s!"exclusion constraint {value.ir.relation}.{value.ir.name} has unaligned operators")
+                let mut elements : Array Pgx.ExclusionElementIR := #[]
+                for ordinal in [:supporting.ir.keyElements.size] do
+                  elements := elements.push {
+                    key := supporting.ir.keyElements[ordinal]!
+                    operator := value.exclusionOperators[ordinal]!
+                  }
+                pure { value.ir with exclusionElements := elements }
+              | .check | .notNull => do
+                if value.ir.supportingIndex.isSome then
+                  throw (drift s!"constraint {value.ir.relation}.{value.ir.name} unexpectedly has a supporting index")
+                pure value.ir
+            match checked with
+            | .error error => return .error error
+            | .ok ir => constraints := constraints.set! index { value with ir }
+          pure (normalizeNotNullConstraints serverMajor
+            (constraints.map (fun value => value.ir)) relations)
 
 private def viewCatalogSql : String :=
   "SELECT c.oid::text, ns.nspname, c.relname, c.relkind::text, " ++
@@ -882,6 +1563,72 @@ private def metadataSchemas (db : DatabaseDesc) : Array String := Id.run do
       schemas := schemas.push routine.key.schema
   return schemas
 
+private def sortedStrings (values : Array String) : Array String :=
+  values.toList.mergeSort (fun left right => compare left right == .lt) |>.toArray
+
+private def catalogConstraintView (value : Pgx.ConstraintIR) : Pgx.ConstraintIR :=
+  { value with
+    -- The typed local expression is a code-generation derivation of the
+    -- normalized catalog definition, not an independent live-catalog field.
+    localExpression := none
+    foreignKeyDeleteSetColumns := sortedStrings value.foreignKeyDeleteSetColumns
+  }
+
+/-- Compare relation constraints as an unordered, duplicate-free collection.
+Ordered column/operator vectors remain ordered; only the documented set-like
+foreign-key delete subset is canonicalized. -/
+def validateConstraintMetadata (expected actual : Array Pgx.ConstraintIR) :
+    Except Error Unit := do
+  unless actual.size == expected.size do
+    throw (drift s!"constraint metadata count drift: expected {expected.size}, received {actual.size}")
+  let mut seen : Array Pgx.ConstraintKey := #[]
+  for want in expected do
+    let key := want.key
+    if seen.contains key then
+      throw (drift s!"generated constraint metadata duplicates {key}")
+    seen := seen.push key
+    let candidates := actual.filter (fun value => value.key == key)
+    let some found := candidates[0]?
+      | throw (drift s!"required constraint metadata is missing: {key}")
+    unless candidates.size == 1 do
+      throw (drift s!"constraint metadata identity is ambiguous: {key}")
+    let want := catalogConstraintView want
+    let found := catalogConstraintView found
+    unless found == want do
+      throw (drift s!"constraint metadata drift for {key}: expected \
+        {repr want}, received {repr found}")
+
+private def isSemanticIndex (value : Pgx.IndexIR) : Bool :=
+  value.unique || value.primary || value.exclusion
+
+private def catalogIndexView (value : Pgx.IndexIR) : Pgx.IndexIR :=
+  { value with includedColumns := sortedStrings value.includedColumns }
+
+/-- Compare indexes that carry relational meaning.  Plain non-unique indexes
+are intentionally ignored: they are performance objects and do not justify a
+generated integrity proposition. -/
+def validateIndexMetadata (expected actual : Array Pgx.IndexIR) : Except Error Unit := do
+  let expected := expected.filter isSemanticIndex
+  let actual := actual.filter isSemanticIndex
+  unless actual.size == expected.size do
+    throw (drift s!"relational index metadata count drift: expected {expected.size}, received {actual.size}")
+  let mut seen : Array Pgx.IndexKey := #[]
+  for want in expected do
+    let key := want.key
+    if seen.contains key then
+      throw (drift s!"generated relational index metadata duplicates {key}")
+    seen := seen.push key
+    let candidates := actual.filter (fun value => value.key == key)
+    let some found := candidates[0]?
+      | throw (drift s!"required relational index metadata is missing: {key}")
+    unless candidates.size == 1 do
+      throw (drift s!"relational index metadata identity is ambiguous: {key}")
+    let want := catalogIndexView want
+    let found := catalogIndexView found
+    unless found == want do
+      throw (drift s!"relational index metadata drift for {key}: expected \
+        {repr want}, received {repr found}")
+
 /-- Compare live semantic view metadata as an unordered, duplicate-free set. -/
 def validateViewMetadata (expected actual : Array Pgx.ViewIR) : Except Error Unit := do
   unless actual.size == expected.size do
@@ -1150,13 +1897,13 @@ def CheckedConnection.completePrepare (conn : CheckedConnection db) (key : Strin
   | some completion => discard <| completion.resolve result
 
 /-- Install the generated session contract and compare every relevant type,
-relation, column, view, routine, and required extension before constructing a
-checked capability. -/
+relation, column, relational constraint/index, view, routine, and required
+extension before constructing a checked capability. -/
 def attach (db : DatabaseDesc) (conn : Pg.Connection) :
     Async (Except Error (CheckedConnection db)) := do
-  match ← validateServerMajor db conn with
+  let serverMajor ← match ← validateServerMajor db conn with
   | .error error => return .error error
-  | .ok () => pure ()
+  | .ok value => pure value
   match ← installSession db conn with
   | .error error => return .error error
   | .ok () => pure ()
@@ -1164,6 +1911,15 @@ def attach (db : DatabaseDesc) (conn : Pg.Connection) :
     | .error error => return .error error
     | .ok values => pure values
   let liveRelations ← match ← loadRelations conn with
+    | .error error => return .error error
+    | .ok values => pure values
+  let relationalRelations := liveRelations.filter fun actual =>
+    db.relations.any (fun expected => expected.key == actual.key)
+  let liveIndexes ← match ← loadRelationalIndexes conn relationalRelations liveTypes with
+    | .error error => return .error error
+    | .ok values => pure values
+  let liveConstraints ← match ← loadRelationalConstraints conn serverMajor
+      relationalRelations liveTypes liveIndexes with
     | .error error => return .error error
     | .ok values => pure values
   let schemas := metadataSchemas db
@@ -1189,6 +1945,12 @@ def attach (db : DatabaseDesc) (conn : Pg.Connection) :
   | .error error => return .error error
   | .ok () => pure ()
   match validateRoutineMetadata db.routines liveRoutines with
+  | .error error => return .error error
+  | .ok () => pure ()
+  match validateIndexMetadata db.indexes (liveIndexes.map (fun value => value.ir)) with
+  | .error error => return .error error
+  | .ok () => pure ()
+  match validateConstraintMetadata db.constraints liveConstraints with
   | .error error => return .error error
   | .ok () => pure ()
   match validateExtensionMetadata db installedExtensions extensionTypeOwnership with

@@ -77,6 +77,13 @@ structure DatabaseDesc where
   session : Pgx.SessionContract
   types : Array StaticTypeDesc
   relations : Array StaticRelationDesc
+  /-- Symbolic relational constraints checked against the live catalog before
+  a connection becomes usable by generated code. -/
+  constraints : Array Pgx.ConstraintIR := #[]
+  /-- Index metadata needed by relational constraints.  Attachment compares
+  semantic (unique, primary-key, and exclusion) indexes; ordinary
+  performance-only indexes remain descriptive IR. -/
+  indexes : Array Pgx.IndexIR := #[]
   views : Array Pgx.ViewIR := #[]
   routines : Array Pgx.RoutineIR := #[]
   requiredExtensions : Array (String × String) := #[]
