@@ -410,6 +410,30 @@ private def expectSchemaDrift (conn : Pg.Connection) : Async Unit := do
   | .error error => fail s!"fresh attachment returned the wrong error: {error}"
   | .ok _ => fail "fresh attachment unexpectedly accepted the drifted schema"
 
+private def exerciseSemanticMetadataDrift
+    (config : Pg.ConnectConfig) (raw : Pg.Connection) : Async Unit := do
+  let _ ← pg! "drift application view definition" (← raw.exec
+    "CREATE OR REPLACE VIEW app.type_sample_summary AS \
+     SELECT sample.id, cardinality(sample.statuses) AS status_count, sample.amount \
+     FROM app.type_samples AS sample WHERE sample.id IS NOT NULL")
+  withConnection config expectSchemaDrift
+  let _ ← pg! "restore application view definition" (← raw.exec
+    "CREATE OR REPLACE VIEW app.type_sample_summary AS \
+     SELECT sample.id, cardinality(sample.statuses) AS status_count, sample.amount \
+     FROM app.type_samples AS sample")
+  withConnection config fun conn => do
+    let _ ← attach! "reattach after restoring view metadata" conn
+    pure ()
+
+  let _ ← pg! "drift table-valued function volatility" (← raw.exec
+    "ALTER FUNCTION app.list_type_sample_summaries(numeric) VOLATILE")
+  withConnection config expectSchemaDrift
+  let _ ← pg! "restore table-valued function volatility" (← raw.exec
+    "ALTER FUNCTION app.list_type_sample_summaries(numeric) STABLE")
+  withConnection config fun conn => do
+    let _ ← attach! "reattach after restoring routine metadata" conn
+    pure ()
+
 private def runAcceptance (options : Options) : Async Unit := do
   let config ← match Pg.ConnectConfig.parseUri options.url with
     | .ok value => pure value
@@ -424,6 +448,7 @@ private def runAcceptance (options : Options) : Async Unit := do
     exerciseNullableCheck checked organizationId
     exerciseSelfJoinProvenance checked organizationId
     exerciseBroaderTypes checked
+    exerciseSemanticMetadataDrift config raw
     exerciseStoredConstraintViolations raw checked organizationId
 
     -- This physical connection is attached before the DDL change, but its
