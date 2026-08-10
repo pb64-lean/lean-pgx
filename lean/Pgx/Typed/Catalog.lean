@@ -714,6 +714,24 @@ private def loadRoutines (conn : Pg.Connection) (schemas : Array String)
       let returnType ← match returnTypeResult with
         | .ok result => pure result
         | .error error => return .error error
+      if schemas.contains value.ir.key.schema && value.ir.returnsSet && results.isEmpty then
+        match returnType with
+        | some ref =>
+          if ref.key.kind == .composite then
+            let candidates := types.filter (fun ty => ty.key == ref.key)
+            let some composite := candidates[0]?
+              | return .error (drift s!"set-returning routine {value.ir.key} \
+                  refers to missing composite result {ref.key}")
+            unless candidates.size == 1 do
+              return .error (drift s!"set-returning routine {value.ir.key} \
+                has ambiguous composite result {ref.key}")
+            for field in composite.compositeFields do
+              results := results.push {
+                name := field.name
+                ordinal := results.size + 1
+                ty := field.ty
+              }
+        | none => pure ()
       let dynamicRecord := match returnType with
         | some ref => ref.key.kind == .pseudo && ref.key.name == "record" && results.isEmpty
         | none => false

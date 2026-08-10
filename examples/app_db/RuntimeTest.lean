@@ -338,7 +338,11 @@ private def exerciseBroaderTypes
       AppDb.Constraints.routines.any (fun routine =>
       routine.key.schema == "app" &&
       routine.key.name == "list_type_sample_summaries" &&
-      routine.returnsSet && routine.resultColumns.size == 3) do
+      routine.returnsSet &&
+      routine.returnType == some {
+        key := { schema := "app", name := "type_sample_summary", kind := .composite }
+      } &&
+      routine.resultColumns.map (·.name) == #["id", "status_count", "amount"]) do
     fail "generated metadata did not isolate the application table-valued function"
   unless AppDb.Constraints.extensionCodecPackages.any (fun package =>
       package.extension == "citext" && package.importModule == "AppDb.ExtensionCodecs" &&

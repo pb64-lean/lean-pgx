@@ -34,7 +34,7 @@ SELECT
 FROM app.type_samples AS sample;
 
 CREATE FUNCTION app.list_type_sample_summaries(minimum numeric(6, 2) DEFAULT 0)
-RETURNS TABLE (id bigint, status_count integer, amount numeric(6, 2))
+RETURNS SETOF app.type_sample_summary
 LANGUAGE sql
 STABLE
 AS $function$
