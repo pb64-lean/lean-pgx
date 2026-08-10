@@ -237,6 +237,10 @@ private structure LiveType where
   compositeFields : Array Pgx.CompositeFieldIR := #[]
   rangeSubtype : Option Pgx.TypeRef := none
   rangeMultirange : Option Pgx.TypeKey := none
+  rangeCollation : Option Pgx.CollationKey := none
+  rangeSubtypeOpclass : Option Pgx.QualifiedName := none
+  rangeCanonical : Option Pgx.RoutineKey := none
+  rangeSubtypeDiff : Option Pgx.RoutineKey := none
   multirangeRange : Option Pgx.TypeKey := none
 
 private def kindSql (alias : String) : String :=
@@ -266,7 +270,9 @@ private def typeCatalogSql : String :=
   kindSql "rst" ++ " END, rmns.nspname, rmt.typname, " ++
   "CASE WHEN rmt.oid IS NULL THEN NULL ELSE " ++ kindSql "rmt" ++ " END, " ++
   "rrns.nspname, rrt.typname, CASE WHEN rrt.oid IS NULL THEN NULL ELSE " ++
-  kindSql "rrt" ++ " END " ++
+  kindSql "rrt" ++ " END, " ++
+  "rcns.nspname, rc.collname, ropns.nspname, rop.opcname, " ++
+  "rcanns.nspname, rcan.proname, rdns.nspname, rdiff.proname " ++
   "FROM pg_catalog.pg_type AS t " ++
   "JOIN pg_catalog.pg_namespace AS ns ON ns.oid = t.typnamespace " ++
   "LEFT JOIN pg_catalog.pg_type AS bt ON bt.oid = NULLIF(t.typbasetype, 0) " ++
@@ -282,6 +288,14 @@ private def typeCatalogSql : String :=
   "LEFT JOIN pg_catalog.pg_range AS mrg ON mrg.rngmultitypid = t.oid " ++
   "LEFT JOIN pg_catalog.pg_type AS rrt ON rrt.oid = mrg.rngtypid " ++
   "LEFT JOIN pg_catalog.pg_namespace AS rrns ON rrns.oid = rrt.typnamespace " ++
+  "LEFT JOIN pg_catalog.pg_collation AS rc ON rc.oid = NULLIF(rg.rngcollation, 0) " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS rcns ON rcns.oid = rc.collnamespace " ++
+  "LEFT JOIN pg_catalog.pg_opclass AS rop ON rop.oid = rg.rngsubopc " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS ropns ON ropns.oid = rop.opcnamespace " ++
+  "LEFT JOIN pg_catalog.pg_proc AS rcan ON rcan.oid = NULLIF(rg.rngcanonical, 0) " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS rcanns ON rcanns.oid = rcan.pronamespace " ++
+  "LEFT JOIN pg_catalog.pg_proc AS rdiff ON rdiff.oid = NULLIF(rg.rngsubdiff, 0) " ++
+  "LEFT JOIN pg_catalog.pg_namespace AS rdns ON rdns.oid = rdiff.pronamespace " ++
   "ORDER BY ns.nspname, t.typname"
 
 private def enumCatalogSql : String :=
@@ -319,6 +333,16 @@ private def optionalTypeRef (context : String) (row : Array (Option ByteArray))
     pure (some { key := { schema, name, kind := ← parseTypeKind context kind } })
   | _, _, _ => throw (drift s!"{context}: incomplete component type identity")
 
+private def optionalQualifiedName (context identity : String)
+    (row : Array (Option ByteArray)) (offset : Nat) :
+    Except Error (Option Pgx.QualifiedName) := do
+  let schema ← cell? context row offset
+  let name ← cell? context row (offset + 1)
+  match schema, name with
+  | none, none => pure none
+  | some schema, some name => pure (some { schema, name })
+  | _, _ => throw (drift s!"{context}: incomplete {identity} identity")
+
 private def parseLiveType (row : Array (Option ByteArray)) : Except Error LiveType := do
   let context := "read pg_type"
   let schema ← cell context row 0
@@ -352,9 +376,49 @@ private def parseLiveType (row : Array (Option ByteArray)) : Except Error LiveTy
   let rangeSubtype ← optionalTypeRef context row 14
   let rangeMultirange := (← optionalTypeRef context row 17).map (·.key)
   let multirangeRange := (← optionalTypeRef context row 20).map (·.key)
+  let rangeCollation := (← optionalQualifiedName context "range collation" row 23).map fun value =>
+    ({ schema := value.schema, name := value.name } : Pgx.CollationKey)
+  let rangeSubtypeOpclass ←
+    optionalQualifiedName context "range subtype opclass" row 25
+  let rangeCanonical := (←
+      optionalQualifiedName context "range canonical routine" row 27).map fun value => {
+    schema := value.schema
+    name := value.name
+    inputTypes := #[{ key := { schema, name, kind } }]
+  }
+  let rangeSubtypeDiff ← match ←
+      optionalQualifiedName context "range subtype-diff routine" row 29 with
+    | none => pure none
+    | some value =>
+        let some subtype := rangeSubtype
+          | throw (drift s!"{context}: range subtype-diff exists without a subtype")
+        pure (some {
+          schema := value.schema
+          name := value.name
+          inputTypes := #[subtype, subtype]
+        })
+  if kind == .range then
+    unless rangeSubtype.isSome && rangeMultirange.isSome &&
+        rangeSubtypeOpclass.isSome do
+      throw (drift s!"{context}: incomplete range metadata for {schema}.{name}")
+    unless multirangeRange.isNone do
+      throw (drift s!"{context}: range {schema}.{name} carries multirange metadata")
+  else if kind == .multirange then
+    unless multirangeRange.isSome do
+      throw (drift s!"{context}: incomplete multirange metadata for {schema}.{name}")
+    unless rangeSubtype.isNone && rangeMultirange.isNone && rangeCollation.isNone &&
+        rangeSubtypeOpclass.isNone && rangeCanonical.isNone && rangeSubtypeDiff.isNone do
+      throw (drift s!"{context}: multirange {schema}.{name} carries range metadata")
+  else
+    unless rangeSubtype.isNone && rangeMultirange.isNone && rangeCollation.isNone &&
+        rangeSubtypeOpclass.isNone && rangeCanonical.isNone && rangeSubtypeDiff.isNone &&
+        multirangeRange.isNone do
+      throw (drift s!"{context}: non-range type {schema}.{name} carries range metadata")
   pure {
     key := { schema, name, kind }, oid, arrayOid, base, notNull,
-    arrayElement, arrayDelimiter, rangeSubtype, rangeMultirange, multirangeRange
+    arrayElement, arrayDelimiter, rangeSubtype, rangeMultirange,
+    rangeCollation, rangeSubtypeOpclass, rangeCanonical, rangeSubtypeDiff,
+    multirangeRange
   }
 
 private def loadTypes (conn : Pg.Connection) :
@@ -928,6 +992,18 @@ private def checkTypes (db : DatabaseDesc) (live : Array LiveType) :
     unless actual.rangeMultirange == expected.rangeMultirange do
       throw (drift s!"range multirange drift for {expected.key}: expected \
         {repr expected.rangeMultirange}, received {repr actual.rangeMultirange}")
+    unless actual.rangeCollation == expected.rangeCollation do
+      throw (drift s!"range collation drift for {expected.key}: expected \
+        {repr expected.rangeCollation}, received {repr actual.rangeCollation}")
+    unless actual.rangeSubtypeOpclass == expected.rangeSubtypeOpclass do
+      throw (drift s!"range subtype opclass drift for {expected.key}: expected \
+        {repr expected.rangeSubtypeOpclass}, received {repr actual.rangeSubtypeOpclass}")
+    unless actual.rangeCanonical == expected.rangeCanonical do
+      throw (drift s!"range canonical routine drift for {expected.key}: expected \
+        {repr expected.rangeCanonical}, received {repr actual.rangeCanonical}")
+    unless actual.rangeSubtypeDiff == expected.rangeSubtypeDiff do
+      throw (drift s!"range subtype-diff routine drift for {expected.key}: expected \
+        {repr expected.rangeSubtypeDiff}, received {repr actual.rangeSubtypeDiff}")
     unless actual.multirangeRange == expected.multirangeRange do
       throw (drift s!"multirange range drift for {expected.key}: expected \
         {repr expected.multirangeRange}, received {repr actual.multirangeRange}")

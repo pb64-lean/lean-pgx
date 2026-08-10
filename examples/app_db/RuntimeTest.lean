@@ -331,18 +331,21 @@ private def exerciseBroaderTypes
       AppDb.Constraints.views.any (fun view =>
         view.relation == { schema := "app", name := "type_sample_summary" }) do
     fail "generated metadata did not isolate the application view"
-  -- PostgreSQL adds five constructor routines for the named range and
-  -- multirange.  Extension-owned implementation routines are intentionally
-  -- outside the application metadata contract.
-  unless AppDb.Constraints.routines.size == 6 &&
-      AppDb.Constraints.routines.any (fun routine =>
+  -- PostgreSQL adds constructor routines for named ranges and multiranges.
+  -- Extension-owned implementation routines remain outside the application
+  -- metadata contract even though the extension is installed in `app`.
+  unless AppDb.Constraints.routines.any (fun routine =>
       routine.key.schema == "app" &&
       routine.key.name == "list_type_sample_summaries" &&
       routine.returnsSet &&
       routine.returnType == some {
         key := { schema := "app", name := "type_sample_summary", kind := .composite }
       } &&
-      routine.resultColumns.map (·.name) == #["id", "status_count", "amount"]) do
+      routine.resultColumns.map (·.name) == #["id", "status_count", "amount"]) &&
+      AppDb.Constraints.routines.any (fun routine =>
+        routine.key.schema == "app" && routine.key.name == "audit_int4_diff") &&
+      !AppDb.Constraints.routines.any (fun routine =>
+        routine.key.schema == "app" && routine.key.name == "citextin") do
     fail "generated metadata did not isolate the application table-valued function"
   unless AppDb.Constraints.extensionCodecPackages.any (fun package =>
       package.extension == "citext" && package.importModule == "AppDb.ExtensionCodecs" &&
@@ -414,13 +417,22 @@ private def expectSchemaDrift (conn : Pg.Connection) : Async Unit := do
   | .error error => fail s!"fresh attachment returned the wrong error: {error}"
   | .ok _ => fail "fresh attachment unexpectedly accepted the drifted schema"
 
+private def expectSchemaDriftContaining (expected : String)
+    (conn : Pg.Connection) : Async Unit := do
+  match ← AppDb.attach conn with
+  | .error (.schemaDrift message) =>
+      unless message.contains expected do
+        fail s!"fresh attachment reported unrelated schema drift: {message}"
+  | .error error => fail s!"fresh attachment returned the wrong error: {error}"
+  | .ok _ => fail "fresh attachment unexpectedly accepted the drifted schema"
+
 private def exerciseSemanticMetadataDrift
     (config : Pg.ConnectConfig) (raw : Pg.Connection) : Async Unit := do
   let _ ← pg! "drift application view definition" (← raw.exec
     "CREATE OR REPLACE VIEW app.type_sample_summary AS \
      SELECT sample.id, cardinality(sample.statuses) AS status_count, sample.amount \
      FROM app.type_samples AS sample WHERE sample.id IS NOT NULL")
-  withConnection config expectSchemaDrift
+  withConnection config (expectSchemaDriftContaining "view metadata drift")
   let _ ← pg! "restore application view definition" (← raw.exec
     "CREATE OR REPLACE VIEW app.type_sample_summary AS \
      SELECT sample.id, cardinality(sample.statuses) AS status_count, sample.amount \
@@ -431,11 +443,62 @@ private def exerciseSemanticMetadataDrift
 
   let _ ← pg! "drift table-valued function volatility" (← raw.exec
     "ALTER FUNCTION app.list_type_sample_summaries(numeric) VOLATILE")
-  withConnection config expectSchemaDrift
+  withConnection config (expectSchemaDriftContaining "routine metadata drift")
   let _ ← pg! "restore table-valued function volatility" (← raw.exec
     "ALTER FUNCTION app.list_type_sample_summaries(numeric) STABLE")
   withConnection config fun conn => do
     let _ ← attach! "reattach after restoring routine metadata" conn
+    pure ()
+
+private def exerciseRangeMetadataDrift
+    (config : Pg.ConnectConfig) (raw : Pg.Connection) : Async Unit := do
+  let _ ← pg! "drop range for subtype-diff drift" (← raw.exec
+    "DROP TYPE app.audit_range")
+  let _ ← pg! "recreate range without subtype-diff" (← raw.exec
+    "CREATE TYPE app.audit_range AS RANGE (\
+     subtype = integer, \
+     multirange_type_name = app.audit_multirange)")
+  withConnection config (expectSchemaDriftContaining
+    "range subtype-diff routine drift")
+
+  let _ ← pg! "drop drifted range" (← raw.exec
+    "DROP TYPE app.audit_range")
+  let _ ← pg! "restore range subtype-diff metadata" (← raw.exec
+    "CREATE TYPE app.audit_range AS RANGE (\
+     subtype = integer, \
+     multirange_type_name = app.audit_multirange, \
+     subtype_diff = app.audit_int4_diff)")
+
+  let _ ← pg! "drop text range for collation drift" (← raw.exec
+    "DROP TYPE app.audit_text_range")
+  let _ ← pg! "recreate text range with another collation" (← raw.exec
+    "CREATE TYPE app.audit_text_range AS RANGE (\
+     subtype = text, \
+     collation = pg_catalog.\"default\", \
+     subtype_opclass = pg_catalog.text_ops, \
+     multirange_type_name = app.audit_text_multirange)")
+  withConnection config (expectSchemaDriftContaining "range collation drift")
+
+  let _ ← pg! "drop text range for opclass drift" (← raw.exec
+    "DROP TYPE app.audit_text_range")
+  let _ ← pg! "recreate text range with another opclass" (← raw.exec
+    "CREATE TYPE app.audit_text_range AS RANGE (\
+     subtype = text, \
+     collation = pg_catalog.\"C\", \
+     subtype_opclass = pg_catalog.text_pattern_ops, \
+     multirange_type_name = app.audit_text_multirange)")
+  withConnection config (expectSchemaDriftContaining "range subtype opclass drift")
+
+  let _ ← pg! "drop drifted text range" (← raw.exec
+    "DROP TYPE app.audit_text_range")
+  let _ ← pg! "restore text range metadata" (← raw.exec
+    "CREATE TYPE app.audit_text_range AS RANGE (\
+     subtype = text, \
+     collation = pg_catalog.\"C\", \
+     subtype_opclass = pg_catalog.text_ops, \
+     multirange_type_name = app.audit_text_multirange)")
+  withConnection config fun conn => do
+    let _ ← attach! "reattach after restoring range metadata" conn
     pure ()
 
 private def runAcceptance (options : Options) : Async Unit := do
@@ -453,6 +516,7 @@ private def runAcceptance (options : Options) : Async Unit := do
     exerciseSelfJoinProvenance checked organizationId
     exerciseBroaderTypes checked
     exerciseSemanticMetadataDrift config raw
+    exerciseRangeMetadataDrift config raw
     exerciseStoredConstraintViolations raw checked organizationId
 
     -- This physical connection is attached before the DDL change, but its

@@ -11,6 +11,29 @@ CREATE TYPE app.score_range AS RANGE (
   multirange_type_name = app.score_multirange
 );
 
+CREATE FUNCTION app.audit_int4_diff(left_value integer, right_value integer)
+RETURNS double precision
+LANGUAGE sql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $function$
+  SELECT left_value::double precision - right_value::double precision
+$function$;
+
+CREATE TYPE app.audit_range AS RANGE (
+  subtype = integer,
+  multirange_type_name = app.audit_multirange,
+  subtype_diff = app.audit_int4_diff
+);
+
+CREATE TYPE app.audit_text_range AS RANGE (
+  subtype = text,
+  collation = pg_catalog."C",
+  subtype_opclass = pg_catalog.text_ops,
+  multirange_type_name = app.audit_text_multirange
+);
+
 CREATE TABLE app.type_samples (
   id bigint GENERATED ALWAYS AS IDENTITY,
   statuses app.user_status[] NOT NULL,

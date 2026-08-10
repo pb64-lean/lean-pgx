@@ -51,6 +51,10 @@ structure StaticTypeDesc where
   compositeFields : Array Pgx.CompositeFieldIR := #[]
   rangeSubtype : Option Pgx.TypeRef := none
   rangeMultirange : Option Pgx.TypeKey := none
+  rangeCollation : Option Pgx.CollationKey := none
+  rangeSubtypeOpclass : Option Pgx.QualifiedName := none
+  rangeCanonical : Option Pgx.RoutineKey := none
+  rangeSubtypeDiff : Option Pgx.RoutineKey := none
   multirangeRange : Option Pgx.TypeKey := none
   deriving Repr, BEq, Inhabited
 

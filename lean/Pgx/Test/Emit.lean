@@ -423,6 +423,16 @@ private def m3Fixture : DatabaseIR := {
     subtype := time
     multirange := scoreMultirangeKey
     subtypeOpclass := { schema := "pg_catalog", name := "time_ops" }
+    canonical := some {
+      schema := "app"
+      name := "score_range_canonical"
+      inputTypes := #[ref scoreRangeKey]
+    }
+    subtypeDiff := some {
+      schema := "app"
+      name := "time_subtype_diff"
+      inputTypes := #[time, time]
+    }
   }]
   multiranges := #[{
     key := scoreMultirangeKey
@@ -557,6 +567,13 @@ private def milestone3Tests : IO Unit := do
   assert! sources.types.contents.contains
     "evaluateRangeBounds (fun item => Pgx.Constraint.evaluateTimeTypmod (none)"
   assert! sources.types.contents.contains "rangeMultirange := some ("
+  assert! sources.types.contents.contains "rangeCollation := none"
+  assert! sources.types.contents.contains "rangeSubtypeOpclass := some ("
+  assert! sources.types.contents.contains "name := \"time_ops\""
+  assert! sources.types.contents.contains "rangeCanonical := some ("
+  assert! sources.types.contents.contains "name := \"score_range_canonical\""
+  assert! sources.types.contents.contains "rangeSubtypeDiff := some ("
+  assert! sources.types.contents.contains "name := \"time_subtype_diff\""
   assert! sources.types.contents.contains "Pgx.Typed.decodeRangeBinary subtype.oid"
   assert! sources.types.contents.contains
     "abbrev Data := Pgx.Typed.PgMultirange (Std.Time.PlainTime)"

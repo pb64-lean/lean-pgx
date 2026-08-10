@@ -175,6 +175,12 @@ private def columnKeyExpr (key : Pgx.ColumnKey) : String :=
 private def collationKeyExpr (key : Pgx.CollationKey) : String :=
   recordExpr s!"schema := {stringLiteral key.schema}, name := {stringLiteral key.name}"
 
+private def qualifiedNameExpr (key : Pgx.QualifiedName) : String :=
+  recordExpr s!"schema := {stringLiteral key.schema}, name := {stringLiteral key.name}"
+
+private def routineKeyExpr (key : Pgx.RoutineKey) : String :=
+  recordExpr s!"schema := {stringLiteral key.schema}, name := {stringLiteral key.name}, inputTypes := {arrayExpr (key.inputTypes.map typeRefExpr)}"
+
 private def compositeFieldExpr (field : Pgx.CompositeFieldIR) : String :=
   let collation := optionExpr (field.collation.map collationKeyExpr)
   recordExpr s!"name := {stringLiteral field.name}, ordinal := {field.ordinal}, ty := {typeRefExpr field.ty}, collation := {collation}"
@@ -200,7 +206,10 @@ private def typeDescExpr (db : Pgx.DatabaseIR) (key : Pgx.TypeKey) : String :=
               | none =>
                   match db.range? key with
                   | some value =>
-                      recordExpr s!"key := {typeKeyExpr key}, rangeSubtype := some ({typeRefExpr value.subtype}), rangeMultirange := some ({typeKeyExpr value.multirange})"
+                      let collation := optionExpr (value.collation.map collationKeyExpr)
+                      let canonical := optionExpr (value.canonical.map routineKeyExpr)
+                      let subtypeDiff := optionExpr (value.subtypeDiff.map routineKeyExpr)
+                      recordExpr s!"key := {typeKeyExpr key}, rangeSubtype := some ({typeRefExpr value.subtype}), rangeMultirange := some ({typeKeyExpr value.multirange}), rangeCollation := {collation}, rangeSubtypeOpclass := some ({qualifiedNameExpr value.subtypeOpclass}), rangeCanonical := {canonical}, rangeSubtypeDiff := {subtypeDiff}"
                   | none =>
                       match db.multirange? key with
                       | some value =>
@@ -330,9 +339,6 @@ private def viewCheckOptionExpr : Pgx.ViewCheckOption → String
 
 private def viewExpr (view : Pgx.ViewIR) : String :=
   recordExpr s!"relation := {relationKeyExpr view.relation}, definition := {stringLiteral view.definition}, checkOption := .{viewCheckOptionExpr view.checkOption}, securityBarrier := {boolExpr view.securityBarrier}, securityInvoker := {boolExpr view.securityInvoker}"
-
-private def routineKeyExpr (key : Pgx.RoutineKey) : String :=
-  recordExpr s!"schema := {stringLiteral key.schema}, name := {stringLiteral key.name}, inputTypes := {arrayExpr (key.inputTypes.map typeRefExpr)}"
 
 private def routineKindExpr : Pgx.RoutineKind → String
   | .function => "function"
