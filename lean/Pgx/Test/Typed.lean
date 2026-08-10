@@ -190,18 +190,37 @@ private def semanticMetadataTests : IO Unit := do
       types := #[extensionKey]
     }]
   }
+  let ownership : Array ExtensionTypeOwnership := #[{
+    key := extensionKey
+    extension := "citext"
+  }]
   assert! (validateExtensionMetadata extensionDb
-    #[("citext", "1.6"), ("plpgsql", "1.0")]).isOk
-  assert! isError (validateExtensionMetadata extensionDb #[("citext", "1.5")])
-  assert! isError (validateExtensionMetadata extensionDb #[])
+    #[("citext", "1.6"), ("plpgsql", "1.0")] ownership).isOk
+  assert! isError (validateExtensionMetadata extensionDb
+    #[("citext", "1.5")] ownership)
+  assert! isError (validateExtensionMetadata extensionDb #[] ownership)
   assert! isError (validateExtensionMetadata {
     extensionDb with
     extensionCodecPackages := extensionDb.extensionCodecPackages.map fun package =>
       { package with version := "1.5" }
-  } #[("citext", "1.6")])
+  } #[("citext", "1.6")] ownership)
   assert! isError (validateExtensionMetadata {
     extensionDb with types := database.types
-  } #[("citext", "1.6")])
+  } #[("citext", "1.6")] ownership)
+  assert! isError (validateExtensionMetadata extensionDb
+    #[("citext", "1.6")] #[])
+  assert! isError (validateExtensionMetadata extensionDb
+    #[("citext", "1.6")]
+    #[{ key := extensionKey, extension := "other" }])
+  assert! isError (validateExtensionMetadata extensionDb
+    #[("citext", "1.6")] (ownership ++ ownership))
+  assert! extensionTypeOwnershipSql.contains
+    "dep.classid = 'pg_catalog.pg_type'::pg_catalog.regclass"
+  assert! extensionTypeOwnershipSql.contains
+    "dep.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass"
+  assert! extensionTypeOwnershipSql.contains "dep.objsubid = 0"
+  assert! extensionTypeOwnershipSql.contains "dep.refobjsubid = 0"
+  assert! extensionTypeOwnershipSql.contains "dep.deptype = 'e'"
 
 def main : IO UInt32 := do
   resolvedCodecTests

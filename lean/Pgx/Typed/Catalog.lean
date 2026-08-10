@@ -746,6 +746,47 @@ private def loadExtensions (conn : Pg.Connection) :
       | .ok value => extensions := extensions.push value
     pure (.ok extensions)
 
+/-- Symbolic extension membership recovered from live `pg_depend` rows. -/
+structure ExtensionTypeOwnership where
+  key : Pgx.TypeKey
+  extension : String
+  deriving Repr, BEq, Inhabited
+
+/-- Query proving that a type is an extension member rather than merely
+sharing an extension's schema or name. -/
+def extensionTypeOwnershipSql : String :=
+  "SELECT dep.objid::text, ext.extname " ++
+  "FROM pg_catalog.pg_depend AS dep " ++
+  "JOIN pg_catalog.pg_extension AS ext ON ext.oid = dep.refobjid " ++
+  "WHERE dep.classid = 'pg_catalog.pg_type'::pg_catalog.regclass " ++
+  "AND dep.objsubid = 0 " ++
+  "AND dep.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass " ++
+  "AND dep.refobjsubid = 0 " ++
+  "AND dep.deptype = 'e' " ++
+  "ORDER BY dep.objid, ext.extname"
+
+private def loadExtensionTypeOwnership (conn : Pg.Connection)
+    (types : Array LiveType) :
+    Async (Except Error (Array ExtensionTypeOwnership)) := do
+  match ← queryOne conn "read extension type ownership" extensionTypeOwnershipSql with
+  | .error error => pure (.error error)
+  | .ok rows =>
+    let mut ownership : Array ExtensionTypeOwnership := #[]
+    for row in rows.rows do
+      let parsed : Except Error ExtensionTypeOwnership := do
+        let oid ← parseUInt32 "read extension type ownership"
+          (← cell "read extension type ownership" row 0)
+        let candidates := types.filter (fun value => value.oid == oid)
+        let some ty := candidates[0]?
+          | throw (drift s!"extension dependency refers to missing type OID {oid}")
+        unless candidates.size == 1 do
+          throw (drift s!"extension dependency has ambiguous type OID {oid}")
+        pure { key := ty.key, extension := ← cell "read extension type ownership" row 1 }
+      match parsed with
+      | .error error => return .error error
+      | .ok value => ownership := ownership.push value
+    pure (.ok ownership)
+
 private def metadataSchemas (db : DatabaseDesc) : Array String := Id.run do
   let mut schemas : Array String := #[]
   for relation in db.relations do
@@ -791,7 +832,8 @@ def validateRoutineMetadata (expected actual : Array Pgx.RoutineIR) : Except Err
 extension codec packages.  Installed extensions outside the required set do
 not affect the contract. -/
 def validateExtensionMetadata (db : DatabaseDesc)
-    (installed : Array (String × String)) : Except Error Unit := do
+    (installed : Array (String × String))
+    (ownership : Array ExtensionTypeOwnership) : Except Error Unit := do
   let mut requiredNames : Array String := #[]
   for required in db.requiredExtensions do
     if requiredNames.contains required.1 then
@@ -826,6 +868,14 @@ def validateExtensionMetadata (db : DatabaseDesc)
       packageTypes := packageTypes.push key
       unless db.types.any (fun value => value.key == key) do
         throw (drift s!"extension codec package {package.extension} refers to missing type {key}")
+      let owners := ownership.filter (fun value => value.key == key)
+      let some owner := owners[0]?
+        | throw (drift s!"extension codec package type {key} is not an extension member")
+      unless owners.size == 1 do
+        throw (drift s!"extension codec package type {key} has ambiguous extension ownership")
+      unless owner.extension == package.extension do
+        throw (drift s!"extension codec package type {key} belongs to \
+          {owner.extension}, not {package.extension}")
 
 private def checkTypes (db : DatabaseDesc) (live : Array LiveType) :
     Except Error (Array ResolvedType) := do
@@ -1032,6 +1082,9 @@ def attach (db : DatabaseDesc) (conn : Pg.Connection) :
   let installedExtensions ← match ← loadExtensions conn with
     | .error error => return .error error
     | .ok values => pure values
+  let extensionTypeOwnership ← match ← loadExtensionTypeOwnership conn liveTypes with
+    | .error error => return .error error
+    | .ok values => pure values
   let resolvedTypes ← match checkTypes db liveTypes with
     | .error error => return .error error
     | .ok values => pure values
@@ -1044,7 +1097,7 @@ def attach (db : DatabaseDesc) (conn : Pg.Connection) :
   match validateRoutineMetadata db.routines liveRoutines with
   | .error error => return .error error
   | .ok () => pure ()
-  match validateExtensionMetadata db installedExtensions with
+  match validateExtensionMetadata db installedExtensions extensionTypeOwnership with
   | .error error => return .error error
   | .ok () => pure ()
   let catalog ← match ResolvedCatalog.create db resolvedTypes resolvedRelations with
