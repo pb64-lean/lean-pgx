@@ -2,6 +2,7 @@
 /integration/downstream/bazel-*
 .lake/
 .bazelrc.user
+.bazelrc.local
 .DS_Store
 /result
 /result-*
