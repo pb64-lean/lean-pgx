@@ -66,6 +66,27 @@ private def binaryInt4Codec : ResolvedCodec Int32 where
     | .ok decoded => pure decoded
     | .error message => throw (.decode message)
 
+private structure SpanProbe where
+  ownerSize : Nat
+  offset : Nat
+  length : Nat
+  deriving Repr, BEq
+
+private instance : Pg.PgDecode SpanProbe where
+  decodeText _ _ := throw "span probe requires binary input"
+  decodeBinary _ _ := throw "span probe must not receive a materialized cell"
+
+private instance : Pg.PgDecodeSpan SpanProbe where
+  decodeBinarySpan _ owner offset length :=
+    pure { ownerSize := owner.size, offset, length }
+
+private def echoCodec : ResolvedCodec ByteArray where
+  expected := int4Desc
+  encode _ _ value := pure { format := 1, value := some value }
+  decode _ _ _
+    | some value => pure value
+    | none => throw (.decode "echo codec received NULL")
+
 /-- Exercise the ownership escape through the prepared built-in descriptor:
 the decoded value is the exact borrowed result-cell payload. -/
 @[noinline] private def decodeOwnedPlannedBytea
@@ -134,6 +155,19 @@ private def column : ColumnSpec := {
   origin := some { relation := usersKey, name := "id" }
 }
 
+/-- An old-form manual spec: prepared callbacks may be supplied without opting
+into the additive row-span decoder. -/
+private def legacyPreparedSpec : QuerySpec database Unit Nat .exactlyOne := {
+  name := "legacy_manual"
+  sql := "SELECT 11"
+  contractHash := "legacy-contract"
+  params := #[]
+  columns := #[]
+  encode := fun _ _ => pure { values := #[], formats := #[] }
+  decode := fun _ _ _ => pure 11
+  preparedDecode := some (fun _ _ _ _ => pure 22)
+}
+
 private def failed (result : Except Error Unit) : Bool :=
   match result with
   | .error _ => true
@@ -152,6 +186,11 @@ private def isError (result : Except Error α) : Bool :=
 private def isSchemaDrift (result : Except Error α) : Bool :=
   match result with
   | .error (.schemaDrift _) => true
+  | .error _ | .ok _ => false
+
+private def isQueryDrift (result : Except Error α) : Bool :=
+  match result with
+  | .error (.queryDrift _) => true
   | .error _ | .ok _ => false
 
 private def preparationFailureTests : IO Unit := do
@@ -563,6 +602,47 @@ def main : IO UInt32 := do
   assert! isError (decodeBuiltin (α := Int32) catalog int4 0 none)
   let escapedBytea := "borrowed descriptor payload".toUTF8
   assert! okEq (decodeOwnedPlannedBytea (some escapedBytea)) escapedBytea
+  assert! legacyPreparedSpec.preparedDecode.isSome
+  assert! legacyPreparedSpec.preparedSpanDecode.isNone
+  let binarySpanRow := Pg.Protocol.DataRowSpans.ofCells
+    #[some "prefix".toUTF8,
+      some (Pg.Protocol.putUInt32 ByteArray.empty (UInt32.ofNat 42)), none]
+  assert! okEq
+    (decodePlannedBuiltinSpan (α := Int32) Pg.Oid.int4 1 binarySpanRow 1) 42
+  assert! okEq
+    (decodePlannedBuiltinSpan (α := Option Int32) Pg.Oid.int4 1 binarySpanRow 2) none
+  assert! isError
+    (decodePlannedBuiltinSpan (α := Int32) Pg.Oid.int4 1 binarySpanRow 3)
+  let probePrefix := "nonzero-prefix".toUTF8
+  let probePayload := Pg.putInt64BE 42
+  let probeSuffix := "distinct-suffix".toUTF8
+  let probeRow := Pg.Protocol.DataRowSpans.ofCells
+    #[some probePrefix, some probePayload, some probeSuffix]
+  let expectedProbe : SpanProbe := {
+    ownerSize := probePrefix.size + probePayload.size + probeSuffix.size
+    offset := probePrefix.size
+    length := probePayload.size
+  }
+  assert! okEq
+    (decodePlannedBuiltinSpan (α := SpanProbe) Pg.Oid.int8 1 probeRow 1)
+    expectedProbe
+  let textSpanRow := Pg.Protocol.DataRowSpans.ofCells
+    #[some "ignored".toUTF8, some "42".toUTF8]
+  assert! okEq
+    (decodePlannedSpan int4Codec resolveTestType
+      { expected := int4Desc, oid := Pg.Oid.int4 } 0 textSpanRow 1) 42
+  assert! isError
+    (decodePlannedSpan int4Codec resolveTestType
+      { expected := int4Desc, oid := Pg.Oid.int4 } 0 textSpanRow 2)
+  let selectedCell := "only-this-cell".toUTF8
+  let echoRow := Pg.Protocol.DataRowSpans.ofCells
+    #[some "left-sibling".toUTF8, some selectedCell, some "right-sibling".toUTF8]
+  assert! okEq
+    (decodePlannedSpan echoCodec resolveTestType
+      { expected := int4Desc, oid := Pg.Oid.int4 } 1 echoRow 1) selectedCell
+  assert! isQueryDrift
+    (decodePlannedSpan echoCodec resolveTestType
+      { expected := int4Desc, oid := Pg.Oid.int4 } 1 echoRow 3)
   let encoded ← match encodeBuiltin catalog int4 (42 : Int32) with
     | .ok value => pure value
     | .error error => throw (IO.userError (toString error))

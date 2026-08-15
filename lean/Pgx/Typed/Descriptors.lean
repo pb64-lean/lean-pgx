@@ -444,6 +444,22 @@ def decodePlannedBuiltin [Pg.PgDecode α] (typeOid : UInt32)
   | .ok decoded => pure decoded
   | .error message => throw (.decode message)
 
+/-- Decode a generated custom-codec result from one materialized cell in an
+otherwise row-owned span representation. -/
+def decodePlannedSpan (codec : ResolvedCodec α) (resolve : TypeResolver)
+    (resolved : ResolvedType) (format : UInt16)
+    (row : @& Pg.Protocol.DataRowSpans) (index : Nat) : Except Error α := do
+  let some value := row.cell? index
+    | throw (.queryDrift s!"generated decoder is missing result column {index}")
+  codec.decode resolve resolved format value
+
+/-- Decode a built-in prepared result directly from its row-owned span. -/
+def decodePlannedBuiltinSpan [Pg.PgDecode α] [Pg.PgDecodeSpan α] (typeOid : UInt32)
+    (format : UInt16) (row : @& Pg.Protocol.DataRowSpans) (index : Nat) : Except Error α :=
+  match Pg.decodeDataRowValue (α := α) typeOid format row index with
+  | .ok decoded => pure decoded
+  | .error message => throw (.decode message)
+
 /-- Encode through a generated codec using its already-resolved outer
 parameter descriptor.  The connection plan has already matched the descriptor
 to the generated spec; avoiding another full static-descriptor comparison is
@@ -527,6 +543,12 @@ structure QuerySpec (db : DatabaseDesc) (Params Row : Type)
   prepared statement. -/
   preparedDecode : Option (TypeResolver → Array ResolvedType →
     Array Pg.Protocol.ColumnDesc → Array (Option ByteArray) →
+    Except Error Row) := none
+  /-- Generated prepared path that retains one backend payload per row.  A
+  missing callback preserves manual-spec compatibility by materializing the
+  row and using `preparedDecode`/`decode`. -/
+  preparedSpanDecode : Option (TypeResolver → Array ResolvedType →
+    Array Pg.Protocol.ColumnDesc → Pg.Protocol.DataRowSpans →
     Except Error Row) := none
 
 /-- Resolve the parameter descriptors once before Parse. -/

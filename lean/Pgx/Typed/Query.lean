@@ -75,7 +75,7 @@ private def prepareChecked (db : DatabaseDesc)
 
 private def runChecked (db : DatabaseDesc)
     (spec : QuerySpec db Params Row cardinality) (conn : CheckedConnection db)
-    (params : Params) : Async (Except Error (PreparedQueryPlan db × Pg.Rows)) := do
+    (params : Params) : Async (Except Error (PreparedQueryPlan db × Pg.SpanRows)) := do
   let plan ← match ← prepareChecked db spec conn with
     | .error error => return .error error
     | .ok plan => pure plan
@@ -94,7 +94,7 @@ private def runChecked (db : DatabaseDesc)
   for format in encoded.formats do
     unless format == 0 || format == 1 do
       return .error (.encode s!"unsupported PostgreSQL parameter format {format}")
-  let rows ← match ← Pg.Connection.execute conn.raw plan.statement.name
+  let rows ← match ← Pg.Connection.executeSpans conn.raw plan.statement.name
       encoded.values encoded.formats plan.resultFormats with
     | .error error =>
       let failure := executionFailure error
@@ -110,13 +110,17 @@ private def runChecked (db : DatabaseDesc)
 private def decodeRow (spec : QuerySpec db Params Row cardinality)
     (plan : PreparedQueryPlan db)
     (catalog : ResolvedCatalog db) (columns : Array Pg.Protocol.ColumnDesc)
-    (values : Array (Option ByteArray)) : Except Error Row := do
+    (values : Pg.Protocol.DataRowSpans) : Except Error Row := do
   unless values.size == spec.columns.size do
     throw (.queryDrift
       s!"data row has {values.size} fields; expected {spec.columns.size}")
-  match spec.preparedDecode with
+  match spec.preparedSpanDecode with
   | some decode => decode plan.resolve plan.results columns values
-  | none => spec.decode catalog columns values
+  | none =>
+    let materialized := values.materialize
+    match spec.preparedDecode with
+    | some decode => decode plan.resolve plan.results columns materialized
+    | none => spec.decode catalog columns materialized
 
 /-- Execute a checked command that has no result columns. -/
 def execute (spec : QuerySpec db Params Row .execute)

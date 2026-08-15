@@ -868,8 +868,13 @@ def main : IO UInt32 := do
   assert! getUser.contents.contains "resultFormats := #[1, 0, 0]"
   assert! getUser.contents.contains "preparedEncode := some encodePreparedParams"
   assert! getUser.contents.contains "preparedDecode := some decodePreparedRow"
+  assert! getUser.contents.contains "preparedSpanDecode := some decodePreparedSpanRow"
+  assert! getUser.contents.contains
+    "(values : Pg.Protocol.DataRowSpans) : Except Pgx.Typed.Error Row"
   assert! getUser.contents.contains
     "Pgx.Typed.decodePlannedBuiltin columns[0]!.typeOid columns[0]!.format values[0]!"
+  assert! getUser.contents.contains
+    "Pgx.Typed.decodePlannedBuiltinSpan columns[0]!.typeOid columns[0]!.format values 0"
   assert! !(getUser.contents.contains "Pg.binaryInt64 params.id")
   assert! getUser.contents.contains "structure RowData where"
   assert! getUser.contents.contains "email : AppDb.Types.AppEmailAddress"
@@ -927,6 +932,10 @@ def main : IO UInt32 := do
     "encodePlannedBuiltin (Pg.binaryInt16 params.rank)"
   assert! mixedFormats.contents.contains
     "decodePlanned External.citextCodec resolve types[1]!"
+  assert! mixedFormats.contents.contains
+    "decodePlannedBuiltinSpan columns[0]!.typeOid columns[0]!.format values 0"
+  assert! mixedFormats.contents.contains
+    "decodePlannedSpan External.citextCodec resolve types[1]! columns[1]!.format values 1"
 
   -- Source contracts remain symbolic and unsupported types are hard errors.
   for source in sources.all do
