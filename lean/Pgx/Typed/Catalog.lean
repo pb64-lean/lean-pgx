@@ -1840,24 +1840,24 @@ namespace Internal
 /-- Runtime-internal cache state. Its name remains visible only because
 module-mode `CheckedConnection` must expose the types of its private
 representation fields. Applications must not construct or inspect it. -/
-inductive PreparedEntryState where
-  | pending (completion : IO.Promise (Except Error Pg.Statement))
-  | ready (statement : Pg.Statement)
+inductive PreparedEntryState (db : DatabaseDesc) where
+  | pending (completion : IO.Promise (Except Error (PreparedQueryPlan db)))
+  | ready (plan : PreparedQueryPlan db)
   /-- Descriptor drift is sticky: PostgreSQL has already installed the named
   statement, so retrying the same name would itself be a protocol error. -/
   | drifted (error : Error)
 
-structure PreparedEntry where
+structure PreparedEntry (db : DatabaseDesc) where
   key : String
-  state : PreparedEntryState
+  state : PreparedEntryState db
 
-abbrev PreparedCache := Std.Mutex (Array PreparedEntry)
+abbrev PreparedCache (db : DatabaseDesc) := Std.Mutex (Array (PreparedEntry db))
 
-inductive PrepareDecision where
-  | ready (statement : Pg.Statement)
+inductive PrepareDecision (db : DatabaseDesc) where
+  | ready (plan : PreparedQueryPlan db)
   | failed (error : Error)
   | owner
-  | wait (completion : IO.Promise (Except Error Pg.Statement))
+  | wait (completion : IO.Promise (Except Error (PreparedQueryPlan db)))
 
 /-- A failed Parse/Describe request has not verified descriptor drift. Preserve
 the underlying PostgreSQL error so transient failures remain retryable. -/
@@ -1878,7 +1878,7 @@ structure CheckedConnection (db : DatabaseDesc) where
   private mk ::
   private rawValue : Pg.Connection
   private catalogValue : ResolvedCatalog db
-  private preparedValue : Internal.PreparedCache
+  private preparedValue : Internal.PreparedCache db
 
 /--
 Access the underlying connection for transaction and lifecycle integration.
@@ -1905,17 +1905,17 @@ def lookupPrepared (conn : CheckedConnection db) (key : String) :
     pure <| entries.findSome? fun entry =>
       if entry.key != key then none
       else match entry.state with
-        | .ready statement => some statement
+        | .ready plan => some plan.statement
         | .pending _ | .drifted _ => none
 
-/-- Claim preparation ownership, reuse a completed statement, or wait for the
-caller that already owns this key. -/
-def beginPrepare (conn : CheckedConnection db) (key : String) :
-    IO PrepareDecision :=
-  conn.preparedValue.atomically do
+/-- Cache-level form used by the checked connection wrapper and focused tests.
+A fresh physical connection owns a fresh value of this cache. -/
+def beginPrepareCache (cache : PreparedCache db) (key : String) :
+    IO (PrepareDecision db) :=
+  cache.atomically do
     let entries ← get
     match entries.find? (fun entry => entry.key == key) with
-    | some { state := .ready statement, .. } => pure (.ready statement)
+    | some { state := .ready plan, .. } => pure (.ready plan)
     | some { state := .drifted error, .. } => pure (.failed error)
     | some { state := .pending completion, .. } => pure (.wait completion)
     | none =>
@@ -1923,12 +1923,19 @@ def beginPrepare (conn : CheckedConnection db) (key : String) :
       set (entries.push { key, state := .pending completion })
       pure .owner
 
+/-- Claim preparation ownership, reuse a completed plan, or wait for the
+caller that already owns this key. -/
+def beginPrepare (conn : CheckedConnection db) (key : String) :
+    IO (PrepareDecision db) :=
+  beginPrepareCache conn.preparedValue key
+
 /-- Publish the owner's result.  Descriptor drift stays sticky because the
 named statement already exists; pre-Parse/transient failures are evicted so a
 later call may retry.  Every result wakes current waiters. -/
-def completePrepare (conn : CheckedConnection db) (key : String)
-    (result : Except Error Pg.Statement) : IO Unit := do
-  let completion? ← conn.preparedValue.atomically do
+def completePrepareCache (cache : PreparedCache db) (key : String)
+    (result : Except Error (PreparedQueryPlan db)) (stickyFailure : Bool := false) :
+    IO Unit := do
+  let completion? ← cache.atomically do
     let entries ← get
     let some index := entries.findIdx? (fun entry => entry.key == key)
       | pure none
@@ -1938,10 +1945,10 @@ def completePrepare (conn : CheckedConnection db) (key : String)
     | .ready _ | .drifted _ => pure none
     | .pending completion =>
       match result with
-      | .ok statement =>
-        set (entries.set! index { key, state := .ready statement })
+      | .ok plan =>
+        set (entries.set! index { key, state := .ready plan })
       | .error error =>
-        if isVerifiedDescriptorDrift error then
+        if stickyFailure || isVerifiedDescriptorDrift error then
           set (entries.set! index { key, state := .drifted error })
         else
           set (entries.filter (fun value => value.key != key))
@@ -1949,6 +1956,33 @@ def completePrepare (conn : CheckedConnection db) (key : String)
   match completion? with
   | none => pure ()
   | some completion => discard <| completion.resolve result
+
+/-- Publish a checked connection's preparation result. -/
+def completePrepare (conn : CheckedConnection db) (key : String)
+    (result : Except Error (PreparedQueryPlan db)) (stickyFailure : Bool := false) :
+    IO Unit :=
+  completePrepareCache conn.preparedValue key result stickyFailure
+
+/-- Promote a ready plan to sticky drift after PostgreSQL execution or the
+portal RowDescription proves that the cached descriptor contract changed. -/
+def markPreparedCacheDrift (cache : PreparedCache db) (key : String)
+    (error : Error) : IO Unit :=
+  if !isVerifiedDescriptorDrift error then pure () else
+    cache.atomically do
+      let entries ← get
+      let some index := entries.findIdx? (fun entry => entry.key == key)
+        | return
+      let some entry := entries[index]?
+        | return
+      match entry.state with
+      | .ready _ =>
+        set (entries.set! index { key, state := .drifted error })
+      | .pending _ | .drifted _ => pure ()
+
+/-- Checked-connection wrapper for sticky execution-time descriptor drift. -/
+def markPreparedDrift (conn : CheckedConnection db) (key : String)
+    (error : Error) : IO Unit :=
+  markPreparedCacheDrift conn.preparedValue key error
 
 end Internal
 

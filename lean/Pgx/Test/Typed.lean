@@ -199,6 +199,126 @@ private def resolvedCodecTests : IO Unit := do
   assert! okEq (optional.decode resolveTestType
     { expected := int4Desc, oid := 23 } 1 none) none
 
+private def preparedPlanTests (catalog : ResolvedCatalog database) : IO Unit := do
+  let resolvedParams ← match resolvePreparedParams catalog #[param] with
+    | .ok value => pure value
+    | .error error => throw (IO.userError (toString error))
+  let textPlan ← match createPreparedQueryPlan catalog "query-key" "query-contract"
+      #[param] resolvedParams #[column] #[] statement with
+    | .ok value => pure value
+    | .error error => throw (IO.userError (toString error))
+  assert! textPlan.params.size == 1
+  assert! textPlan.params[0]!.oid == 23
+  assert! textPlan.results[0]!.oid == 23
+  assert! textPlan.columns[0]!.origin == some { tableOid := 90001, attnum := 1 }
+  assert! (verifyPreparedQueryIdentity textPlan "query-key" "query-contract" 1 1 0).isOk
+  assert! isError (verifyPreparedQueryIdentity textPlan
+    "query-key" "different-parameter-contract" 1 1 0)
+  assert! isError (verifyPreparedQueryIdentity textPlan
+    "query-key" "different-format-contract" 1 1 1)
+  assert! (verifyPreparedResultColumns textPlan #[idResult]).isOk
+  assert! isError (verifyPreparedResultColumns textPlan
+    #[{ idResult with typeOid := 25 }])
+  assert! isError (verifyPreparedResultColumns textPlan
+    #[{ idResult with tableOid := 90002 }])
+
+  -- Bind format-vector validation is paid while constructing the plan.  The
+  -- statement Describe remains text, while every portal description is still
+  -- checked against the cached binary expectation before decoding.
+  let binaryPlan ← match createPreparedQueryPlan catalog "binary-key" "binary-contract"
+      #[param] resolvedParams #[column] #[1] statement with
+    | .ok value => pure value
+    | .error error => throw (IO.userError (toString error))
+  assert! binaryPlan.columns[0]!.format == 1
+  assert! isError (verifyPreparedQueryIdentity binaryPlan
+    "binary-key" "different-format-contract" 1 1 1)
+  assert! (verifyPreparedResultColumns binaryPlan
+    #[{ idResult with format := 1 }]).isOk
+  assert! isError (verifyPreparedResultColumns binaryPlan #[idResult])
+  let decoderEntered ← IO.mkRef false
+  let verifyBeforeDecode (actual : Array Pg.Protocol.ColumnDesc) :
+      IO (Except Error Unit) := do
+    match verifyPreparedResultColumns binaryPlan actual with
+    | .error error => pure (.error error)
+    | .ok () =>
+      decoderEntered.set true
+      pure (.ok ())
+  assert! isError (← verifyBeforeDecode #[idResult])
+  assert! !(← decoderEntered.get)
+  assert! (← verifyBeforeDecode #[{ idResult with format := 1 }]).isOk
+  assert! ← decoderEntered.get
+  assert! isError (createPreparedQueryPlan catalog "bad-key" "bad-contract"
+    #[param] resolvedParams #[column] #[0, 1] statement)
+  assert! isError (createPreparedQueryPlan catalog "bad-key" "bad-contract"
+    #[param] resolvedParams #[column] #[2] statement)
+
+  -- One cache has one first-use owner and publishes the same completed plan to
+  -- followers.  A distinct cache (and therefore a distinct physical checked
+  -- connection) has independent ownership for the identical full key.
+  let cacheA : PreparedCache database ← Std.Mutex.new #[]
+  let cacheB : PreparedCache database ← Std.Mutex.new #[]
+  assert! match ← beginPrepareCache cacheA "query-key" with
+    | .owner => true
+    | _ => false
+  assert! match ← beginPrepareCache cacheA "query-key" with
+    | .wait _ => true
+    | _ => false
+  completePrepareCache cacheA "query-key" (.ok textPlan)
+  assert! match ← beginPrepareCache cacheA "query-key" with
+    | .ready plan => plan.statement.name == statement.name
+    | _ => false
+  assert! match ← beginPrepareCache cacheB "query-key" with
+    | .owner => true
+    | _ => false
+  markPreparedCacheDrift cacheA "query-key" (.queryDrift "portal changed")
+  assert! match ← beginPrepareCache cacheA "query-key" with
+    | .failed (.queryDrift message) => message == "portal changed"
+    | _ => false
+
+  -- Release genuinely concurrent contenders through one barrier.  The mutex
+  -- must publish exactly one preparation owner; every other task observes the
+  -- same pending completion rather than becoming a second Parse owner.
+  let concurrentCache : PreparedCache database ← Std.Mutex.new #[]
+  let start : IO.Promise Unit ← IO.Promise.new
+  let contenderCount := 16
+  let mut contenders : Array (Std.Async.AsyncTask (PrepareDecision database)) := #[]
+  for _ in [0:contenderCount] do
+    contenders := contenders.push (← IO.asTask do
+      let some () ← IO.wait start.result?
+        | throw (IO.userError "concurrent cache barrier was dropped")
+      beginPrepareCache concurrentCache "concurrent-key")
+  discard <| start.resolve ()
+  let mut owners := 0
+  let mut waiters := 0
+  for contender in contenders do
+    match ← IO.wait contender with
+    | .ok .owner => owners := owners + 1
+    | .ok (.wait _) => waiters := waiters + 1
+    | .ok _ => throw (IO.userError "concurrent first use observed a completed cache entry")
+    | .error error => throw error
+  assert! owners == 1
+  assert! waiters == contenderCount - 1
+  completePrepareCache concurrentCache "concurrent-key" (.ok textPlan)
+
+  let retryCache : PreparedCache database ← Std.Mutex.new #[]
+  assert! match ← beginPrepareCache retryCache "retry" with
+    | .owner => true
+    | _ => false
+  completePrepareCache retryCache "retry"
+    (.error (.postgres (.transport "temporary")))
+  assert! match ← beginPrepareCache retryCache "retry" with
+    | .owner => true
+    | _ => false
+
+  let driftCache : PreparedCache database ← Std.Mutex.new #[]
+  assert! match ← beginPrepareCache driftCache "drift" with
+    | .owner => true
+    | _ => false
+  completePrepareCache driftCache "drift" (.error (.queryDrift "changed"))
+  assert! match ← beginPrepareCache driftCache "drift" with
+    | .failed (.queryDrift message) => message == "changed"
+    | _ => false
+
 private def semanticMetadataTests : IO Unit := do
   assert! (validateViewMetadata #[activeUsersView] #[activeUsersView]).isOk
   assert! isError (validateViewMetadata #[activeUsersView]
@@ -404,6 +524,7 @@ def main : IO UInt32 := do
   let catalog ← match catalogResult with
     | .ok value => pure value
     | .error error => throw (IO.userError (toString error))
+  preparedPlanTests catalog
   assert! (verifyStatement catalog #[param] #[column] statement).isOk
   assert! (verifyResultColumns catalog #[column] #[idResult]).isOk
   assert! (verifyResultColumns catalog #[column] #[idResult] #[0]).isOk

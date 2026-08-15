@@ -2517,6 +2517,21 @@ private def encodeValueExpr (plan : NamingPlan) (db : Pgx.DatabaseIR)
             else s!"{constructor} {value}"
       pure s!"Pgx.Typed.encodeBuiltin catalog ({typeRefExpr ref}) ({encodedValue})"
 
+private def encodePlannedValueExpr (plan : NamingPlan) (db : Pgx.DatabaseIR)
+    (ref : Pgx.TypeRef) (nullable : Bool) (resolved value : String) :
+    Except CodegenError String := do
+  let use ← resolveTypeUse plan db ref.key
+  match codecExpr use nullable with
+  | some codec =>
+      pure s!"Pgx.Typed.encodePlanned {codec} resolve {resolved} {value}"
+  | none =>
+      let encodedValue := match use.binaryParamConstructor with
+        | none => value
+        | some constructor =>
+            if nullable then s!"Option.map {constructor} {value}"
+            else s!"{constructor} {value}"
+      pure s!"Pgx.Typed.encodePlannedBuiltin ({encodedValue})"
+
 private def resultFormat (plan : NamingPlan) (db : Pgx.DatabaseIR)
     (ref : Pgx.TypeRef) : Except CodegenError UInt16 := do
   pure (← resolveTypeUse plan db ref.key).resultFormat
@@ -2533,6 +2548,15 @@ private def decodeValueExpr (plan : NamingPlan) (db : Pgx.DatabaseIR)
   match codecExpr use nullable with
   | some codec => pure s!"Pgx.Typed.decodeResolved {codec} {args}"
   | none => pure s!"Pgx.Typed.decodeBuiltin {args}"
+
+private def decodePlannedValueExpr (plan : NamingPlan) (db : Pgx.DatabaseIR)
+    (ref : Pgx.TypeRef) (nullable : Bool) (resolved : String) (index : Nat) :
+    Except CodegenError String := do
+  let use ← resolveTypeUse plan db ref.key
+  let args := s!"columns[{index}]!.format values[{index}]!"
+  match codecExpr use nullable with
+  | some codec => pure s!"Pgx.Typed.decodePlanned {codec} resolve {resolved} {args}"
+  | none => pure s!"Pgx.Typed.decodePlannedBuiltin columns[{index}]!.typeOid {args}"
 
 private partial def domainChainAux (db : Pgx.DatabaseIR) (key : Pgx.TypeKey)
     (seen : Array Pgx.TypeKey) : Except CodegenError (Array Pgx.DomainIR) := do
@@ -2684,6 +2708,26 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
     s!"    formats := {arrayExpr (encodedNames.map (· ++ ".format"))}",
     "  }",
     "",
+    "private def encodePreparedParams",
+    "    (resolve : Pgx.Typed.TypeResolver)",
+    "    (types : Array Pgx.Typed.ResolvedType)",
+    "    (params : Params) : Except Pgx.Typed.Error Pgx.Typed.EncodedParams := do",
+    "  let _ := resolve",
+    "  let _ := types",
+    "  let _ := params"
+  ]
+  let mut preparedEncodedNames : Array String := #[]
+  for i in [0:query.params.size] do
+    let encodedName := s!"encoded{i}"
+    preparedEncodedNames := preparedEncodedNames.push encodedName
+    lines := lines ++ [s!"  let {encodedName} ← {← encodePlannedValueExpr plan db
+      query.params[i]!.ty query.params[i]!.nullable s!"types[{i}]!" s!"params.{paramNames[i]!}"}"]
+  lines := lines ++ [
+    "  pure {",
+    s!"    values := {arrayExpr (preparedEncodedNames.map (· ++ ".value"))}",
+    s!"    formats := {arrayExpr (preparedEncodedNames.map (· ++ ".format"))}",
+    "  }",
+    "",
     "private def decodeRow",
     s!"    (catalog : Pgx.Typed.ResolvedCatalog {plan.modulePrefix}.database)",
     "    (columns : Array Pg.Protocol.ColumnDesc)",
@@ -2716,6 +2760,43 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
   lines := lines ++ [
     "  match validate rowData with",
     "  | .ok refined => pure refined",
+    "  | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)",
+    "",
+    "private def decodePreparedRow",
+    "    (resolve : Pgx.Typed.TypeResolver)",
+    "    (types : Array Pgx.Typed.ResolvedType)",
+    "    (columns : Array Pg.Protocol.ColumnDesc)",
+    "    (values : Array (Option ByteArray)) : Except Pgx.Typed.Error Row := do",
+    "  let _ := resolve",
+    "  let _ := types",
+    s!"  unless columns.size == {query.columns.size} do",
+    s!"    throw (.queryDrift \"generated decoder expected {query.columns.size} column descriptors\")",
+    s!"  unless values.size == {query.columns.size} do",
+    s!"    throw (.queryDrift \"generated decoder expected {query.columns.size} row values\")"
+  ]
+  let mut preparedDecodedNames : Array String := #[]
+  for i in [0:query.columns.size] do
+    let column := query.columns[i]!
+    let wireName := s!"decodedWire{i}"
+    lines := lines ++ [s!"  let {wireName} ← {← decodePlannedValueExpr plan db
+      column.ty column.nullable s!"types[{i}]!" i}"]
+    match column.logicalType with
+    | none => preparedDecodedNames := preparedDecodedNames.push wireName
+    | some _ =>
+        let decodedName := s!"decoded{i}"
+        preparedDecodedNames := preparedDecodedNames.push decodedName
+        let refined ← refineLogicalColumnExpression plan db column wireName
+          s!"query {query.name} result {column.name}"
+        lines := lines ++ [s!"  let {decodedName} ← {refined}"]
+  if query.columns.isEmpty then
+    lines := lines ++ ["  let rowData : RowData := RowData.mk"]
+  else
+    let assignments := Array.range query.columns.size |>.map fun i =>
+      columnNames[i]! ++ " := " ++ preparedDecodedNames[i]!
+    lines := lines ++ ["  let rowData : RowData := { " ++ commaSep assignments ++ " }"]
+  lines := lines ++ [
+    "  match validate rowData with",
+    "  | .ok refined => pure refined",
     "  | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)"
   ]
   lines := lines ++ [
@@ -2732,6 +2813,8 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
     s!"  resultFormats := {arrayExpr (resultFormats.map toString)}",
     "  encode := encodeParams",
     "  decode := decodeRow",
+    "  preparedEncode := some encodePreparedParams",
+    "  preparedDecode := some decodePreparedRow",
     "}",
     "",
     s!"/-- Execute `{query.name}` through a descriptor-checked prepared statement. -/",

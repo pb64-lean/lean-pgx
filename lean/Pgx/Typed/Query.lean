@@ -25,11 +25,6 @@ private def queryKey (db : DatabaseDesc)
 private def statementName (key : String) : String :=
   "pgx_" ++ String.ofList (key.toList.take 48)
 
-private def resolvedParamOids (catalog : ResolvedCatalog db)
-    (params : Array ParamSpec) : Except Error (Array UInt32) :=
-  params.mapM fun param => do
-    pure (← catalog.resolveType param.ty.key).oid
-
 private def executionFailure (error : Pg.Error) : Error :=
   match error with
   | .server fields =>
@@ -40,35 +35,54 @@ private def executionFailure (error : Pg.Error) : Error :=
       .postgres error
   | _ => .postgres error
 
+private def acceptCachedPlan (key : String) (spec : QuerySpec db Params Row cardinality)
+    (plan : PreparedQueryPlan db) : Except Error (PreparedQueryPlan db) := do
+  verifyPreparedQueryIdentity plan key spec.contractHash spec.params.size
+    spec.columns.size spec.resultFormats.size
+  pure plan
+
 private def prepareChecked (db : DatabaseDesc)
     (spec : QuerySpec db Params Row cardinality) (conn : CheckedConnection db) :
-    Async (Except Error Pg.Statement) := do
+    Async (Except Error (PreparedQueryPlan db)) := do
   let key := queryKey db spec
   match ← Internal.beginPrepare conn key with
-  | .ready statement => pure (.ok statement)
+  | .ready plan => pure (acceptCachedPlan key spec plan)
   | .failed error => pure (.error error)
-  | .wait completion => await completion
+  | .wait completion => do
+    let result ← await completion
+    pure <| result.bind (acceptCachedPlan key spec)
   | .owner =>
-    let result : Except Error Pg.Statement ← match
-        resolvedParamOids conn.catalog spec.params with
-      | .error error => pure (.error error)
-      | .ok paramOids =>
-        match ← Pg.Connection.prepare conn.raw (statementName key) spec.sql paramOids with
-        | .error error => pure (.error (Internal.preparationFailure error))
-        | .ok statement =>
-          match verifyStatement conn.catalog spec.params spec.columns statement with
-          | .error error => pure (.error error)
-          | .ok () => pure (.ok statement)
-    Internal.completePrepare conn key result
-    pure result
+    match resolvePreparedParams conn.catalog spec.params with
+    | .error error =>
+      let result := Except.error error
+      Internal.completePrepare conn key result
+      pure result
+    | .ok resolvedParams =>
+      let paramOids := resolvedParams.map (fun value => value.oid)
+      match ← Pg.Connection.prepare conn.raw (statementName key) spec.sql paramOids with
+      | .error error =>
+        let result := Except.error (Internal.preparationFailure error)
+        Internal.completePrepare conn key result
+        pure result
+      | .ok statement =>
+        let result := createPreparedQueryPlan conn.catalog key spec.contractHash spec.params
+          resolvedParams spec.columns spec.resultFormats statement
+        -- Parse/Describe succeeded, so any subsequent descriptor-plan failure
+        -- must remain sticky: retrying this named statement would collide with
+        -- the one PostgreSQL has already installed on this session.
+        Internal.completePrepare conn key result true
+        pure result
 
 private def runChecked (db : DatabaseDesc)
     (spec : QuerySpec db Params Row cardinality) (conn : CheckedConnection db)
-    (params : Params) : Async (Except Error Pg.Rows) := do
-  let statement ← match ← prepareChecked db spec conn with
+    (params : Params) : Async (Except Error (PreparedQueryPlan db × Pg.Rows)) := do
+  let plan ← match ← prepareChecked db spec conn with
     | .error error => return .error error
-    | .ok statement => pure statement
-  let encoded ← match spec.encode conn.catalog params with
+    | .ok plan => pure plan
+  let encodedResult := match spec.preparedEncode with
+    | some encode => encode plan.resolve plan.params params
+    | none => spec.encode conn.catalog params
+  let encoded ← match encodedResult with
     | .error error => return .error error
     | .ok encoded => pure encoded
   unless encoded.values.size == spec.params.size do
@@ -80,28 +94,29 @@ private def runChecked (db : DatabaseDesc)
   for format in encoded.formats do
     unless format == 0 || format == 1 do
       return .error (.encode s!"unsupported PostgreSQL parameter format {format}")
-  unless spec.resultFormats.isEmpty || spec.resultFormats.size == 1 ||
-      spec.resultFormats.size == spec.columns.size do
-    return .error (.queryDrift
-      s!"generated result format vector has {spec.resultFormats.size} entries; expected 0, 1, or {spec.columns.size}")
-  for format in spec.resultFormats do
-    unless format == 0 || format == 1 do
-      return .error (.queryDrift s!"unsupported PostgreSQL result format {format}")
-  let rows ← match ← Pg.Connection.execute conn.raw statement.name
-      encoded.values encoded.formats spec.resultFormats with
-    | .error error => return .error (executionFailure error)
+  let rows ← match ← Pg.Connection.execute conn.raw plan.statement.name
+      encoded.values encoded.formats plan.resultFormats with
+    | .error error =>
+      let failure := executionFailure error
+      Internal.markPreparedDrift conn plan.cacheKey failure
+      return .error failure
     | .ok rows => pure rows
-  match verifyResultColumns conn.catalog spec.columns rows.columns spec.resultFormats with
-  | .error error => pure (.error error)
-  | .ok () => pure (.ok rows)
+  match verifyPreparedResultColumns plan rows.columns with
+  | .error error =>
+    Internal.markPreparedDrift conn plan.cacheKey error
+    pure (.error error)
+  | .ok () => pure (.ok (plan, rows))
 
 private def decodeRow (spec : QuerySpec db Params Row cardinality)
+    (plan : PreparedQueryPlan db)
     (catalog : ResolvedCatalog db) (columns : Array Pg.Protocol.ColumnDesc)
     (values : Array (Option ByteArray)) : Except Error Row := do
   unless values.size == spec.columns.size do
     throw (.queryDrift
       s!"data row has {values.size} fields; expected {spec.columns.size}")
-  spec.decode catalog columns values
+  match spec.preparedDecode with
+  | some decode => decode plan.resolve plan.results columns values
+  | none => spec.decode catalog columns values
 
 /-- Execute a checked command that has no result columns. -/
 def execute (spec : QuerySpec db Params Row .execute)
@@ -109,7 +124,7 @@ def execute (spec : QuerySpec db Params Row .execute)
     Async (Except Error CommandResult) := do
   match ← runChecked db spec conn params with
   | .error error => pure (.error error)
-  | .ok rows =>
+  | .ok (_, rows) =>
     if rows.rows.isEmpty then pure (.ok { tag := rows.tag })
     else pure (.error (.queryDrift
       s!"execute query unexpectedly returned {rows.rows.size} data rows"))
@@ -120,9 +135,9 @@ def fetchOne (spec : QuerySpec db Params Row .exactlyOne)
     Async (Except Error Row) := do
   match ← runChecked db spec conn params with
   | .error error => pure (.error error)
-  | .ok rows =>
+  | .ok (plan, rows) =>
     match rows.rows with
-    | #[values] => pure (decodeRow spec conn.catalog rows.columns values)
+    | #[values] => pure (decodeRow spec plan conn.catalog rows.columns values)
     | values => pure (.error (.cardinality "exactly one row" s!"{values.size} rows"))
 
 /-- Execute a checked query whose application contract permits at most one
@@ -132,10 +147,10 @@ def fetchOptional (spec : QuerySpec db Params Row .zeroOrOne)
     Async (Except Error (Option Row)) := do
   match ← runChecked db spec conn params with
   | .error error => pure (.error error)
-  | .ok rows =>
+  | .ok (plan, rows) =>
     match rows.rows with
     | #[] => pure (.ok none)
-    | #[values] => pure (some <$> decodeRow spec conn.catalog rows.columns values)
+    | #[values] => pure (some <$> decodeRow spec plan conn.catalog rows.columns values)
     | values => pure (.error (.cardinality "zero or one row" s!"{values.size} rows"))
 
 /-- Execute a checked query returning all buffered rows in server order. -/
@@ -144,7 +159,7 @@ def fetchMany (spec : QuerySpec db Params Row .many)
     Async (Except Error (Array Row)) := do
   match ← runChecked db spec conn params with
   | .error error => pure (.error error)
-  | .ok rows =>
-    pure (rows.rows.mapM (decodeRow spec conn.catalog rows.columns))
+  | .ok (plan, rows) =>
+    pure (rows.rows.mapM (decodeRow spec plan conn.catalog rows.columns))
 
 end Pgx.Typed

@@ -427,14 +427,87 @@ def decodeResolved (codec : ResolvedCodec α) (catalog : ResolvedCatalog db)
     throw (.schemaDrift s!"codec does not describe {ty.key}")
   codec.decode (fun key => catalog.resolveType key) resolved format value
 
+/-- Encode through a generated built-in codec on the planned path.  Built-in
+encoders do not need an installation-local OID, so they avoid even the cached
+descriptor array access after plan identity and arity have been checked. -/
+def encodePlannedBuiltin [Pg.PgEncode α] (value : α) : Except Error EncodedValue :=
+  pure {
+    format := Pg.PgEncode.format α
+    value := Pg.PgEncode.encode value
+  }
+
+/-- Decode a built-in value using the portal OID that the numeric prepared plan
+has already validated. -/
+def decodePlannedBuiltin [Pg.PgDecode α] (typeOid : UInt32)
+    (format : UInt16) (value : Option ByteArray) : Except Error α :=
+  match Pg.decodeValue (α := α) typeOid format value with
+  | .ok decoded => pure decoded
+  | .error message => throw (.decode message)
+
+/-- Encode through a generated codec using its already-resolved outer
+parameter descriptor.  The connection plan has already matched the descriptor
+to the generated spec; avoiding another full static-descriptor comparison is
+part of the planned path.  The resolver remains available for genuine nested
+container dependencies. -/
+def encodePlanned (codec : ResolvedCodec α) (resolve : TypeResolver)
+    (resolved : ResolvedType) (value : α) : Except Error EncodedValue :=
+  codec.encode resolve resolved value
+
+/-- Decode through a generated codec using its already-resolved outer result
+descriptor.  The spec/plan association has already been checked on the cache
+path; nested container dependencies may still use `resolve`. -/
+def decodePlanned (codec : ResolvedCodec α) (resolve : TypeResolver)
+    (resolved : ResolvedType) (format : UInt16) (value : Option ByteArray) :
+    Except Error α :=
+  codec.decode resolve resolved format value
+
+/-- Physical origin recorded once from a checked catalog. -/
+structure PhysicalColumnOrigin where
+  tableOid : UInt32
+  attnum : UInt16
+  deriving Repr, BEq, Inhabited
+
+/-- Numeric portal-validation expectation.  It contains no symbolic type or
+relation keys, so validating a hot execution cannot scan the catalog. -/
+structure PreparedColumnPlan where
+  name : String
+  typeOid : UInt32
+  typeMod : Int32
+  origin : Option PhysicalColumnOrigin := none
+  format : UInt16 := 0
+  deriving Repr, BEq, Inhabited
+
+/-- Everything reusable after a query has been prepared and checked on one
+physical connection.  Values of this type are retained only in that checked
+connection's private cache. -/
+structure PreparedQueryPlan (db : DatabaseDesc) where
+  cacheKey : String
+  contractHash : String
+  statement : Pg.Statement
+  params : Array ResolvedType
+  results : Array ResolvedType
+  /-- Connection-local resolver retained for nested container codecs.  Direct
+  parameter/result descriptors use the arrays above and never call it. -/
+  resolve : TypeResolver
+  columns : Array PreparedColumnPlan
+  /-- Validated Bind result-format vector, retained in its compact PostgreSQL
+  representation (empty, one entry, or one per result). -/
+  resultFormats : Array UInt16
+  deriving Inhabited
+
 structure QuerySpec (db : DatabaseDesc) (Params Row : Type)
     (cardinality : Pgx.Cardinality) where
   name : String
   sql : String
+  /-- Stable query-contract fingerprint.  Manual specs that share a cache key
+  must use the same value only when their parameter/result/format contract is
+  identical. -/
   contractHash : String
   /-- Generation-time `queryCacheKey`. The empty default preserves manually
   authored source compatibility; generated specs always embed a nonempty key,
-  while legacy/manual specs derive it on demand. -/
+  while legacy/manual specs derive it on demand.  Supplying a nonempty manual
+  value asserts that it is the full database-contract/query-contract/SQL
+  identity, not merely a PostgreSQL statement name. -/
   cacheKey : String := ""
   params : Array ParamSpec
   columns : Array ColumnSpec
@@ -445,6 +518,155 @@ structure QuerySpec (db : DatabaseDesc) (Params Row : Type)
   encode : ResolvedCatalog db → Params → Except Error EncodedParams
   decode : ResolvedCatalog db → Array Pg.Protocol.ColumnDesc →
     Array (Option ByteArray) → Except Error Row
+  /-- Generated fast path.  The outer parameter descriptors have already been
+  resolved by the connection-bound prepared plan; `TypeResolver` is retained
+  only for nested codec dependencies. -/
+  preparedEncode : Option (TypeResolver → Array ResolvedType → Params →
+    Except Error EncodedParams) := none
+  /-- Generated fast path using result descriptors resolved once with the
+  prepared statement. -/
+  preparedDecode : Option (TypeResolver → Array ResolvedType →
+    Array Pg.Protocol.ColumnDesc → Array (Option ByteArray) →
+    Except Error Row) := none
+
+/-- Resolve the parameter descriptors once before Parse. -/
+def resolvePreparedParams (catalog : ResolvedCatalog db)
+    (params : Array ParamSpec) : Except Error (Array ResolvedType) :=
+  params.mapM fun param => catalog.resolveType param.ty.key
+
+private def physicalOrigin (catalog : ResolvedCatalog db)
+    (columnName : String) (origin : Pgx.ColumnKey) : Except Error PhysicalColumnOrigin := do
+  let some relation := catalog.resolveRelation? origin.relation
+    | throw (.queryDrift
+        s!"result column {columnName} has an unresolved symbolic origin")
+  let some column := relation.columns.find? (fun value =>
+      value.expected.name == origin.name)
+    | throw (.queryDrift
+        s!"result column {columnName} has an unresolved symbolic origin")
+  pure { tableOid := relation.oid, attnum := column.attnum }
+
+private def expandedResultFormats (columnCount : Nat)
+    (formats : Array UInt16) : Except Error (Array UInt16) := do
+  unless formats.isEmpty || formats.size == 1 || formats.size == columnCount do
+    throw (.queryDrift
+      s!"result format vector has {formats.size} entries; expected 0, 1, or {columnCount}")
+  for format in formats do
+    unless format == 0 || format == 1 do
+      throw (.queryDrift s!"unsupported PostgreSQL result format {format}")
+  if formats.isEmpty then
+    pure (Array.replicate columnCount 0)
+  else if formats.size == 1 then
+    pure (Array.replicate columnCount formats[0]!)
+  else
+    pure formats
+
+private def verifyPreparedColumns (expected : Array PreparedColumnPlan)
+    (actual : Array Pg.Protocol.ColumnDesc) (checkFormat : Bool) :
+    Except Error Unit := do
+  unless actual.size == expected.size do
+    throw (.queryDrift
+      s!"result column count changed from {expected.size} to {actual.size}")
+  for i in [0:expected.size] do
+    let want := expected[i]!
+    let got := actual[i]!
+    unless got.name == want.name do
+      throw (.queryDrift
+        s!"result column {i + 1} changed name from {want.name} to {got.name}")
+    unless got.typeOid == want.typeOid do
+      throw (.queryDrift
+        s!"result column {want.name} changed PostgreSQL type")
+    unless got.typeMod == want.typeMod do
+      throw (.queryDrift
+        s!"result column {want.name} changed type modifier")
+    match want.origin with
+    | some origin =>
+      unless got.tableOid == origin.tableOid && got.attnum == origin.attnum do
+        throw (.queryDrift
+          s!"result column {want.name} changed symbolic origin")
+    | none => pure ()
+    if checkFormat then
+      unless got.format == want.format do
+        throw (.queryDrift
+          s!"result column {want.name} changed wire format")
+
+/-- Finish a connection-bound plan after Parse/Describe has succeeded.  All
+symbolic result types and origins are converted to physical descriptors here,
+then both the statement's parameter description and row description are
+checked before the plan can enter the ready cache state. -/
+def createPreparedQueryPlan (catalog : ResolvedCatalog db) (cacheKey contractHash : String)
+    (params : Array ParamSpec) (resolvedParams : Array ResolvedType)
+    (columns : Array ColumnSpec) (resultFormats : Array UInt16)
+    (statement : Pg.Statement) : Except Error (PreparedQueryPlan db) := do
+  unless resolvedParams.size == params.size do
+    throw (.queryDrift
+      s!"resolved parameter plan has {resolvedParams.size} entries; expected {params.size}")
+  unless statement.paramTypes.size == params.size do
+    throw (.queryDrift
+      s!"parameter count changed from {params.size} to {statement.paramTypes.size}")
+  for i in [0:params.size] do
+    let resolved := resolvedParams[i]!
+    unless resolved.expected.key == params[i]!.ty.key do
+      throw (.queryDrift s!"resolved parameter {i + 1} changed symbolic type")
+    unless statement.paramTypes[i]! == resolved.oid do
+      throw (.queryDrift s!"parameter {i + 1} changed PostgreSQL type")
+  let formats ← expandedResultFormats columns.size resultFormats
+  let mut results : Array ResolvedType := #[]
+  let mut preparedColumns : Array PreparedColumnPlan := #[]
+  for i in [0:columns.size] do
+    let column := columns[i]!
+    let resolved ← match catalog.resolveType column.ty.key with
+      | .ok value => pure value
+      | .error _ => throw (.queryDrift
+          s!"result column {column.name} has an unresolved symbolic type")
+    results := results.push resolved
+    let origin ← column.origin.mapM (physicalOrigin catalog column.name)
+    preparedColumns := preparedColumns.push {
+      name := column.name
+      typeOid := resolved.oid
+      typeMod := column.ty.typmod.getD (-1)
+      origin
+      format := formats[i]!
+    }
+  verifyPreparedColumns preparedColumns statement.columns false
+  pure {
+    cacheKey
+    contractHash
+    statement
+    params := resolvedParams
+    results
+    resolve := fun key => catalog.resolveType key
+    columns := preparedColumns
+    resultFormats
+  }
+
+/-- Constant-time defense against handing a ready plan to a different query
+contract.  Generated cache identities already bind the database contract,
+query contract, and SQL.  A manual nonempty `cacheKey` is therefore an
+assertion that those inputs are identical; lying about both it and
+`contractHash` is a malformed manual contract, just like supplying an invalid
+encoder callback.  Sizes additionally protect planned array indexing without
+rescanning symbolic descriptors on every hit. -/
+def verifyPreparedQueryIdentity (plan : PreparedQueryPlan db)
+    (cacheKey contractHash : String) (paramCount columnCount formatCount : Nat) :
+    Except Error Unit := do
+  unless plan.cacheKey == cacheKey && plan.contractHash == contractHash do
+    throw (.queryDrift
+      "prepared query cache identity aliases a different query contract")
+  unless plan.params.size == paramCount do
+    throw (.queryDrift
+      "prepared query cache identity aliases a different parameter shape")
+  unless plan.results.size == columnCount do
+    throw (.queryDrift
+      "prepared query cache identity aliases a different result shape")
+  unless plan.resultFormats.size == formatCount do
+    throw (.queryDrift
+      "prepared query cache identity aliases a different result-format shape")
+
+/-- Validate each portal RowDescription against the cached numeric plan.  This
+remains on every execution and runs before any generated decoder. -/
+def verifyPreparedResultColumns (plan : PreparedQueryPlan db)
+    (actual : Array Pg.Protocol.ColumnDesc) : Except Error Unit :=
+  verifyPreparedColumns plan.columns actual true
 
 private def expectedOid (catalog : ResolvedCatalog db) (ref : Pgx.TypeRef) :
     Except Error UInt32 := do
