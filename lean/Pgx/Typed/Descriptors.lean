@@ -438,6 +438,10 @@ structure QuerySpec (db : DatabaseDesc) (Params Row : Type)
   cacheKey : String := ""
   params : Array ParamSpec
   columns : Array ColumnSpec
+  /-- Bind result formats using PostgreSQL's shorthand: empty means all text,
+  one entry applies to every result column, and otherwise there is one entry
+  per column.  The empty compatibility default preserves the prior text path. -/
+  resultFormats : Array UInt16 := #[]
   encode : ResolvedCatalog db → Params → Except Error EncodedParams
   decode : ResolvedCatalog db → Array Pg.Protocol.ColumnDesc →
     Array (Option ByteArray) → Except Error Row
@@ -477,9 +481,21 @@ private def verifyColumns (catalog : ResolvedCatalog db)
     | none => pure ()
 
 def verifyResultColumns (catalog : ResolvedCatalog db)
-    (expected : Array ColumnSpec) (actual : Array Pg.Protocol.ColumnDesc) :
-    Except Error Unit :=
+    (expected : Array ColumnSpec) (actual : Array Pg.Protocol.ColumnDesc)
+    (formats : Array UInt16 := #[]) : Except Error Unit := do
   verifyColumns catalog expected actual
+  unless formats.isEmpty || formats.size == 1 || formats.size == expected.size do
+    throw (.queryDrift
+      s!"result format vector has {formats.size} entries; expected 0, 1, or {expected.size}")
+  for i in [0:expected.size] do
+    let want : UInt16 := if formats.isEmpty then 0
+      else if formats.size == 1 then formats[0]!
+      else formats[i]!
+    unless want == 0 || want == 1 do
+      throw (.queryDrift s!"unsupported PostgreSQL result format {want}")
+    unless actual[i]!.format == want do
+      throw (.queryDrift
+        s!"result column {expected[i]!.name} changed wire format")
 
 def verifyStatement (catalog : ResolvedCatalog db)
     (params : Array ParamSpec) (columns : Array ColumnSpec) (statement : Pg.Statement) :

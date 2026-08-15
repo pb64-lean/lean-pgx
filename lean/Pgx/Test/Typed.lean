@@ -405,6 +405,17 @@ def main : IO UInt32 := do
     | .ok value => pure value
     | .error error => throw (IO.userError (toString error))
   assert! (verifyStatement catalog #[param] #[column] statement).isOk
+  assert! (verifyResultColumns catalog #[column] #[idResult]).isOk
+  assert! (verifyResultColumns catalog #[column] #[idResult] #[0]).isOk
+  assert! (verifyResultColumns catalog #[column]
+    #[{ idResult with format := 1 }] #[1]).isOk
+  assert! (verifyResultColumns catalog #[column, column]
+    #[{ idResult with format := 1 }, { idResult with format := 1 }] #[1]).isOk
+  assert! failed (verifyResultColumns catalog #[column] #[idResult] #[1])
+  assert! failed (verifyResultColumns catalog #[column] #[idResult] #[0, 1])
+  assert! failed (verifyResultColumns catalog #[column, column]
+    #[idResult, idResult] #[0, 0, 0])
+  assert! failed (verifyResultColumns catalog #[column] #[idResult] #[2])
   assert! failed (verifyStatement catalog #[] #[column] statement)
   assert! failed (verifyStatement catalog #[param] #[column]
     { statement with paramTypes := #[25] })

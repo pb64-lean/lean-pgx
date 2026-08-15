@@ -126,6 +126,8 @@ private structure NamingPlan where
 private structure TypeUse where
   leanType : String
   codec : Option String := none
+  binaryParamConstructor : Option String := none
+  resultFormat : UInt16 := 0
   deriving Inhabited
 
 private def generatedHeader : String :=
@@ -933,7 +935,11 @@ private def resolveTypeUse (plan : NamingPlan) (db : Pgx.DatabaseIR)
   | some value => pure { leanType := value.leanType, codec := some value.codec }
   | none =>
       match Pgx.builtinTypeMapping? key with
-      | some value => pure { leanType := value.leanType }
+      | some value => pure {
+          leanType := value.leanType
+          binaryParamConstructor := value.binaryParamConstructor
+          resultFormat := value.resultFormat
+        }
       | none =>
           match namedType? plan key with
           | some value => pure { leanType := value.leanType, codec := some value.codec }
@@ -2503,7 +2509,22 @@ private def encodeValueExpr (plan : NamingPlan) (db : Pgx.DatabaseIR)
   match codecExpr use nullable with
   | some codec =>
       pure s!"Pgx.Typed.encodeResolved {codec} catalog ({typeRefExpr ref}) {value}"
-  | none => pure s!"Pgx.Typed.encodeBuiltin catalog ({typeRefExpr ref}) {value}"
+  | none =>
+      let encodedValue := match use.binaryParamConstructor with
+        | none => value
+        | some constructor =>
+            if nullable then s!"Option.map {constructor} {value}"
+            else s!"{constructor} {value}"
+      pure s!"Pgx.Typed.encodeBuiltin catalog ({typeRefExpr ref}) ({encodedValue})"
+
+private def resultFormat (plan : NamingPlan) (db : Pgx.DatabaseIR)
+    (ref : Pgx.TypeRef) : Except CodegenError UInt16 := do
+  pure (← resolveTypeUse plan db ref.key).resultFormat
+
+private def compactResultFormats (formats : Array UInt16) : Array UInt16 :=
+  if formats.all (· == 0) then #[]
+  else if formats.all (· == 1) then #[1]
+  else formats
 
 private def decodeValueExpr (plan : NamingPlan) (db : Pgx.DatabaseIR)
     (ref : Pgx.TypeRef) (nullable : Bool) (index : Nat) : Except CodegenError String := do
@@ -2589,6 +2610,8 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
     (named : NamedQuery) : Except CodegenError String := do
   let query := named.query
   let cacheKey := Pgx.Typed.queryCacheKey db.contractHash query.sqlHash query.sql
+  let resultFormats := compactResultFormats <|
+    ← query.columns.mapM fun column => resultFormat plan db column.ty
   let paramNames := allocatedNames (query.params.map (·.name)) "param"
   let columnNames := allocatedNames (query.columns.map (·.name)) "column"
   let namespaceName := plan.modulePrefix ++ ".Queries." ++ named.moduleName
@@ -2706,6 +2729,7 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
     s!"  cacheKey := {stringLiteral cacheKey}",
     s!"  params := {arrayExpr (query.params.map paramSpecExpr)}",
     s!"  columns := {arrayExpr (query.columns.map columnSpecExpr)}",
+    s!"  resultFormats := {arrayExpr (resultFormats.map toString)}",
     "  encode := encodeParams",
     "  decode := decodeRow",
     "}",

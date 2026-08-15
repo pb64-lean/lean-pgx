@@ -10,19 +10,28 @@ namespace Pgx
 structure BuiltinTypeMapping where
   key : TypeKey
   leanType : String
+  /-- Constructor for an opt-in scalar parameter encoder.  This is deliberately
+  absent for types whose ordinary `PgEncode` instance is the only supported
+  wire representation. -/
+  binaryParamConstructor : Option String := none
+  /-- Preferred Bind result format for this exact built-in wire type. -/
+  resultFormat : UInt16 := 0
   deriving Repr, BEq, Inhabited
 
-private def builtin (name leanType : String) : BuiltinTypeMapping :=
-  { key := { schema := "pg_catalog", name, kind := .base }, leanType }
+private def builtin (name leanType : String)
+    (binaryParamConstructor : Option String := none)
+    (resultFormat : UInt16 := 0) : BuiltinTypeMapping :=
+  { key := { schema := "pg_catalog", name, kind := .base }, leanType,
+    binaryParamConstructor, resultFormat }
 
 /-- Built-in scalar surface backed by pg-lean codecs.  Symbolic container and
 composite mappings are resolved from their generated IR records. -/
 def builtinTypeMappings : Array BuiltinTypeMapping := #[
   builtin "bool" "Bool",
   builtin "bytea" "ByteArray",
-  builtin "int2" "Int16",
-  builtin "int4" "Int32",
-  builtin "int8" "Int64",
+  builtin "int2" "Int16" (some "Pg.binaryInt16") 1,
+  builtin "int4" "Int32" (some "Pg.binaryInt32") 1,
+  builtin "int8" "Int64" (some "Pg.binaryInt64") 1,
   builtin "oid" "Int",
   builtin "float4" "Float",
   builtin "float8" "Float",

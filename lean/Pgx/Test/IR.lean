@@ -380,6 +380,9 @@ def main : IO UInt32 := do
   assert! sample.contractHash == sample.contractHash
   assert! sample.normalize.supportedServerMajors == #[17, 18]
   assert! (builtinTypeMapping? int4.key).map (·.leanType) == some "Int32"
+  assert! (builtinTypeMapping? int4.key).map (·.binaryParamConstructor) ==
+    some (some "Pg.binaryInt32")
+  assert! (builtinTypeMapping? int4.key).map (·.resultFormat) == some 1
   assert! (sample.typeSupport? sample.enums[0]!.key).isSome
   assert! (sample.typeSupport? statusArrayKey).isSome
   let changedQueries := sample.queries.map fun (q : QueryIR) =>

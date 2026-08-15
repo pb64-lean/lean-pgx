@@ -13,11 +13,14 @@ open Pgx.Codegen.Identifier
 private def base (name : String) : TypeRef :=
   { key := { schema := "pg_catalog", name, kind := .base } }
 
+private def int2 : TypeRef := base "int2"
 private def int4 : TypeRef := base "int4"
 private def int8 : TypeRef := base "int8"
 private def text : TypeRef := base "text"
 private def bool : TypeRef := base "bool"
 private def time : TypeRef := base "time"
+private def citext : TypeRef :=
+  { key := { schema := "ext", name := "citext", kind := .base } }
 private def varchar12 : TypeRef :=
   { key := { schema := "pg_catalog", name := "varchar", kind := .base }, typmod := some 16 }
 
@@ -243,6 +246,24 @@ private def shuffled : DatabaseIR := {
 
 private def generated : Except CodegenError GeneratedSources :=
   emitDatabase "app_db" fixture
+
+private def binaryFormatFixture : DatabaseIR := {
+  fixture with
+  queries := fixture.queries.push {
+    name := "MixedFormats"
+    sql := "SELECT $1::int4 AS count, label::ext.citext FROM app.labels WHERE rank = $2"
+    sqlHash := "mixed-formats-v1"
+    params := #[
+      { position := 1, name := "count", ty := int4, nullable := true },
+      { position := 2, name := "rank", ty := int2, nullable := false }
+    ]
+    columns := #[
+      { name := "count", ty := int4, nullable := false },
+      { name := "label", ty := citext, nullable := false }
+    ]
+    cardinality := .many
+  }
+}
 
 private def unsupportedRelationalFixture : DatabaseIR := {
   fixture with
@@ -652,6 +673,9 @@ def main : IO UInt32 := do
       match emitDatabase "app_db" unsupportedRelationalFixture with
       | .ok value => pure value
       | .error error => throw (IO.userError (toString error))
+  let binaryFormatSources ← match emitDatabase "app_db" binaryFormatFixture with
+    | .ok value => pure value
+    | .error error => throw (IO.userError (toString error))
   generatedTypeTests
 
   -- Fixed output layout and a compact full-file golden for the root module.
@@ -763,6 +787,10 @@ def main : IO UInt32 := do
   assert! getUserCacheKey.length == 64
   assert! getUser.contents.contains s!"cacheKey := \"{getUserCacheKey}\""
   assert! !(getUser.contents.contains "Pgx.Typed.queryCacheKey")
+  -- The exact int8 wire result opts into binary, while the domain parameter
+  -- and text/custom result codecs remain on their declared text path.
+  assert! getUser.contents.contains "resultFormats := #[1, 0, 0]"
+  assert! !(getUser.contents.contains "Pg.binaryInt64 params.id")
   assert! getUser.contents.contains "structure RowData where"
   assert! getUser.contents.contains "email : AppDb.Types.AppEmailAddress"
   assert! getUser.contents.contains "abbrev Row := { value : RowData // ValidPred value }"
@@ -777,6 +805,18 @@ def main : IO UInt32 := do
   assert! listUsers.contents.contains "email : Option (AppDb.Types.AppEmailAddress)"
   assert! listUsers.contents.contains "| none => pure none"
   assert! listUsers.contents.contains "| some present => some <$> (do"
+  assert! listUsers.contents.contains "resultFormats := #[1, 0, 0]"
+  let some countUsers := sources.findModule? "AppDb.Queries.CountUsers"
+    | throw (IO.userError "missing generated CountUsers module")
+  assert! countUsers.contents.contains "resultFormats := #[1]"
+  let some mixedFormats := binaryFormatSources.findModule? "AppDb.Queries.MixedFormats"
+    | throw (IO.userError "missing generated MixedFormats module")
+  assert! mixedFormats.contents.contains
+    "Option.map Pg.binaryInt32 params.count"
+  assert! mixedFormats.contents.contains "Pg.binaryInt16 params.rank"
+  assert! mixedFormats.contents.contains "resultFormats := #[1, 0]"
+  assert! mixedFormats.contents.contains
+    "decodeResolved External.citextCodec"
 
   -- Source contracts remain symbolic and unsupported types are hard errors.
   for source in sources.all do

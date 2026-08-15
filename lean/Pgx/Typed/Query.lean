@@ -80,11 +80,18 @@ private def runChecked (db : DatabaseDesc)
   for format in encoded.formats do
     unless format == 0 || format == 1 do
       return .error (.encode s!"unsupported PostgreSQL parameter format {format}")
+  unless spec.resultFormats.isEmpty || spec.resultFormats.size == 1 ||
+      spec.resultFormats.size == spec.columns.size do
+    return .error (.queryDrift
+      s!"generated result format vector has {spec.resultFormats.size} entries; expected 0, 1, or {spec.columns.size}")
+  for format in spec.resultFormats do
+    unless format == 0 || format == 1 do
+      return .error (.queryDrift s!"unsupported PostgreSQL result format {format}")
   let rows ← match ← Pg.Connection.execute conn.raw statement.name
-      encoded.values encoded.formats with
+      encoded.values encoded.formats spec.resultFormats with
     | .error error => return .error (executionFailure error)
     | .ok rows => pure rows
-  match verifyResultColumns conn.catalog spec.columns rows.columns with
+  match verifyResultColumns conn.catalog spec.columns rows.columns spec.resultFormats with
   | .error error => pure (.error error)
   | .ok () => pure (.ok rows)
 
