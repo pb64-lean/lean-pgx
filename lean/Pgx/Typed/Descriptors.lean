@@ -407,7 +407,7 @@ def encodeBuiltin [Pg.PgEncode α] (catalog : ResolvedCatalog db)
   }
 
 def decodeBuiltin [Pg.PgDecode α] (catalog : ResolvedCatalog db)
-    (ty : Pgx.TypeRef) (format : UInt16) (value : Option ByteArray) : Except Error α := do
+    (ty : Pgx.TypeRef) (format : UInt16) (value : @& Option ByteArray) : Except Error α := do
   let resolved ← catalog.resolveType ty.key
   match Pg.decodeValue (α := α) resolved.oid format value with
   | .ok decoded => pure decoded
@@ -439,7 +439,7 @@ def encodePlannedBuiltin [Pg.PgEncode α] (value : α) : Except Error EncodedVal
 /-- Decode a built-in value using the portal OID that the numeric prepared plan
 has already validated. -/
 def decodePlannedBuiltin [Pg.PgDecode α] (typeOid : UInt32)
-    (format : UInt16) (value : Option ByteArray) : Except Error α :=
+    (format : UInt16) (value : @& Option ByteArray) : Except Error α :=
   match Pg.decodeValue (α := α) typeOid format value with
   | .ok decoded => pure decoded
   | .error message => throw (.decode message)

@@ -1,8 +1,15 @@
 """Pure lean-pgx tests."""
 
-load("@rules_lean//lean:defs.bzl", "lean_test")
+load("@rules_lean//lean:defs.bzl", "lean_binary", "lean_test")
 
 package(default_visibility = ["//visibility:private"])
+
+lean_binary(
+    name = "borrowed_decode_benchmark",
+    srcs = ["BorrowedDecodeBenchmark.lean"],
+    deps = ["//lean/Pgx/Typed:descriptors"],
+    strip_module_prefix = "lean",
+)
 
 lean_test(
     name = "ir_test",

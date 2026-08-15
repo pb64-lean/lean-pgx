@@ -66,6 +66,12 @@ private def binaryInt4Codec : ResolvedCodec Int32 where
     | .ok decoded => pure decoded
     | .error message => throw (.decode message)
 
+/-- Exercise the ownership escape through the prepared built-in descriptor:
+the decoded value is the exact borrowed result-cell payload. -/
+@[noinline] private def decodeOwnedPlannedBytea
+    (value : Option ByteArray) : Except Error ByteArray :=
+  decodePlannedBuiltin Pg.Oid.bytea 1 value
+
 private def idColumn : StaticColumnDesc :=
   { name := "id", ordinal := 1, ty := int4, nullable := false }
 
@@ -555,6 +561,8 @@ def main : IO UInt32 := do
   assert! okEq (decodeBuiltin (α := Int32) catalog int4 0 (some "42".toUTF8)) 42
   assert! okEq (decodeBuiltin (α := Option Int32) catalog int4 0 none) none
   assert! isError (decodeBuiltin (α := Int32) catalog int4 0 none)
+  let escapedBytea := "borrowed descriptor payload".toUTF8
+  assert! okEq (decodeOwnedPlannedBytea (some escapedBytea)) escapedBytea
   let encoded ← match encodeBuiltin catalog int4 (42 : Int32) with
     | .ok value => pure value
     | .error error => throw (IO.userError (toString error))
