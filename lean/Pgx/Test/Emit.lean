@@ -265,6 +265,79 @@ private def binaryFormatFixture : DatabaseIR := {
   }
 }
 
+private def int8Scalar : Pgx.Constraint.ScalarType := scalar int8 .int64
+
+private def reversedUsersIdConstraint : ConstraintIR := {
+  relation := usersKey
+  name := "users_id_positive_reversed"
+  kind := .check
+  expression := some "CHECK ((0 < id))"
+  localExpression := some <| .compare .lt
+    (.cast .integerWiden (.literal (.integer 0) int4Scalar) userIdScalar)
+    (.cast .identity (.column "id" userIdScalar false) userIdScalar)
+}
+
+private def contradictoryUsersIdConstraint : ConstraintIR := {
+  relation := usersKey
+  name := "users_id_contradictory"
+  kind := .check
+  expression := some "CHECK ((id >= 10) AND (id < 5))"
+  localExpression := some <| .and
+    (.compare .ge
+      (.cast .identity (.column "id" userIdScalar false) userIdScalar)
+      (.cast .identity (.literal (.integer 10) userIdScalar) userIdScalar))
+    (.compare .lt
+      (.cast .identity (.column "id" userIdScalar false) userIdScalar)
+      (.cast .identity (.literal (.integer 5) userIdScalar) userIdScalar))
+}
+
+private def nullableScoreConstraint : ConstraintIR := {
+  relation := usersKey
+  name := "users_score_range"
+  kind := .check
+  expression := some "CHECK ((score >= 0) AND (score < 100))"
+  localExpression := some <| .and
+    (.compare .ge
+      (.cast .identity (.column "score" int8Scalar true) int8Scalar)
+      (.cast .identity (.literal (.integer 0) int8Scalar) int8Scalar))
+    (.compare .lt
+      (.cast .identity (.column "score" int8Scalar true) int8Scalar)
+      (.cast .identity (.literal (.integer 100) int8Scalar) int8Scalar))
+}
+
+private def quantityUInt32Constraint : ConstraintIR := {
+  relation := usersKey
+  name := "users_quantity_uint32"
+  kind := .check
+  expression := some
+    "CHECK ((quantity >= 0) AND (quantity < '4294967296'::bigint))"
+  localExpression := some <| .and
+    (.compare .ge
+      (.cast .identity (.column "quantity" int8Scalar false) int8Scalar)
+      (.cast .identity (.literal (.integer 0) int8Scalar) int8Scalar))
+    (.compare .lt
+      (.cast .identity (.column "quantity" int8Scalar false) int8Scalar)
+      (.cast .identity (.literal (.integer 4294967296) int8Scalar) int8Scalar))
+}
+
+private def rangeSpecializationFixture : DatabaseIR :=
+  Pgx.Codegen.Projection.planDatabase {
+    fixtureBase with
+    relations := fixtureBase.relations.map fun relation =>
+      if relation.key == usersKey then
+        { relation with columns := relation.columns ++ #[
+            { name := "score", ordinal := 5, ty := int8, nullable := true },
+            { name := "quantity", ordinal := 6, ty := int8, nullable := false }
+          ] }
+      else relation
+    constraints := fixtureBase.constraints ++ #[
+      reversedUsersIdConstraint,
+      contradictoryUsersIdConstraint,
+      nullableScoreConstraint,
+      quantityUInt32Constraint
+    ]
+  }
+
 private def unsupportedRelationalFixture : DatabaseIR := {
   fixture with
   constraints := fixture.constraints.push {
@@ -676,6 +749,9 @@ def main : IO UInt32 := do
   let binaryFormatSources ← match emitDatabase "app_db" binaryFormatFixture with
     | .ok value => pure value
     | .error error => throw (IO.userError (toString error))
+  let rangeSources ← match emitDatabase "range_db" rangeSpecializationFixture with
+    | .ok value => pure value
+    | .error error => throw (IO.userError (toString error))
   generatedTypeTests
 
   -- Fixed output layout and a compact full-file golden for the root module.
@@ -802,6 +878,15 @@ def main : IO UInt32 := do
   assert! !(getUser.contents.contains
     "decodeResolved AppDb.Types.AppEmailAddress.codec")
   assert! getUser.contents.contains "users_id_positive"
+  assert! getUser.contents.contains
+    "@[expose] def ValidPred (value : RowData) : Prop :=\n  Pgx.Constraint.Valid checks value"
+  assert! getUser.contents.contains "def SpecializedPred (value : RowData) : Prop"
+  assert! getUser.contents.contains "theorem specializedPred_iff_validPred"
+  assert! getUser.contents.contains "Pgx.Constraint.validatePredIff"
+  assert! getUser.contents.contains "Pgx.Constraint.IntegerRange.HoldsValue"
+  assert! getUser.contents.contains "def idUInt64 (value : Row) : UInt64"
+  assert! getUser.contents.contains "Pgx.Constraint.uint64OfPositiveInt64"
+  assert! !(getUser.contents.contains "Pgx.Constraint.compareNullable .gt")
   assert! getUser.contents.contains "match validate rowData with"
   assert! getUser.contents.contains "Pgx.Typed.Error.constraintViolation violation"
   let some listUsers := sources.findModule? "AppDb.Queries.ListUsers"
@@ -813,6 +898,21 @@ def main : IO UInt32 := do
   let some countUsers := sources.findModule? "AppDb.Queries.CountUsers"
     | throw (IO.userError "missing generated CountUsers module")
   assert! countUsers.contents.contains "resultFormats := #[1]"
+  assert! !(countUsers.contents.contains "def countUInt64")
+
+  -- Range recognition covers reversed operands, contradictory bounds and
+  -- nullable SQL-unknown semantics.  Multiple recognized facts for `id`
+  -- still emit one deterministic accessor declaration.
+  assert! rangeSources.schema.contents.contains "users_id_positive_reversed"
+  assert! rangeSources.schema.contents.contains "users_id_contradictory"
+  assert! rangeSources.schema.contents.contains "users_score_range"
+  assert! rangeSources.schema.contents.contains
+    "Pgx.Constraint.IntegerRange.HoldsNullable"
+  assert! rangeSources.schema.contents.contains "users_quantity_uint32"
+  assert! rangeSources.schema.contents.contains
+    "def quantityUInt32 (value : Row) : UInt32"
+  assert! rangeSources.schema.contents.contains "Pgx.Constraint.uint32OfInt64"
+  assert! (rangeSources.schema.contents.splitOn "def idUInt64 (value : Row)").length == 2
   let some mixedFormats := binaryFormatSources.findModule? "AppDb.Queries.MixedFormats"
     | throw (IO.userError "missing generated MixedFormats module")
   assert! mixedFormats.contents.contains

@@ -115,6 +115,135 @@ instance (result : Except EvaluationError SqlTruth) : Decidable (resultPasses re
   | .ok truth => inferInstanceAs (Decidable truth.checkPasses)
   | .error _ => isFalse id
 
+/-! ## Fixed-width integer ranges
+
+The code generator recognizes the common PostgreSQL shape consisting only of
+ordered comparisons between one fixed-width integer and integer literals.
+Keeping the bounds in the same fixed-width carrier is important: successful
+row validation then neither allocates an arbitrary-precision `Int` nor builds
+the generic `Except`/`Option`/`SqlTruth` evaluator graph.
+-/
+
+/-- One lower or upper bound of a generated fixed-width integer range. -/
+structure IntegerBound (α : Type u) where
+  value : α
+  inclusive : Bool
+
+/-- A conjunction of at most one lower and one upper integer bound. -/
+structure IntegerRange (α : Type u) where
+  lower : Option (IntegerBound α) := none
+  upper : Option (IntegerBound α) := none
+
+namespace IntegerRange
+
+/-- Native-width lower-bound decision used by generated range predicates. -/
+@[expose] def lowerPasses [Ord α] (range : IntegerRange α) (value : α) : Bool :=
+  match range.lower with
+  | none => true
+  | some bound =>
+      if bound.inclusive then compare bound.value value != .gt
+      else compare bound.value value == .lt
+
+/-- Native-width upper-bound decision used by generated range predicates. -/
+@[expose] def upperPasses [Ord α] (range : IntegerRange α) (value : α) : Bool :=
+  match range.upper with
+  | none => true
+  | some bound =>
+      if bound.inclusive then compare value bound.value != .gt
+      else compare value bound.value == .lt
+
+/-- Proof carried by a non-null value accepted by a specialized range. -/
+@[expose] def HoldsValue [Ord α] (range : IntegerRange α) (value : α) : Prop :=
+  range.lowerPasses value = true ∧ range.upperPasses value = true
+
+/-- PostgreSQL CHECK semantics for a nullable specialized range: null is SQL
+unknown and therefore passes the check. -/
+@[expose] def HoldsNullable [Ord α] (range : IntegerRange α) : Option α → Prop
+  | none => True
+  | some value => range.HoldsValue value
+
+instance [Ord α] (range : IntegerRange α) (value : α) :
+    Decidable (range.HoldsValue value) := by
+  unfold HoldsValue
+  infer_instance
+
+instance [Ord α] (range : IntegerRange α) (value : Option α) :
+    Decidable (range.HoldsNullable value) := by
+  cases value <;> simp only [HoldsNullable]
+  · exact isTrue trivial
+  · infer_instance
+
+/-- Canonical three-valued result corresponding to `HoldsValue`. -/
+def truthValue [Ord α] (range : IntegerRange α) (value : α) : SqlTruth :=
+  if range.lowerPasses value && range.upperPasses value then .true else .false
+
+/-- Compatibility evaluator for public generated `Check` programs.  The hot
+generated validator uses `HoldsValue` directly. -/
+def evaluateValue [Ord α] (range : IntegerRange α) (value : α) :
+    Except EvaluationError SqlTruth :=
+  .ok (range.truthValue value)
+
+/-- Nullable compatibility evaluator.  `none` remains SQL unknown. -/
+def evaluateNullable [Ord α] (range : IntegerRange α) :
+    Option α → Except EvaluationError SqlTruth
+  | none => .ok .unknown
+  | some value => range.evaluateValue value
+
+/-- The native non-null range predicate has exactly the canonical generated
+check meaning. -/
+theorem resultPasses_evaluateValue_iff [Ord α] (range : IntegerRange α)
+    (value : α) :
+    resultPasses (range.evaluateValue value) ↔ range.HoldsValue value := by
+  by_cases holds :
+      range.lowerPasses value = true ∧ range.upperPasses value = true
+  · simp [evaluateValue, truthValue, HoldsValue, resultPasses,
+      SqlTruth.checkPasses, holds]
+  · simp [evaluateValue, truthValue, HoldsValue, resultPasses,
+      SqlTruth.checkPasses, holds]
+
+/-- Nullable specialization preserves PostgreSQL's unknown-passes CHECK
+semantics exactly. -/
+theorem resultPasses_evaluateNullable_iff [Ord α] (range : IntegerRange α)
+    (value : Option α) :
+    resultPasses (range.evaluateNullable value) ↔ range.HoldsNullable value := by
+  cases value with
+  | none => simp [evaluateNullable, HoldsNullable, resultPasses, SqlTruth.checkPasses]
+  | some value =>
+      exact resultPasses_evaluateValue_iff range value
+
+end IntegerRange
+
+/-! Proof-backed fixed-width conversions.  Their proof arguments are erased,
+and their implementations are direct machine-integer casts. -/
+
+/-- A positive `Int64`, expressed using the same native comparison emitted by
+the range specializer. -/
+@[expose] def PositiveInt64 (value : Int64) : Prop :=
+  (compare (0 : Int64) value == .lt) = true
+
+/-- A nonnegative `Int64`, expressed using a native-width comparison. -/
+@[expose] def NonnegativeInt64 (value : Int64) : Prop :=
+  (compare (0 : Int64) value != .gt) = true
+
+/-- The exact PostgreSQL BIGINT interval representable by `UInt32`. -/
+@[expose] def Int64FitsUInt32 (value : Int64) : Prop :=
+  NonnegativeInt64 value ∧
+    (compare value (4294967296 : Int64) == .lt) = true
+
+/-- Convert a proof-backed positive BIGINT without a runtime range branch. -/
+@[inline] def uint64OfPositiveInt64 (value : Int64) (_ : PositiveInt64 value) : UInt64 :=
+  value.toUInt64
+
+/-- Convert a proof-backed nonnegative BIGINT without a runtime range branch. -/
+@[inline] def uint64OfNonnegativeInt64 (value : Int64)
+    (_ : NonnegativeInt64 value) : UInt64 :=
+  value.toUInt64
+
+/-- Convert a proof-backed BIGINT in `[0, 2^32)` without a runtime range
+branch or an intermediate arbitrary-precision integer. -/
+@[inline] def uint32OfInt64 (value : Int64) (_ : Int64FitsUInt32 value) : UInt32 :=
+  value.toUInt64.toUInt32
+
 /-- Lift a unary modeled operation through SQL null. -/
 def liftNullable (operation : α → Except EvaluationError β) :
     Option α → Except EvaluationError (Option β)
@@ -535,6 +664,63 @@ def firstViolation? : List (Check α) → α → Option Violation
       | .error error => some (.evaluationFailed check.name error)
       | .ok .false => some (.checkFailed check.name)
       | .ok .true | .ok .unknown => firstViolation? rest value
+
+/-- Turn a failed generic check result into its stable diagnostic.  Calling
+this after `resultPasses` failed keeps successful generated validation on the
+single-evaluation path. -/
+def violationOfResult (constraint : String) :
+    Except EvaluationError SqlTruth → Violation
+  | .error error => .evaluationFailed constraint error
+  | .ok .false => .checkFailed constraint
+  | .ok .true | .ok .unknown => .inconsistentValidator
+
+/-- Run a fast predicate while returning the historically public canonical
+proof.  Generated modules provide an explicit equivalence theorem, keeping
+`ValidPred` definitionally tied to `Valid checks`.  Successful values avoid
+the canonical list of closures; the source-ordered diagnostic program runs
+only after the direct predicate rejects a value. -/
+@[expose] def validatePredIff {α : Type u} (canonical fast : α → Prop)
+    (decideFast : (value : α) → Decidable (fast value))
+    (equivalent : (value : α) → (fast value ↔ canonical value))
+    (firstViolation : α → Violation) (value : α) :
+    Except Violation { refined : α // canonical refined } :=
+  letI : Decidable (fast value) := decideFast value
+  if valid : fast value then
+    .ok ⟨value, (equivalent value).mp valid⟩
+  else
+    .error (firstViolation value)
+
+theorem validatePredIff_sound {α : Type u} (canonical fast : α → Prop)
+    (decideFast : (value : α) → Decidable (fast value))
+    (equivalent : (value : α) → (fast value ↔ canonical value))
+    (firstViolation : α → Violation) {value : α}
+    {refined : { candidate : α // canonical candidate }} :
+    validatePredIff canonical fast decideFast equivalent firstViolation value = .ok refined →
+      refined.val = value ∧ canonical value := by
+  intro accepted
+  simp only [validatePredIff] at accepted
+  split at accepted
+  next valid =>
+    have refined_eq : refined = ⟨value, (equivalent value).mp valid⟩ :=
+      Except.ok.inj accepted.symm
+    subst refined
+    exact ⟨rfl, (equivalent value).mp valid⟩
+  next _ => contradiction
+
+theorem validatePredIff_complete {α : Type u} (canonical fast : α → Prop)
+    (decideFast : (value : α) → Decidable (fast value))
+    (equivalent : (value : α) → (fast value ↔ canonical value))
+    (firstViolation : α → Violation) {value : α} :
+    canonical value →
+      ∃ refined,
+        validatePredIff canonical fast decideFast equivalent firstViolation value = .ok refined := by
+  intro valid
+  have fastValid : fast value := (equivalent value).mpr valid
+  exact ⟨⟨value, valid⟩, by
+    simp only [validatePredIff]
+    split
+    next => rfl
+    next invalid => exact (invalid fastValid).elim⟩
 
 /-- Construct a proof-bearing value only by executing its local checks. -/
 @[expose] def validate (checks : List (Check α)) (value : α) :

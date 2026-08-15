@@ -1261,7 +1261,9 @@ private def allocatedNames (sources : Array String) (fallback : String) : Array 
 
 private structure ExprBinding where
   sourceName : String
+  leanName : String
   access : String
+  refinedAccess : String
   declared : Pgx.TypeRef
   storage : Pgx.TypeRef
   nullable : Bool
@@ -1276,9 +1278,26 @@ private structure CompiledValue where
   semanticType : String
   scalarType : Pgx.Constraint.ScalarType
 
+private structure GeneratedRangeBound where
+  value : Int
+  inclusive : Bool
+  deriving Repr, BEq, Inhabited
+
+private structure GeneratedIntegerRange where
+  nativeType : String
+  access : String
+  refinedAccess : String
+  nullable : Bool
+  accessorStem : String
+  lower : Option GeneratedRangeBound := none
+  upper : Option GeneratedRangeBound := none
+  deriving Repr, BEq, Inhabited
+
 private structure GeneratedCheck where
   name : String
   evaluate : String
+  integerRange : Option GeneratedIntegerRange := none
+  deriving Inhabited
 
 private def semanticTypeName (context : String) : Pgx.Constraint.ScalarType →
     Except CodegenError String
@@ -1331,12 +1350,175 @@ private def scalarizeStorage (plan : NamingPlan) (db : Pgx.DatabaseIR)
     (ref : Pgx.TypeRef) (expression context : String) : Except CodegenError String :=
   scalarizeStorageAux plan db ref expression context #[]
 
+private structure NativeIntegerAccess where
+  leanType : String
+  access : String
+  deriving Inhabited
+
+/-- Unwrap generated domains while retaining the fixed-width machine integer
+carrier instead of scalarizing through arbitrary-precision `Int`. -/
+private partial def nativeIntegerAccessAux (plan : NamingPlan) (db : Pgx.DatabaseIR)
+    (ref : Pgx.TypeRef) (expression context : String) (seen : Array Pgx.TypeKey) :
+    Except CodegenError (Option NativeIntegerAccess) := do
+  if seen.contains ref.key then throw (.cyclicDomain ref.key)
+  if (db.typeOverride? ref.key).isSome then pure none
+  else
+    match db.domain? ref.key with
+    | some domain =>
+        let some named := namedType? plan ref.key
+          | throw (.unsupportedConstraint context
+              s!"domain {ref.key} has no generated local validator")
+        nativeIntegerAccessAux plan db domain.base
+          s!"{named.leanType}.toBase ({expression})" context (seen.push ref.key)
+    | none =>
+        if ref.key.schema != "pg_catalog" then pure none
+        else if ref.key.name == "int2" then
+          pure (some { leanType := "Int16", access := expression })
+        else if ref.key.name == "int4" then
+          pure (some { leanType := "Int32", access := expression })
+        else if ref.key.name == "int8" then
+          pure (some { leanType := "Int64", access := expression })
+        else pure none
+
+private def nativeIntegerAccess? (plan : NamingPlan) (db : Pgx.DatabaseIR)
+    (ref : Pgx.TypeRef) (expression context : String) :
+    Except CodegenError (Option NativeIntegerAccess) :=
+  nativeIntegerAccessAux plan db ref expression context #[]
+
+private def integerFitsNative (leanType : String) (value : Int) : Bool :=
+  if leanType == "Int16" then
+    -32768 ≤ value && value ≤ 32767
+  else if leanType == "Int32" then
+    -2147483648 ≤ value && value ≤ 2147483647
+  else if leanType == "Int64" then
+    -9223372036854775808 ≤ value && value ≤ 9223372036854775807
+  else false
+
+private def unwrapIntegerExpr : Pgx.Constraint.ValueExpr → Pgx.Constraint.ValueExpr
+  | expression@(.cast preservation value _) =>
+      if preservation == .identity || preservation == .domain ||
+          preservation == .integerWiden then
+        unwrapIntegerExpr value
+      else
+        expression
+  | value => value
+
+private def integerLiteral? (value : Pgx.Constraint.ValueExpr) : Option Int :=
+  match unwrapIntegerExpr value with
+  | .literal (.integer value) _ => some value
+  | _ => none
+
 private def findBinding (scope : ExprScope) (name context : String) :
     Except CodegenError ExprBinding := do
   let bindings := scope.columns.filter (fun binding => binding.sourceName == name)
   unless bindings.size == 1 do
     throw (.malformedIR context s!"column {repr name} does not resolve uniquely")
   pure bindings[0]!
+
+private def integerVariable? (plan : NamingPlan) (db : Pgx.DatabaseIR)
+    (scope : ExprScope) (context : String) (value : Pgx.Constraint.ValueExpr) :
+    Except CodegenError (Option GeneratedIntegerRange) := do
+  let binding? ← match unwrapIntegerExpr value with
+    | .column name ty nullable => do
+        if !ty.isInteger then pure none
+        else
+          let binding ← findBinding scope name context
+          unless binding.nullable == nullable do
+            throw (.malformedIR context s!"column annotation for {repr name} differs from its field")
+          pure (some binding)
+    | .domainValue ty _ =>
+        if ty.isInteger then pure scope.domainValue else pure none
+    | _ => pure none
+  let some binding := binding? | pure none
+  if binding.nullable then
+    let some payload ← nativeIntegerAccess? plan db binding.storage "present" context
+      | pure none
+    pure (some {
+      nativeType := payload.leanType
+      access := s!"({binding.access}).map (fun present => {payload.access})"
+      refinedAccess := s!"({binding.refinedAccess}).map (fun present => {payload.access})"
+      nullable := true
+      accessorStem := binding.leanName
+    })
+  else
+    let some access ← nativeIntegerAccess? plan db binding.storage binding.access context
+      | pure none
+    let some refined ← nativeIntegerAccess? plan db binding.storage binding.refinedAccess context
+      | pure none
+    pure (some {
+      nativeType := access.leanType
+      access := access.access
+      refinedAccess := refined.access
+      nullable := false
+      accessorStem := binding.leanName
+    })
+
+private def reverseComparison : Pgx.Constraint.Comparison → Pgx.Constraint.Comparison
+  | .eq => .eq
+  | .ne => .ne
+  | .lt => .gt
+  | .le => .ge
+  | .gt => .lt
+  | .ge => .le
+
+private def rangeAtom (range : GeneratedIntegerRange)
+    (operator : Pgx.Constraint.Comparison) (literal : Int) :
+    Option GeneratedIntegerRange :=
+  if !integerFitsNative range.nativeType literal then none
+  else
+    match operator with
+    | .gt => some { range with lower := some { value := literal, inclusive := false } }
+    | .ge => some { range with lower := some { value := literal, inclusive := true } }
+    | .lt => some { range with upper := some { value := literal, inclusive := false } }
+    | .le => some { range with upper := some { value := literal, inclusive := true } }
+    | .eq | .ne => none
+
+private def strongestLower (left right : Option GeneratedRangeBound) :
+    Option GeneratedRangeBound :=
+  match left, right with
+  | none, value | value, none => value
+  | some left, some right =>
+      if left.value < right.value then some right
+      else if right.value < left.value then some left
+      else some { value := left.value, inclusive := left.inclusive && right.inclusive }
+
+private def strongestUpper (left right : Option GeneratedRangeBound) :
+    Option GeneratedRangeBound :=
+  match left, right with
+  | none, value | value, none => value
+  | some left, some right =>
+      if left.value < right.value then some left
+      else if right.value < left.value then some right
+      else some { value := left.value, inclusive := left.inclusive && right.inclusive }
+
+private def mergeIntegerRanges (left right : GeneratedIntegerRange) :
+    Option GeneratedIntegerRange :=
+  if left.nativeType != right.nativeType || left.access != right.access ||
+      left.refinedAccess != right.refinedAccess || left.nullable != right.nullable then
+    none
+  else
+    some {
+      left with
+      lower := strongestLower left.lower right.lower
+      upper := strongestUpper left.upper right.upper
+    }
+
+private partial def compileIntegerRange? (plan : NamingPlan) (db : Pgx.DatabaseIR)
+    (scope : ExprScope) (context : String) : Pgx.Constraint.TruthExpr →
+    Except CodegenError (Option GeneratedIntegerRange)
+  | .compare operator left right => do
+      if let some literal := integerLiteral? right then
+        let some nativeRange ← integerVariable? plan db scope context left | pure none
+        pure (rangeAtom nativeRange operator literal)
+      else if let some literal := integerLiteral? left then
+        let some nativeRange ← integerVariable? plan db scope context right | pure none
+        pure (rangeAtom nativeRange (reverseComparison operator) literal)
+      else pure none
+  | .and left right => do
+      let some left ← compileIntegerRange? plan db scope context left | pure none
+      let some right ← compileIntegerRange? plan db scope context right | pure none
+      pure (mergeIntegerRanges left right)
+  | _ => pure none
 
 private def optionValueExpression (plan : NamingPlan) (db : Pgx.DatabaseIR)
     (binding : ExprBinding) (semanticType context : String) : Except CodegenError String := do
@@ -1483,6 +1665,15 @@ private partial def compileTruthExpr (plan : NamingPlan) (db : Pgx.DatabaseIR)
       let value ← compileTruthExpr plan db scope context value
       pure s!"({value}).map Pgx.Constraint.SqlTruth.negate"
 
+private def compileGeneratedCheck (plan : NamingPlan) (db : Pgx.DatabaseIR)
+    (scope : ExprScope) (context name : String)
+    (expression : Pgx.Constraint.TruthExpr) : Except CodegenError GeneratedCheck := do
+  pure {
+    name
+    evaluate := ← compileTruthExpr plan db scope context expression
+    integerRange := ← compileIntegerRange? plan db scope context expression
+  }
+
 private def scalarTypmodCheck? (ref : Pgx.TypeRef) (access : String)
     (nullable : Bool) (name : String) : Option GeneratedCheck :=
   let optionalValue := if nullable then access else s!"some ({access})"
@@ -1549,13 +1740,165 @@ private def typmodCheck? (db : Pgx.DatabaseIR) (ref : Pgx.TypeRef)
   else
     scalarTypmodCheck? ref access nullable name
 
+private def generatedBoundExpr (nativeType : String) :
+    Option GeneratedRangeBound → String
+  | none => "none"
+  | some bound =>
+      s!"some ({recordExpr s!"value := ({bound.value} : {nativeType}), inclusive := {boolExpr bound.inclusive}"})"
+
+private def generatedRangeExpr (range : GeneratedIntegerRange) : String :=
+  recordExpr s!"lower := {generatedBoundExpr range.nativeType range.lower}, upper := {generatedBoundExpr range.nativeType range.upper}"
+
+private def specializedEvaluateExpr (index : Nat) (check : GeneratedCheck) : String :=
+  match check.integerRange with
+  | none => check.evaluate
+  | some range =>
+      if range.nullable then
+        s!"Pgx.Constraint.IntegerRange.evaluateNullable integerRange{index} ({range.access})"
+      else
+        s!"Pgx.Constraint.IntegerRange.evaluateValue integerRange{index} ({range.access})"
+
+private def specializedPredicateExpr (index : Nat) (check : GeneratedCheck) : String :=
+  match check.integerRange with
+  | none => s!"Pgx.Constraint.resultPasses (evaluateCheck{index} value)"
+  | some range =>
+      if range.nullable then
+        s!"Pgx.Constraint.IntegerRange.HoldsNullable integerRange{index} ({range.access})"
+      else
+        s!"Pgx.Constraint.IntegerRange.HoldsValue integerRange{index} ({range.access})"
+
+private def conjunctionExpr : List String → String
+  | [] => "(let _ := value; True)"
+  | [value] => value
+  | value :: rest => s!"({value}) ∧ ({conjunctionExpr rest})"
+
+private def generatedFailureExpr (index : Nat) (check : GeneratedCheck) : String :=
+  if check.integerRange.isSome then
+    s!".checkFailed {stringLiteral check.name}"
+  else
+    s!"Pgx.Constraint.violationOfResult {stringLiteral check.name} (evaluateCheck{index} value)"
+
+private def generatedDiagnosticExpr (checks : Array GeneratedCheck)
+    (predicates : Array String) : String :=
+  let rec loop (index : Nat) : String :=
+    if index < checks.size then
+      s!"if {predicates[index]!} then ({loop (index + 1)}) else ({generatedFailureExpr index checks[index]!})"
+    else if checks.isEmpty then "(let _ := value; .inconsistentValidator)"
+    else ".inconsistentValidator"
+  loop 0
+
+private inductive GeneratedConversion where
+  | positiveUInt64
+  | nonnegativeUInt64
+  | uint32
+
+private def generatedConversion? (range : GeneratedIntegerRange) :
+    Option GeneratedConversion :=
+  if range.nullable || range.nativeType != "Int64" then none
+  else
+    match range.lower, range.upper with
+    | some { value := 0, inclusive := true },
+        some { value := 4294967296, inclusive := false } => some .uint32
+    | some { value := 0, inclusive := false }, _ => some .positiveUInt64
+    | some { value := 0, inclusive := true }, _ => some .nonnegativeUInt64
+    | _, _ => none
+
+private def conjunctionProjection (base : String) (index size : Nat) : String :=
+  if size ≤ 1 then base
+  else
+    let withTails := (List.range index).foldl (fun value _ => value ++ ".2") base
+    if index + 1 < size then withTails ++ ".1" else withTails
+
+private def emitConversionAccessor (publicType : String) (checkCount index : Nat)
+    (range : GeneratedIntegerRange) (conversion : GeneratedConversion) : List String :=
+  let proof := conjunctionProjection "specialized" index checkCount
+  let unfoldRange := s!"integerRange{index}, Pgx.Constraint.IntegerRange.HoldsValue, Pgx.Constraint.IntegerRange.lowerPasses, Pgx.Constraint.IntegerRange.upperPasses"
+  match conversion with
+  | .positiveUInt64 =>
+      let theoremName := range.accessorStem ++ "Positive"
+      let accessorName := range.accessorStem ++ "UInt64"
+      [
+        s!"/-- Project the generated positive BIGINT fact for `{range.accessorStem}`. -/",
+        s!"theorem {theoremName} (value : {publicType}) :",
+        s!"    Pgx.Constraint.PositiveInt64 ({range.refinedAccess}) := by",
+        "  have specialized := (specializedPred_iff_validPred value.val).mpr value.property",
+        s!"  have rangeProof := {proof}",
+        s!"  simpa [{unfoldRange}, Pgx.Constraint.PositiveInt64] using rangeProof.1",
+        "",
+        s!"/-- Convert `{range.accessorStem}` to `UInt64` using its row proof, with no range branch. -/",
+        s!"@[inline] def {accessorName} (value : {publicType}) : UInt64 :=",
+        s!"  Pgx.Constraint.uint64OfPositiveInt64 ({range.refinedAccess}) ({theoremName} value)",
+        ""
+      ]
+  | .nonnegativeUInt64 =>
+      let theoremName := range.accessorStem ++ "Nonnegative"
+      let accessorName := range.accessorStem ++ "UInt64"
+      [
+        s!"/-- Project the generated nonnegative BIGINT fact for `{range.accessorStem}`. -/",
+        s!"theorem {theoremName} (value : {publicType}) :",
+        s!"    Pgx.Constraint.NonnegativeInt64 ({range.refinedAccess}) := by",
+        "  have specialized := (specializedPred_iff_validPred value.val).mpr value.property",
+        s!"  have rangeProof := {proof}",
+        s!"  simpa [{unfoldRange}, Pgx.Constraint.NonnegativeInt64] using rangeProof.1",
+        "",
+        s!"/-- Convert `{range.accessorStem}` to `UInt64` using its row proof, with no range branch. -/",
+        s!"@[inline] def {accessorName} (value : {publicType}) : UInt64 :=",
+        s!"  Pgx.Constraint.uint64OfNonnegativeInt64 ({range.refinedAccess}) ({theoremName} value)",
+        ""
+      ]
+  | .uint32 =>
+      let theoremName := range.accessorStem ++ "FitsUInt32"
+      let accessorName := range.accessorStem ++ "UInt32"
+      [
+        s!"/-- Project the generated `[0, 2^32)` BIGINT fact for `{range.accessorStem}`. -/",
+        s!"theorem {theoremName} (value : {publicType}) :",
+        s!"    Pgx.Constraint.Int64FitsUInt32 ({range.refinedAccess}) := by",
+        "  have specialized := (specializedPred_iff_validPred value.val).mpr value.property",
+        s!"  have rangeProof := {proof}",
+        s!"  simpa [{unfoldRange}, Pgx.Constraint.Int64FitsUInt32, Pgx.Constraint.NonnegativeInt64] using rangeProof",
+        "",
+        s!"/-- Convert `{range.accessorStem}` to `UInt32` using its row proof, with no range branch. -/",
+        s!"@[inline] def {accessorName} (value : {publicType}) : UInt32 :=",
+        s!"  Pgx.Constraint.uint32OfInt64 ({range.refinedAccess}) ({theoremName} value)",
+        ""
+      ]
+
 private def emitValidator (dataType publicType : String)
-    (checks : Array GeneratedCheck) : List String :=
-  let checkExprs := checks.map fun check =>
-    recordExpr s!"name := {stringLiteral check.name}, evaluate := fun value => {check.evaluate}"
-  [
-    "/-- Generated validator program; public so module-mode declarations may",
-    "refer to it while construction remains confined to generated code. -/",
+    (checks : Array GeneratedCheck) : List String := Id.run do
+  let mut lines : List String := []
+  let mut predicates : Array String := #[]
+  for i in [0:checks.size] do
+    let check := checks[i]!
+    if let some range := check.integerRange then
+      lines := lines ++ [
+        s!"def integerRange{i} : Pgx.Constraint.IntegerRange {range.nativeType} :=",
+        s!"  {generatedRangeExpr range}",
+        ""
+      ]
+    lines := lines ++ [
+      s!"def evaluateCheck{i} (value : {dataType}) :",
+      "    Except Pgx.Constraint.EvaluationError Pgx.Constraint.SqlTruth :=",
+      s!"  {specializedEvaluateExpr i check}",
+      ""
+    ]
+    predicates := predicates.push (specializedPredicateExpr i check)
+  let checkExprs := checks.mapIdx fun i check =>
+    recordExpr s!"name := {stringLiteral check.name}, evaluate := evaluateCheck{i}"
+  let mut equivalenceSimp := #[
+    "SpecializedPred", "ValidPred", "checks", "Pgx.Constraint.Valid"
+  ]
+  if checks.any (fun check =>
+      check.integerRange.map (fun range => !range.nullable) |>.getD false) then
+    equivalenceSimp := equivalenceSimp.push
+      "Pgx.Constraint.IntegerRange.resultPasses_evaluateValue_iff"
+  if checks.any (fun check =>
+      check.integerRange.map (fun range => range.nullable) |>.getD false) then
+    equivalenceSimp := equivalenceSimp.push
+      "Pgx.Constraint.IntegerRange.resultPasses_evaluateNullable_iff"
+  for i in [0:checks.size] do
+    equivalenceSimp := equivalenceSimp.push s!"evaluateCheck{i}"
+  lines := lines ++ [
+    "/-- Canonical generated validator program retained as the public proof meaning. -/",
     s!"def checks : List (Pgx.Constraint.Check {dataType}) :=",
     "  [" ++ commaSep checkExprs ++ "]",
     "",
@@ -1566,24 +1909,57 @@ private def emitValidator (dataType publicType : String)
     s!"instance (value : {dataType}) : Decidable (ValidPred value) :=",
     "  Pgx.Constraint.validDecidable checks value",
     "",
+    "/-- Direct predicate used by the generated fast validator. -/",
+    s!"@[expose] def SpecializedPred (value : {dataType}) : Prop :=",
+    s!"  {conjunctionExpr predicates.toList}",
+    "",
+    s!"def specializedDecidable (value : {dataType}) : Decidable (SpecializedPred value) :=",
+    "  by",
+    "    unfold SpecializedPred",
+    "    infer_instance",
+    "",
+    "/-- The specialized program has exactly the canonical SQL CHECK meaning. -/",
+    s!"theorem specializedPred_iff_validPred (value : {dataType}) :",
+    "    SpecializedPred value ↔ ValidPred value := by",
+    "  simp [" ++ String.intercalate ", " equivalenceSimp.toList ++ "]",
+    "",
+    s!"def firstViolation (value : {dataType}) : Pgx.ConstraintViolation :=",
+    s!"  {generatedDiagnosticExpr checks predicates}",
+    "",
     s!"/-- A `{dataType}` paired with proof of its generated local constraints. -/",
     "abbrev " ++ publicType ++ " := { value : " ++ dataType ++ " // ValidPred value }",
     "",
     s!"/-- Validate a `{dataType}` and construct its proof-bearing `{publicType}`. -/",
     s!"@[expose] def validate (value : {dataType}) : Except Pgx.ConstraintViolation {publicType} :=",
-    "  Pgx.Constraint.validate checks value",
+    "  Pgx.Constraint.validatePredIff ValidPred SpecializedPred specializedDecidable",
+    "    specializedPred_iff_validPred firstViolation value",
     "",
     "/-- Successful validation preserves the input and establishes `ValidPred`. -/",
     "theorem validate_sound {value : " ++ dataType ++ "} {refined : " ++ publicType ++ "} :",
     "    validate value = .ok refined → refined.val = value ∧ ValidPred value := by",
-    "  exact Pgx.Constraint.validate_sound checks",
+    "  intro accepted",
+    "  exact Pgx.Constraint.validatePredIff_sound ValidPred SpecializedPred",
+    "    specializedDecidable specializedPred_iff_validPred firstViolation accepted",
     "",
     "/-- Every value satisfying `ValidPred` is accepted by `validate`. -/",
     "theorem validate_complete {value : " ++ dataType ++ "} :",
     s!"    ValidPred value → ∃ refined : {publicType}, validate value = .ok refined := by",
-    "  exact Pgx.Constraint.validate_complete checks",
+    "  intro valid",
+    "  exact Pgx.Constraint.validatePredIff_complete ValidPred SpecializedPred",
+    "    specializedDecidable specializedPred_iff_validPred firstViolation valid",
     ""
   ]
+  let mut emittedAccessors : Array String := #[]
+  for i in [0:checks.size] do
+    if let some range := checks[i]!.integerRange then
+      if let some conversion := generatedConversion? range then
+        let accessorName := range.accessorStem ++ match conversion with
+          | .uint32 => "UInt32"
+          | .positiveUInt64 | .nonnegativeUInt64 => "UInt64"
+        unless emittedAccessors.contains accessorName do
+          emittedAccessors := emittedAccessors.push accessorName
+          lines := lines ++ emitConversionAccessor publicType checks.size i range conversion
+  return lines
 
 private def rawEncodeBody (use : TypeUse) : List String :=
   match use.codec with
@@ -1986,7 +2362,9 @@ private def emitDomain (plan : NamingPlan) (db : Pgx.DatabaseIR)
   let scope : ExprScope := {
     domainValue := some {
       sourceName := "VALUE"
+      leanName := "toBase"
       access := "value.toBase"
+      refinedAccess := "value.val.toBase"
       declared := { key := value.key }
       storage := value.base
       nullable := false
@@ -1994,11 +2372,8 @@ private def emitDomain (plan : NamingPlan) (db : Pgx.DatabaseIR)
   }
   let mut checks : Array GeneratedCheck := #[]
   for constraint in value.localConstraints do
-    checks := checks.push {
-      name := constraint.name
-      evaluate := ← compileTruthExpr plan db scope
-        s!"{context} constraint {constraint.name}" constraint.expression
-    }
+    checks := checks.push (← compileGeneratedCheck plan db scope
+      s!"{context} constraint {constraint.name}" constraint.name constraint.expression)
   if let some check := typmodCheck? db value.base "value.toBase" false
       s!"{value.key.display} type modifier" then
     checks := checks.push check
@@ -2121,7 +2496,9 @@ private def emitRelation (plan : NamingPlan) (db : Pgx.DatabaseIR)
     let column := relation.columns[i]!
     bindings := bindings.push {
       sourceName := column.name
+      leanName := names[i]!
       access := s!"value.{names[i]!}"
+      refinedAccess := s!"value.val.{names[i]!}"
       declared := column.ty
       storage := column.ty
       nullable := column.nullable
@@ -2133,11 +2510,8 @@ private def emitRelation (plan : NamingPlan) (db : Pgx.DatabaseIR)
       let some expression := constraint.localExpression
         | throw (.malformedIR s!"constraint {constraint.name}"
             "validated check has no typed local expression")
-      checks := checks.push {
-        name := constraint.name
-        evaluate := ← compileTruthExpr plan db scope
-          s!"relation {relation.key} constraint {constraint.name}" expression
-      }
+      checks := checks.push (← compileGeneratedCheck plan db scope
+        s!"relation {relation.key} constraint {constraint.name}" constraint.name expression)
   for i in [0:relation.columns.size] do
     let column := relation.columns[i]!
     if let some check := typmodCheck? db column.ty s!"value.{names[i]!}"
@@ -2645,7 +3019,9 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
     let logical := column.logicalType.getD column.ty
     bindings := bindings.push {
       sourceName := column.name
+      leanName := columnNames[i]!
       access := s!"value.{columnNames[i]!}"
+      refinedAccess := s!"value.val.{columnNames[i]!}"
       declared := logical
       storage := logical
       nullable := column.nullable
@@ -2653,11 +3029,8 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
   let scope : ExprScope := { columns := bindings }
   let mut checks : Array GeneratedCheck := #[]
   for constraint in query.localConstraints do
-    checks := checks.push {
-      name := constraint.name
-      evaluate := ← compileTruthExpr plan db scope
-        s!"query {query.name} constraint {constraint.name}" constraint.expression
-    }
+    checks := checks.push (← compileGeneratedCheck plan db scope
+      s!"query {query.name} constraint {constraint.name}" constraint.name constraint.expression)
   for i in [0:query.columns.size] do
     let column := query.columns[i]!
     if column.logicalType.isNone then
