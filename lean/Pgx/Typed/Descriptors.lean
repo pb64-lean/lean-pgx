@@ -278,6 +278,13 @@ structure EncodedParams where
   formats : Array UInt16
   deriving Repr, BEq, Inhabited
 
+/-- Full prepared-query cache identity. Generated query modules evaluate this
+at generation time and embed the resulting hexadecimal digest as a string
+literal, keeping SHA-256 and its input construction off the execution path. -/
+def queryCacheKey (databaseContractHash queryContractHash sql : String) : String :=
+  Pg.Crypto.toHexLower <| Pg.Crypto.sha256
+    (databaseContractHash ++ "\n" ++ queryContractHash ++ "\n" ++ sql).toUTF8
+
 structure CommandResult where
   tag : String
   deriving Repr, BEq, Inhabited
@@ -425,6 +432,10 @@ structure QuerySpec (db : DatabaseDesc) (Params Row : Type)
   name : String
   sql : String
   contractHash : String
+  /-- Generation-time `queryCacheKey`. The empty default preserves manually
+  authored source compatibility; generated specs always embed a nonempty key,
+  while legacy/manual specs derive it on demand. -/
+  cacheKey : String := ""
   params : Array ParamSpec
   columns : Array ColumnSpec
   encode : ResolvedCatalog db → Params → Except Error EncodedParams

@@ -1,8 +1,6 @@
 module
 
 public import Pgx.Typed.Catalog
-import Pg.Crypto.Sha256
-import Pg.Crypto.Hex
 
 public section
 
@@ -19,8 +17,10 @@ open Std.Async
 
 private def queryKey (db : DatabaseDesc)
     (spec : QuerySpec db Params Row cardinality) : String :=
-  Pg.Crypto.toHexLower <| Pg.Crypto.sha256
-    (db.contractHash ++ "\n" ++ spec.contractHash ++ "\n" ++ spec.sql).toUTF8
+  if spec.cacheKey.isEmpty then
+    queryCacheKey db.contractHash spec.contractHash spec.sql
+  else
+    spec.cacheKey
 
 private def statementName (key : String) : String :=
   "pgx_" ++ String.ofList (key.toList.take 48)

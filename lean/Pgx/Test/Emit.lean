@@ -756,6 +756,13 @@ def main : IO UInt32 := do
     source.contents.contains "sql := \"SELECT id, email, status\\nFROM app.users WHERE id = $1 /* \\\"checked\\\" */\"")
   let some getUser := sources.findModule? "AppDb.Queries.GetUser"
     | throw (IO.userError "missing generated GetUser module")
+  let getUserSql :=
+    "SELECT id, email, status\nFROM app.users WHERE id = $1 /* \"checked\" */"
+  let getUserCacheKey :=
+    Pgx.Typed.queryCacheKey fixture.contractHash "get-user-v1" getUserSql
+  assert! getUserCacheKey.length == 64
+  assert! getUser.contents.contains s!"cacheKey := \"{getUserCacheKey}\""
+  assert! !(getUser.contents.contains "Pgx.Typed.queryCacheKey")
   assert! getUser.contents.contains "structure RowData where"
   assert! getUser.contents.contains "email : AppDb.Types.AppEmailAddress"
   assert! getUser.contents.contains "abbrev Row := { value : RowData // ValidPred value }"

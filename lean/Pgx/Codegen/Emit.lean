@@ -2588,6 +2588,7 @@ private def cardinalityRunner : Pgx.Cardinality → String
 private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
     (named : NamedQuery) : Except CodegenError String := do
   let query := named.query
+  let cacheKey := Pgx.Typed.queryCacheKey db.contractHash query.sqlHash query.sql
   let paramNames := allocatedNames (query.params.map (·.name)) "param"
   let columnNames := allocatedNames (query.columns.map (·.name)) "column"
   let namespaceName := plan.modulePrefix ++ ".Queries." ++ named.moduleName
@@ -2702,6 +2703,7 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
     s!"  name := {stringLiteral query.name}",
     s!"  sql := {stringLiteral query.sql}",
     s!"  contractHash := {stringLiteral query.sqlHash}",
+    s!"  cacheKey := {stringLiteral cacheKey}",
     s!"  params := {arrayExpr (query.params.map paramSpecExpr)}",
     s!"  columns := {arrayExpr (query.columns.map columnSpecExpr)}",
     "  encode := encodeParams",
