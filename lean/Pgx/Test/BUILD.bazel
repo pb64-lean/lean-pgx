@@ -11,6 +11,13 @@ lean_binary(
     strip_module_prefix = "lean",
 )
 
+lean_binary(
+    name = "row_span_borrow_benchmark",
+    srcs = ["RowSpanBorrowBenchmark.lean"],
+    deps = ["//lean/Pgx/Typed:query"],
+    strip_module_prefix = "lean",
+)
+
 lean_test(
     name = "ir_test",
     srcs = ["IR.lean"],
