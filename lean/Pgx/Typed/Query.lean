@@ -122,17 +122,6 @@ private def decodeRow (spec : QuerySpec db Params Row cardinality)
     | some decode => decode plan.resolve plan.results columns materialized
     | none => spec.decode catalog columns materialized
 
-namespace Internal
-
-/-- Map the buffered span rows through the checked decoder.  Kept as a named,
-non-inlined boundary so ownership at the row callback remains inspectable. -/
-@[noinline] def decodeSpanRows
-    (decode : Pg.Protocol.DataRowSpans → Except Error Row)
-    (rows : Array Pg.Protocol.DataRowSpans) : Except Error (Array Row) :=
-  rows.mapM decode
-
-end Internal
-
 /-- Execute a checked command that has no result columns. -/
 def execute (spec : QuerySpec db Params Row .execute)
     (conn : CheckedConnection db) (params : Params) :
@@ -175,7 +164,6 @@ def fetchMany (spec : QuerySpec db Params Row .many)
   match ← runChecked db spec conn params with
   | .error error => pure (.error error)
   | .ok (plan, rows) =>
-    pure (Internal.decodeSpanRows
-      (decodeRow spec plan conn.catalog rows.columns) rows.rows)
+    pure (rows.rows.mapM (decodeRow spec plan conn.catalog rows.columns))
 
 end Pgx.Typed

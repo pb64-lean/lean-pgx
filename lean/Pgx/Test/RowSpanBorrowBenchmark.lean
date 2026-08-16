@@ -11,6 +11,13 @@ open Pgx.Typed
 
 private abbrev SpanRow := Pg.Protocol.DataRowSpans
 
+/-- Test-only copy of the `fetchMany` mapping shape.  Keeping it out of
+production ensures this rejected experiment cannot add an extra call boundary. -/
+@[noinline] private def decodeSpanRows
+    (decode : SpanRow → Except Error Row)
+    (rows : Array SpanRow) : Except Error (Array Row) :=
+  rows.mapM decode
+
 @[noinline] private def rowSize (row : @& SpanRow) : Except Error Nat :=
   pure row.size
 
@@ -35,12 +42,12 @@ private def expectOk {α : Type} (context : String) : Except Error α → IO α
 private def semanticControls : IO Unit := do
   let cells := #[some "alpha".toUTF8, none, some "omega".toUTF8]
   let materialized ← expectOk "materialize control" <|
-    Internal.decodeSpanRows materializeRow #[Pg.Protocol.DataRowSpans.ofCells cells]
+    decodeSpanRows materializeRow #[Pg.Protocol.DataRowSpans.ofCells cells]
   unless materialized == #[cells] do
     throw (IO.userError "materialized row did not survive the callback boundary")
 
   let escaped ← expectOk "span escape control" <|
-    Internal.decodeSpanRows escapeRow #[Pg.Protocol.DataRowSpans.ofCells cells]
+    decodeSpanRows escapeRow #[Pg.Protocol.DataRowSpans.ofCells cells]
   let escapedCells := escaped.map (·.materialize)
   unless escapedCells == #[cells] do
     throw (IO.userError "escaped span row did not retain its payload")
@@ -50,7 +57,7 @@ private def semanticControls : IO Unit := do
     Pg.Protocol.DataRowSpans.ofCells #[some "reject".toUTF8],
     Pg.Protocol.DataRowSpans.ofCells #[some "unreached".toUTF8]
   ]
-  match Internal.decodeSpanRows rejectSentinel rows with
+  match decodeSpanRows rejectSentinel rows with
   | .ok _ => throw (IO.userError "error control unexpectedly decoded every row")
   | .error error =>
     unless error.kind == .decode &&
@@ -62,7 +69,7 @@ private def runBatches (row : @& SpanRow) (pageSize iterations : Nat) : IO Nat :
   for _ in [0:iterations] do
     let rows := Array.replicate pageSize row
     let decoded ← expectOk "benchmark decode" <|
-      Internal.decodeSpanRows rowSize rows
+      decodeSpanRows rowSize rows
     checksum := checksum + decoded.foldl (· + ·) 0
   pure checksum
 
