@@ -2,8 +2,9 @@ import Pgx.Typed.Query
 
 /-!
 Focused checkpoint for ownership at `fetchMany`'s retained-span decoder
-callback.  The timing case uses the same named mapping boundary as production;
-the semantic controls cover materialization, errors, and values that escape a
+callback.  It models both dynamic calls in the production path: `Array.mapM`
+to `decodeRow`, then `decodeRow` to the callback stored in `QuerySpec`.  The
+semantic controls cover materialization, errors, and values that escape a
 borrowed decoder.
 -/
 
@@ -11,12 +12,28 @@ open Pgx.Typed
 
 private abbrev SpanRow := Pg.Protocol.DataRowSpans
 
-/-- Test-only copy of the `fetchMany` mapping shape.  Keeping it out of
-production ensures this rejected experiment cannot add an extra call boundary. -/
-@[noinline] private def decodeSpanRows
+/-- Existing ownership shape: the outer dispatcher consumes the row and can
+transfer it to the dynamically stored decoder without another retain. -/
+@[noinline] private def dispatchOwned
+    (decode : SpanRow → Except Error Row) (row : SpanRow) : Except Error Row :=
+  decode row
+
+@[noinline] private def decodeSpanRowsOwned
     (decode : SpanRow → Except Error Row)
     (rows : Array SpanRow) : Except Error (Array Row) :=
-  rows.mapM decode
+  rows.mapM (dispatchOwned decode)
+
+/-- Rejected source-level candidate.  Dynamic closure application still uses
+the consuming boxed ABI, so each `@&` layer must retain before forwarding. -/
+@[noinline] private def dispatchBorrowed
+    (decode : @& SpanRow → Except Error Row)
+    (row : @& SpanRow) : Except Error Row :=
+  decode row
+
+@[noinline] private def decodeSpanRowsBorrowed
+    (decode : @& SpanRow → Except Error Row)
+    (rows : Array SpanRow) : Except Error (Array Row) :=
+  rows.mapM (dispatchBorrowed decode)
 
 @[noinline] private def rowSize (row : @& SpanRow) : Except Error Nat :=
   pure row.size
@@ -41,43 +58,63 @@ private def expectOk {α : Type} (context : String) : Except Error α → IO α
 
 private def semanticControls : IO Unit := do
   let cells := #[some "alpha".toUTF8, none, some "omega".toUTF8]
-  let materialized ← expectOk "materialize control" <|
-    decodeSpanRows materializeRow #[Pg.Protocol.DataRowSpans.ofCells cells]
-  unless materialized == #[cells] do
-    throw (IO.userError "materialized row did not survive the callback boundary")
+  let checkSuccess (label : String)
+      (materializedResult : Except Error (Array (Array (Option ByteArray))))
+      (escapedResult : Except Error (Array SpanRow)) : IO Unit := do
+    let materialized ← expectOk s!"{label} materialize control" materializedResult
+    unless materialized == #[cells] do
+      throw (IO.userError s!"{label} materialized row did not survive")
+    let escaped ← expectOk s!"{label} span escape control" escapedResult
+    unless escaped.map (·.materialize) == #[cells] do
+      throw (IO.userError s!"{label} escaped span row did not retain its payload")
+  checkSuccess "owned"
+    (decodeSpanRowsOwned materializeRow #[Pg.Protocol.DataRowSpans.ofCells cells])
+    (decodeSpanRowsOwned escapeRow #[Pg.Protocol.DataRowSpans.ofCells cells])
+  checkSuccess "borrowed"
+    (decodeSpanRowsBorrowed materializeRow #[Pg.Protocol.DataRowSpans.ofCells cells])
+    (decodeSpanRowsBorrowed escapeRow #[Pg.Protocol.DataRowSpans.ofCells cells])
 
-  let escaped ← expectOk "span escape control" <|
-    decodeSpanRows escapeRow #[Pg.Protocol.DataRowSpans.ofCells cells]
-  let escapedCells := escaped.map (·.materialize)
-  unless escapedCells == #[cells] do
-    throw (IO.userError "escaped span row did not retain its payload")
+  let sentinelRows : Unit → Array SpanRow := fun _ => #[
+      Pg.Protocol.DataRowSpans.ofCells #[some "accept".toUTF8],
+      Pg.Protocol.DataRowSpans.ofCells #[some "reject".toUTF8],
+      Pg.Protocol.DataRowSpans.ofCells #[some "unreached".toUTF8]
+    ]
+  let checkError (label : String) : Except Error (Array Nat) → IO Unit
+    | .ok _ => throw (IO.userError s!"{label} unexpectedly decoded every row")
+    | .error error =>
+      unless error.kind == .decode &&
+          error.toMessage == "row decoding failed: row-span sentinel rejected" do
+        throw (IO.userError s!"{label} changed failure: {error.toMessage}")
+  checkError "owned error control" <|
+    decodeSpanRowsOwned rejectSentinel (sentinelRows ())
+  checkError "borrowed error control" <|
+    decodeSpanRowsBorrowed rejectSentinel (sentinelRows ())
 
-  let rows := #[
-    Pg.Protocol.DataRowSpans.ofCells #[some "accept".toUTF8],
-    Pg.Protocol.DataRowSpans.ofCells #[some "reject".toUTF8],
-    Pg.Protocol.DataRowSpans.ofCells #[some "unreached".toUTF8]
-  ]
-  match decodeSpanRows rejectSentinel rows with
-  | .ok _ => throw (IO.userError "error control unexpectedly decoded every row")
-  | .error error =>
-    unless error.kind == .decode &&
-        error.toMessage == "row decoding failed: row-span sentinel rejected" do
-      throw (IO.userError s!"error control changed failure: {error.toMessage}")
-
-private def runBatches (row : @& SpanRow) (pageSize iterations : Nat) : IO Nat := do
+private def runOwnedBatches
+    (row : @& SpanRow) (pageSize iterations : Nat) : IO Nat := do
   let mut checksum := 0
   for _ in [0:iterations] do
     let rows := Array.replicate pageSize row
     let decoded ← expectOk "benchmark decode" <|
-      decodeSpanRows rowSize rows
+      decodeSpanRowsOwned rowSize rows
     checksum := checksum + decoded.foldl (· + ·) 0
   pure checksum
 
-private def measureRun (row : @& SpanRow)
-    (pageSize iterations : Nat) : IO (Nat × Nat) := do
-  discard <| runBatches row pageSize (Nat.min iterations 1000)
+private def runBorrowedBatches
+    (row : @& SpanRow) (pageSize iterations : Nat) : IO Nat := do
+  let mut checksum := 0
+  for _ in [0:iterations] do
+    let rows := Array.replicate pageSize row
+    let decoded ← expectOk "benchmark decode" <|
+      decodeSpanRowsBorrowed rowSize rows
+    checksum := checksum + decoded.foldl (· + ·) 0
+  pure checksum
+
+private def measureRun (run : @& SpanRow → Nat → Nat → IO Nat)
+    (row : @& SpanRow) (pageSize iterations : Nat) : IO (Nat × Nat) := do
+  discard <| run row pageSize (Nat.min iterations 1000)
   let started ← IO.monoNanosNow
-  let checksum ← runBatches row pageSize iterations
+  let checksum ← run row pageSize iterations
   pure ((← IO.monoNanosNow) - started, checksum)
 
 private def insertSorted (value : Nat) : List Nat → List Nat
@@ -102,19 +139,38 @@ private def parseNat (value? : Option String) (fallback : Nat) : Nat :=
 
 private def benchmark (row : @& SpanRow) (iterations rounds : Nat) : IO Unit := do
   for pageSize in #[1, 55] do
-    let mut samples := #[]
+    let mut ownedSamples := #[]
+    let mut borrowedSamples := #[]
     let mut expectedChecksum : Option Nat := none
-    for _ in [0:rounds] do
-      let sample ← measureRun row pageSize iterations
+    for round in [0:rounds] do
+      let measurePair := if round % 2 == 0 then do
+          let owned ← measureRun runOwnedBatches row pageSize iterations
+          let borrowed ← measureRun runBorrowedBatches row pageSize iterations
+          pure (owned, borrowed)
+        else do
+          let borrowed ← measureRun runBorrowedBatches row pageSize iterations
+          let owned ← measureRun runOwnedBatches row pageSize iterations
+          pure (owned, borrowed)
+      let pair ← measurePair
+      unless pair.1.2 == pair.2.2 do
+        throw (IO.userError "owned and borrowed checksums differ")
       match expectedChecksum with
-      | none => expectedChecksum := some sample.2
-      | some expected => unless sample.2 == expected do
+      | none => expectedChecksum := some pair.1.2
+      | some expected => unless pair.1.2 == expected do
           throw (IO.userError "benchmark checksum changed between rounds")
-      samples := samples.push sample.1
+      ownedSamples := ownedSamples.push pair.1.1
+      borrowedSamples := borrowedSamples.push pair.2.1
     let totalRows := pageSize * iterations
-    let nanosPerRow := if totalRows == 0 then 0 else median samples * 100 / totalRows
-    IO.println s!"page_{pageSize}_samples_ns={formatSamples samples}"
-    IO.println s!"page_{pageSize}_median_ns_per_row={formatHundredths nanosPerRow}"
+    let ownedMedian := median ownedSamples
+    let borrowedMedian := median borrowedSamples
+    let ownedPerRow := if totalRows == 0 then 0 else ownedMedian * 100 / totalRows
+    let borrowedPerRow := if totalRows == 0 then 0 else borrowedMedian * 100 / totalRows
+    let speedup := if borrowedMedian == 0 then 0 else ownedMedian * 100 / borrowedMedian
+    IO.println s!"page_{pageSize}_owned_samples_ns={formatSamples ownedSamples}"
+    IO.println s!"page_{pageSize}_borrowed_samples_ns={formatSamples borrowedSamples}"
+    IO.println s!"page_{pageSize}_owned_median_ns_per_row={formatHundredths ownedPerRow}"
+    IO.println s!"page_{pageSize}_borrowed_median_ns_per_row={formatHundredths borrowedPerRow}"
+    IO.println s!"page_{pageSize}_borrowed_speedup_x={formatHundredths speedup}"
     IO.println s!"page_{pageSize}_checksum={expectedChecksum.getD 0}"
 
 def main (args : List String) : IO Unit := do
