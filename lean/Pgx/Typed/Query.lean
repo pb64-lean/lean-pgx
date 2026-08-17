@@ -73,6 +73,28 @@ private def prepareChecked (db : DatabaseDesc)
         Internal.completePrepare conn key result true
         pure result
 
+private def validateEncodedParams (expected : Nat) (encoded : @& EncodedParams) :
+    Except Error Unit := do
+  unless encoded.values.size == expected do
+    throw (.encode
+      s!"generated encoder returned {encoded.values.size} values for {expected} parameters")
+  unless encoded.formats.size == expected do
+    throw (.encode
+      s!"generated encoder returned {encoded.formats.size} formats for {expected} parameters")
+  match encoded.formats.find? (fun format => !(format == 0 || format == 1)) with
+  | some format =>
+    throw (.encode s!"unsupported PostgreSQL parameter format {format}")
+  | none => pure ()
+
+namespace ParameterValidationBenchmark
+
+/-- Exact production validation seam for the focused differential benchmark. -/
+@[noinline] def validateCandidate (expected : Nat) (encoded : @& EncodedParams) :
+    Except Error Unit :=
+  validateEncodedParams expected encoded
+
+end ParameterValidationBenchmark
+
 private def runChecked (db : DatabaseDesc)
     (spec : QuerySpec db Params Row cardinality) (conn : CheckedConnection db)
     (params : Params) : Async (Except Error (PreparedQueryPlan db × Pg.SpanRows)) := do
@@ -85,15 +107,9 @@ private def runChecked (db : DatabaseDesc)
   let encoded ← match encodedResult with
     | .error error => return .error error
     | .ok encoded => pure encoded
-  unless encoded.values.size == spec.params.size do
-    return .error (.encode
-      s!"generated encoder returned {encoded.values.size} values for {spec.params.size} parameters")
-  unless encoded.formats.size == spec.params.size do
-    return .error (.encode
-      s!"generated encoder returned {encoded.formats.size} formats for {spec.params.size} parameters")
-  for format in encoded.formats do
-    unless format == 0 || format == 1 do
-      return .error (.encode s!"unsupported PostgreSQL parameter format {format}")
+  match validateEncodedParams spec.params.size encoded with
+  | .error error => return .error error
+  | .ok () => pure ()
   let rows ← match ← Pg.Connection.executeSpans conn.raw plan.statement.name
       encoded.values encoded.formats plan.resultFormats with
     | .error error =>

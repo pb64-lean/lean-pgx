@@ -25,6 +25,23 @@ lean_binary(
     strip_module_prefix = "lean",
 )
 
+lean_binary(
+    name = "parameter_validation_benchmark",
+    srcs = ["ParameterValidationBenchmark.lean"],
+    testonly = True,
+    deps = ["//lean/Pgx/Typed:query"],
+    strip_module_prefix = "lean",
+    tags = ["manual"],
+)
+
+lean_test(
+    name = "parameter_validation_test",
+    srcs = ["ParameterValidationBenchmark.lean"],
+    args = ["candidate", "0", "0", "0"],
+    deps = ["//lean/Pgx/Typed:query"],
+    strip_module_prefix = "lean",
+)
+
 lean_test(
     name = "ir_test",
     srcs = ["IR.lean"],
