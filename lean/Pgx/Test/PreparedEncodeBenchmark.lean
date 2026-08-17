@@ -20,6 +20,7 @@ private structure Params where
   sku : String
   quantity : Int64
   description : String
+  nullableCount : Option Int32
   deriving Inhabited
 
 private inductive Shape where
@@ -150,6 +151,21 @@ private def directDeleteWidget (params : Params) : Except Error EncodedParams :=
     ]
   }
 
+@[noinline, export pgx_benchmark_prepared_legacy_nullable]
+private def legacyNullable (params : Params) : Except Error EncodedParams := do
+  let encoded ← encodePlannedBuiltin
+    (Option.map Pg.binaryInt32 params.nullableCount)
+  pure { values := #[encoded.value], formats := #[encoded.format] }
+
+@[noinline, export pgx_benchmark_prepared_direct_nullable]
+private def directNullable (params : Params) : Except Error EncodedParams :=
+  pure {
+    values := #[Pg.PgEncode.encode
+      (Option.map Pg.binaryInt32 params.nullableCount)]
+    formats := #[plannedBuiltinFormat
+      (Option.map Pg.binaryInt32 params.nullableCount)]
+  }
+
 private def encodeLegacy : Shape → Params → Except Error EncodedParams
   | .getWidget => legacyGetWidget
   | .listWidgets => legacyListWidgets
@@ -184,6 +200,7 @@ private def fixtures : Array Params := #[
     sku := "SKU-12345"
     quantity := 42
     description := "representative widget description"
+    nullableCount := some 37
   },
   {
     widgetId := -9223372036854775807
@@ -193,6 +210,7 @@ private def fixtures : Array Params := #[
     sku := "nul\u0000sku"
     quantity := -1
     description := "café 한국어 🚀"
+    nullableCount := none
   }
 ]
 
@@ -207,6 +225,12 @@ private def semanticControls : IO Unit := do
             throw (IO.userError s!"{shapeName shape} prepared encoders differ")
       | .error error, _ | _, .error error =>
           throw (IO.userError s!"{shapeName shape} encoder failed: {error.toMessage}")
+    match legacyNullable params, directNullable params with
+    | .ok legacy, .ok direct =>
+        unless legacy == direct do
+          throw (IO.userError "nullable prepared encoders differ")
+    | .error error, _ | _, .error error =>
+        throw (IO.userError s!"nullable encoder failed: {error.toMessage}")
 
 private def checksum (encoded : @& EncodedParams) : Nat :=
   let valueBytes := encoded.values.foldl (fun total value =>
