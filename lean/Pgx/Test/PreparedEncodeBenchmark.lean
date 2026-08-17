@@ -20,8 +20,10 @@ private structure Params where
   sku : String
   quantity : Int64
   description : String
-  nullableCount : Option Int32
   deriving Inhabited
+
+private structure NullableParams where
+  count : Option Int32
 
 private inductive Shape where
   | getWidget
@@ -152,18 +154,18 @@ private def directDeleteWidget (params : Params) : Except Error EncodedParams :=
   }
 
 @[noinline, export pgx_benchmark_prepared_legacy_nullable]
-private def legacyNullable (params : Params) : Except Error EncodedParams := do
+private def legacyNullable (params : NullableParams) : Except Error EncodedParams := do
   let encoded ← encodePlannedBuiltin
-    (Option.map Pg.binaryInt32 params.nullableCount)
+    (Option.map Pg.binaryInt32 params.count)
   pure { values := #[encoded.value], formats := #[encoded.format] }
 
 @[noinline, export pgx_benchmark_prepared_direct_nullable]
-private def directNullable (params : Params) : Except Error EncodedParams :=
+private def directNullable (params : NullableParams) : Except Error EncodedParams :=
   pure {
     values := #[Pg.PgEncode.encode
-      (Option.map Pg.binaryInt32 params.nullableCount)]
+      (Option.map Pg.binaryInt32 params.count)]
     formats := #[plannedBuiltinFormat
-      (Option.map Pg.binaryInt32 params.nullableCount)]
+      (Option.map Pg.binaryInt32 params.count)]
   }
 
 private def encodeLegacy : Shape → Params → Except Error EncodedParams
@@ -200,7 +202,6 @@ private def fixtures : Array Params := #[
     sku := "SKU-12345"
     quantity := 42
     description := "representative widget description"
-    nullableCount := some 37
   },
   {
     widgetId := -9223372036854775807
@@ -210,8 +211,12 @@ private def fixtures : Array Params := #[
     sku := "nul\u0000sku"
     quantity := -1
     description := "café 한국어 🚀"
-    nullableCount := none
   }
+]
+
+private def nullableFixtures : Array NullableParams := #[
+  { count := some 37 },
+  { count := none }
 ]
 
 private def semanticControls : IO Unit := do
@@ -225,6 +230,7 @@ private def semanticControls : IO Unit := do
             throw (IO.userError s!"{shapeName shape} prepared encoders differ")
       | .error error, _ | _, .error error =>
           throw (IO.userError s!"{shapeName shape} encoder failed: {error.toMessage}")
+  for params in nullableFixtures do
     match legacyNullable params, directNullable params with
     | .ok legacy, .ok direct =>
         unless legacy == direct do
