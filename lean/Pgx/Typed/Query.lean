@@ -104,24 +104,26 @@ private def runChecked (db : DatabaseDesc)
   let encodedResult := match spec.preparedEncode with
     | some encode => encode plan.resolve plan.params params
     | none => spec.encode conn.catalog params
-  let encoded ← match encodedResult with
-    | .error error => return .error error
-    | .ok encoded => pure encoded
-  match validateEncodedParams spec.params.size encoded with
-  | .error error => return .error error
-  | .ok () => pure ()
-  let rows ← match ← Pg.Connection.executeSpans conn.raw plan.statement.name
-      encoded.values encoded.formats plan.resultFormats with
-    | .error error =>
-      let failure := executionFailure error
-      Internal.markPreparedDrift conn plan.cacheKey failure
-      return .error failure
-    | .ok rows => pure rows
-  match verifyPreparedResultColumns plan rows.columns with
-  | .error error =>
-    Internal.markPreparedDrift conn plan.cacheKey error
-    pure (.error error)
-  | .ok () => pure (.ok (plan, rows))
+  -- Keep these synchronous admission branches nested: lifting either success
+  -- into `Async` would allocate and bind an already-resolved task.
+  match encodedResult with
+  | .error error => pure (.error error)
+  | .ok encoded =>
+    match validateEncodedParams spec.params.size encoded with
+    | .error error => pure (.error error)
+    | .ok () => do
+      let rows ← match ← Pg.Connection.executeSpans conn.raw plan.statement.name
+          encoded.values encoded.formats plan.resultFormats with
+        | .error error =>
+          let failure := executionFailure error
+          Internal.markPreparedDrift conn plan.cacheKey failure
+          return .error failure
+        | .ok rows => pure rows
+      match verifyPreparedResultColumns plan rows.columns with
+      | .error error =>
+        Internal.markPreparedDrift conn plan.cacheKey error
+        pure (.error error)
+      | .ok () => pure (.ok (plan, rows))
 
 private def decodeRow (spec : QuerySpec db Params Row cardinality)
     (plan : PreparedQueryPlan db)

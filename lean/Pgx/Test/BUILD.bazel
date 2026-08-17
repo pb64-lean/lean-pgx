@@ -42,6 +42,23 @@ lean_test(
     strip_module_prefix = "lean",
 )
 
+lean_binary(
+    name = "parameter_admission_benchmark",
+    srcs = ["ParameterAdmissionBenchmark.lean"],
+    testonly = True,
+    deps = ["//lean/Pgx/Typed:query"],
+    strip_module_prefix = "lean",
+    tags = ["manual"],
+)
+
+lean_test(
+    name = "parameter_admission_test",
+    srcs = ["ParameterAdmissionBenchmark.lean"],
+    args = ["candidate", "0", "0", "0"],
+    deps = ["//lean/Pgx/Typed:query"],
+    strip_module_prefix = "lean",
+)
+
 lean_test(
     name = "ir_test",
     srcs = ["IR.lean"],
