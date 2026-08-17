@@ -59,6 +59,23 @@ lean_test(
     strip_module_prefix = "lean",
 )
 
+lean_binary(
+    name = "prepared_column_verification_benchmark",
+    srcs = ["PreparedColumnVerificationBenchmark.lean"],
+    testonly = True,
+    deps = ["//lean/Pgx/Typed:descriptors"],
+    strip_module_prefix = "lean",
+    tags = ["manual"],
+)
+
+lean_test(
+    name = "prepared_column_verification_test",
+    srcs = ["PreparedColumnVerificationBenchmark.lean"],
+    args = ["candidate", "0", "true", "0", "0"],
+    deps = ["//lean/Pgx/Typed:descriptors"],
+    strip_module_prefix = "lean",
+)
+
 lean_test(
     name = "ir_test",
     srcs = ["IR.lean"],

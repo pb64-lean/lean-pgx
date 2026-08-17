@@ -588,7 +588,7 @@ private def expandedResultFormats (columnCount : Nat)
   else
     pure formats
 
-private def verifyPreparedColumns (expected : Array PreparedColumnPlan)
+private def verifyPreparedColumnsReference (expected : Array PreparedColumnPlan)
     (actual : Array Pg.Protocol.ColumnDesc) (checkFormat : Bool) :
     Except Error Unit := do
   unless actual.size == expected.size do
@@ -616,6 +616,106 @@ private def verifyPreparedColumns (expected : Array PreparedColumnPlan)
       unless got.format == want.format do
         throw (.queryDrift
           s!"result column {want.name} changed wire format")
+
+private def verifyPreparedColumnsCandidateLoop
+    (expected : @& Array PreparedColumnPlan)
+    (actual : @& Array Pg.Protocol.ColumnDesc) (checkFormat : Bool)
+    (limit index : USize) (expectedLimitBound : limit.toNat ≤ expected.size)
+    (actualLimitBound : limit.toNat ≤ actual.size) (indexBound : index ≤ limit) :
+    Except Error Unit := do
+  if atEnd : index = limit then
+    pure ()
+  else
+    have indexLt : index < limit :=
+      USize.lt_iff_le_and_ne.mpr ⟨indexBound, atEnd⟩
+    have expectedBound : index.toNat < expected.size :=
+      Nat.lt_of_lt_of_le (USize.lt_iff_toNat_lt.mp indexLt) expectedLimitBound
+    have actualBound : index.toNat < actual.size :=
+      Nat.lt_of_lt_of_le (USize.lt_iff_toNat_lt.mp indexLt) actualLimitBound
+    let want := expected.uget index expectedBound
+    let got := actual.uget index actualBound
+    unless got.name == want.name do
+      throw (.queryDrift
+        s!"result column {index.toNat + 1} changed name from {want.name} to {got.name}")
+    unless got.typeOid == want.typeOid do
+      throw (.queryDrift
+        s!"result column {want.name} changed PostgreSQL type")
+    unless got.typeMod == want.typeMod do
+      throw (.queryDrift
+        s!"result column {want.name} changed type modifier")
+    match want.origin with
+    | some origin =>
+      unless got.tableOid == origin.tableOid && got.attnum == origin.attnum do
+        throw (.queryDrift
+          s!"result column {want.name} changed symbolic origin")
+    | none => pure ()
+    if checkFormat then
+      unless got.format == want.format do
+        throw (.queryDrift
+          s!"result column {want.name} changed wire format")
+    let next := index + 1
+    have nextToNat : next.toNat = index.toNat + 1 := by
+      rw [USize.toNat_add, USize.toNat_one, Nat.mod_eq_of_lt]
+      exact Nat.lt_of_le_of_lt
+        (Nat.succ_le_of_lt (USize.lt_iff_toNat_lt.mp indexLt))
+        limit.toNat_lt_size
+    have nextBound : next ≤ limit := by
+      rw [USize.le_iff_toNat_le, nextToNat]
+      exact USize.lt_iff_toNat_lt.mp indexLt
+    verifyPreparedColumnsCandidateLoop expected actual checkFormat limit next
+      expectedLimitBound actualLimitBound nextBound
+termination_by limit.toNat - index.toNat
+decreasing_by
+  have stepToNat : (index + 1).toNat = index.toNat + 1 := by
+    simpa only [next] using nextToNat
+  rw [stepToNat]
+  have := USize.lt_iff_toNat_lt.mp indexLt
+  omega
+
+private def verifyPreparedColumnsCandidate (expected : Array PreparedColumnPlan)
+    (actual : Array Pg.Protocol.ColumnDesc) (checkFormat : Bool) :
+    Except Error Unit :=
+  if sizeEq : actual.size = expected.size then
+    -- Lean's array executor guarantees representable runtime sizes are
+    -- strictly below `USize.size`, so `Array.usize` covers the complete array.
+    let limit := expected.usize
+    let expectedLimitBound : limit.toNat ≤ expected.size := by
+      simp only [limit, Array.usize, Nat.toUSize_eq, USize.toNat_ofNat']
+      exact Nat.mod_le _ _
+    let actualLimitBound : limit.toNat ≤ actual.size := by
+      simpa only [sizeEq] using expectedLimitBound
+    let indexBound : (0 : USize) ≤ limit := by
+      rw [USize.le_iff_toNat_le, USize.toNat_zero]
+      exact Nat.zero_le _
+    verifyPreparedColumnsCandidateLoop expected actual checkFormat limit 0
+      expectedLimitBound actualLimitBound indexBound
+  else
+    .error (.queryDrift
+      s!"result column count changed from {expected.size} to {actual.size}")
+
+namespace PreparedColumnVerificationBenchmark
+
+/-- Exact former logical verifier for semantic and counter differentials. -/
+@[noinline] def verifyReference (expected : Array PreparedColumnPlan)
+    (actual : Array Pg.Protocol.ColumnDesc) (checkFormat : Bool) :
+    Except Error Unit :=
+  verifyPreparedColumnsReference expected actual checkFormat
+
+/-- Exact compiled production verifier for semantic and counter differentials. -/
+@[noinline] def verifyCandidate (expected : Array PreparedColumnPlan)
+    (actual : Array Pg.Protocol.ColumnDesc) (checkFormat : Bool) :
+    Except Error Unit :=
+  verifyPreparedColumnsCandidate expected actual checkFormat
+
+end PreparedColumnVerificationBenchmark
+
+/-- The logical definition preserves the former Range-loop semantics exactly;
+compiled production uses the proof-bounded native-index implementation. -/
+@[implemented_by verifyPreparedColumnsCandidate]
+private def verifyPreparedColumns (expected : Array PreparedColumnPlan)
+    (actual : Array Pg.Protocol.ColumnDesc) (checkFormat : Bool) :
+    Except Error Unit :=
+  verifyPreparedColumnsReference expected actual checkFormat
 
 /-- Finish a connection-bound plan after Parse/Describe has succeeded.  All
 symbolic result types and origins are converted to physical descriptors here,
