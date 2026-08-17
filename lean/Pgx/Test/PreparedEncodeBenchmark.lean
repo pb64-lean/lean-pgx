@@ -40,7 +40,7 @@ private def legacyGetWidget (params : Params) : Except Error EncodedParams := do
 private def directGetWidget (params : Params) : Except Error EncodedParams :=
   pure {
     values := #[Pg.PgEncode.encode (Pg.binaryInt64 params.widgetId)]
-    formats := #[1]
+    formats := #[plannedBuiltinFormat (Pg.binaryInt64 params.widgetId)]
   }
 
 private def legacyListWidgets (params : Params) : Except Error EncodedParams := do
@@ -57,7 +57,10 @@ private def directListWidgets (params : Params) : Except Error EncodedParams :=
       Pg.PgEncode.encode (Pg.binaryInt64 params.ownerId),
       Pg.PgEncode.encode (Pg.binaryInt64 params.pageSize)
     ]
-    formats := #[1, 1]
+    formats := #[
+      plannedBuiltinFormat (Pg.binaryInt64 params.ownerId),
+      plannedBuiltinFormat (Pg.binaryInt64 params.pageSize)
+    ]
   }
 
 @[noinline, export pgx_benchmark_prepared_legacy_insert]
@@ -84,7 +87,13 @@ private def directInsertWidget (params : Params) : Except Error EncodedParams :=
       Pg.PgEncode.encode (Pg.binaryInt64 params.quantity),
       Pg.PgEncode.encode params.description
     ]
-    formats := #[1, 0, 0, 1, 0]
+    formats := #[
+      plannedBuiltinFormat (Pg.binaryInt64 params.ownerId),
+      plannedBuiltinFormat params.name,
+      plannedBuiltinFormat params.sku,
+      plannedBuiltinFormat (Pg.binaryInt64 params.quantity),
+      plannedBuiltinFormat params.description
+    ]
   }
 
 private def legacyUpdateWidget (params : Params) : Except Error EncodedParams := do
@@ -111,7 +120,14 @@ private def directUpdateWidget (params : Params) : Except Error EncodedParams :=
       Pg.PgEncode.encode (Pg.binaryInt64 params.quantity),
       Pg.PgEncode.encode params.description
     ]
-    formats := #[1, 1, 0, 0, 1, 0]
+    formats := #[
+      plannedBuiltinFormat (Pg.binaryInt64 params.widgetId),
+      plannedBuiltinFormat (Pg.binaryInt64 params.ownerId),
+      plannedBuiltinFormat params.name,
+      plannedBuiltinFormat params.sku,
+      plannedBuiltinFormat (Pg.binaryInt64 params.quantity),
+      plannedBuiltinFormat params.description
+    ]
   }
 
 private def legacyDeleteWidget (params : Params) : Except Error EncodedParams := do
@@ -128,7 +144,10 @@ private def directDeleteWidget (params : Params) : Except Error EncodedParams :=
       Pg.PgEncode.encode (Pg.binaryInt64 params.widgetId),
       Pg.PgEncode.encode (Pg.binaryInt64 params.ownerId)
     ]
-    formats := #[1, 1]
+    formats := #[
+      plannedBuiltinFormat (Pg.binaryInt64 params.widgetId),
+      plannedBuiltinFormat (Pg.binaryInt64 params.ownerId)
+    ]
   }
 
 private def encodeLegacy : Shape → Params → Except Error EncodedParams

@@ -2891,20 +2891,32 @@ private def encodeValueExpr (plan : NamingPlan) (db : Pgx.DatabaseIR)
             else s!"{constructor} {value}"
       pure s!"Pgx.Typed.encodeBuiltin catalog ({typeRefExpr ref}) ({encodedValue})"
 
-private def encodePlannedValueExpr (plan : NamingPlan) (db : Pgx.DatabaseIR)
+private structure PlannedParamEncoding where
+  valueExpr : String
+  /-- `none` means `valueExpr` can fail and yields an `EncodedValue` that must
+  be bound before its fields are used.  Built-ins instead provide their
+  compile-time format directly and `valueExpr` is the final wire value. -/
+  directFormatExpr : Option String := none
+
+private def plannedParamEncoding (plan : NamingPlan) (db : Pgx.DatabaseIR)
     (ref : Pgx.TypeRef) (nullable : Bool) (resolved value : String) :
-    Except CodegenError String := do
+    Except CodegenError PlannedParamEncoding := do
   let use ← resolveTypeUse plan db ref.key
   match codecExpr use nullable with
   | some codec =>
-      pure s!"Pgx.Typed.encodePlanned {codec} resolve {resolved} {value}"
+      pure {
+        valueExpr := s!"Pgx.Typed.encodePlanned {codec} resolve {resolved} {value}"
+      }
   | none =>
       let encodedValue := match use.binaryParamConstructor with
         | none => value
         | some constructor =>
             if nullable then s!"Option.map {constructor} {value}"
             else s!"{constructor} {value}"
-      pure s!"Pgx.Typed.encodePlannedBuiltin ({encodedValue})"
+      pure {
+        valueExpr := s!"Pg.PgEncode.encode ({encodedValue})"
+        directFormatExpr := some s!"Pgx.Typed.plannedBuiltinFormat ({encodedValue})"
+      }
 
 private def resultFormat (plan : NamingPlan) (db : Pgx.DatabaseIR)
     (ref : Pgx.TypeRef) : Except CodegenError UInt16 := do
@@ -3101,16 +3113,24 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
     "  let _ := types",
     "  let _ := params"
   ]
-  let mut preparedEncodedNames : Array String := #[]
+  let mut preparedValueExprs : Array String := #[]
+  let mut preparedFormatExprs : Array String := #[]
   for i in [0:query.params.size] do
+    let encoding ← plannedParamEncoding plan db query.params[i]!.ty
+      query.params[i]!.nullable s!"types[{i}]!" s!"params.{paramNames[i]!}"
     let encodedName := s!"encoded{i}"
-    preparedEncodedNames := preparedEncodedNames.push encodedName
-    lines := lines ++ [s!"  let {encodedName} ← {← encodePlannedValueExpr plan db
-      query.params[i]!.ty query.params[i]!.nullable s!"types[{i}]!" s!"params.{paramNames[i]!}"}"]
+    match encoding.directFormatExpr with
+    | none =>
+        lines := lines ++ [s!"  let {encodedName} ← {encoding.valueExpr}"]
+        preparedValueExprs := preparedValueExprs.push s!"{encodedName}.value"
+        preparedFormatExprs := preparedFormatExprs.push s!"{encodedName}.format"
+    | some formatExpr =>
+        preparedValueExprs := preparedValueExprs.push encoding.valueExpr
+        preparedFormatExprs := preparedFormatExprs.push formatExpr
   lines := lines ++ [
     "  pure {",
-    s!"    values := {arrayExpr (preparedEncodedNames.map (· ++ ".value"))}",
-    s!"    formats := {arrayExpr (preparedEncodedNames.map (· ++ ".format"))}",
+    s!"    values := {arrayExpr preparedValueExprs}",
+    s!"    formats := {arrayExpr preparedFormatExprs}",
     "  }",
     "",
     "private def decodeRow",

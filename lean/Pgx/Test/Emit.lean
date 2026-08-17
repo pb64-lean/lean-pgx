@@ -927,9 +927,18 @@ def main : IO UInt32 := do
   assert! mixedFormats.contents.contains
     "decodeResolved External.citextCodec"
   assert! mixedFormats.contents.contains
-    "encodePlannedBuiltin (Option.map Pg.binaryInt32 params.count)"
+    "Pg.PgEncode.encode (Option.map Pg.binaryInt32 params.count)"
   assert! mixedFormats.contents.contains
-    "encodePlannedBuiltin (Pg.binaryInt16 params.rank)"
+    "plannedBuiltinFormat (Option.map Pg.binaryInt32 params.count)"
+  assert! mixedFormats.contents.contains
+    "Pg.PgEncode.encode (Pg.binaryInt16 params.rank)"
+  assert! mixedFormats.contents.contains
+    "plannedBuiltinFormat (Pg.binaryInt16 params.rank)"
+  assert! mixedFormats.contents.contains
+    "values := #[Pg.PgEncode.encode (Option.map Pg.binaryInt32 params.count), Pg.PgEncode.encode (Pg.binaryInt16 params.rank)]"
+  assert! mixedFormats.contents.contains
+    "formats := #[Pgx.Typed.plannedBuiltinFormat (Option.map Pg.binaryInt32 params.count), Pgx.Typed.plannedBuiltinFormat (Pg.binaryInt16 params.rank)]"
+  assert! !(mixedFormats.contents.contains "encodePlannedBuiltin")
   assert! mixedFormats.contents.contains
     "decodePlanned External.citextCodec resolve types[1]!"
   assert! mixedFormats.contents.contains

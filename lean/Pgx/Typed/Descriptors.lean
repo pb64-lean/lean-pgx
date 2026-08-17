@@ -436,6 +436,12 @@ def encodePlannedBuiltin [Pg.PgEncode α] (value : α) : Except Error EncodedVal
     value := Pg.PgEncode.encode value
   }
 
+/-- Obtain a built-in parameter's static wire format while letting generated
+code construct its value array directly.  The borrowed witness keeps this
+helper allocation-free even for reference-valued parameter types. -/
+@[inline] def plannedBuiltinFormat [Pg.PgEncode α] (_ : @& α) : UInt16 :=
+  Pg.PgEncode.format α
+
 /-- Decode a built-in value using the portal OID that the numeric prepared plan
 has already validated. -/
 def decodePlannedBuiltin [Pg.PgDecode α] (typeOid : UInt32)
