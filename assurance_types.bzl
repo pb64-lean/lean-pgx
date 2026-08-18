@@ -6,4 +6,5 @@ PGX_PRINCIPAL_TYPES = {
     "Pgx.Logic.State.equivalent_refl": "∀ {schema : Pgx.Logic.Schema.{_, _}} (state : Pgx.Logic.State schema), Pgx.Logic.State.Equivalent state state",
     "Pgx.Logic.State.equivalent_symm": "∀ {schema : Pgx.Logic.Schema.{_, _}} {left right : Pgx.Logic.State schema}, Pgx.Logic.State.Equivalent left right → Pgx.Logic.State.Equivalent right left",
     "Pgx.Logic.State.equivalent_trans": "∀ {schema : Pgx.Logic.Schema.{_, _}} {first second third : Pgx.Logic.State schema}, Pgx.Logic.State.Equivalent first second → Pgx.Logic.State.Equivalent second third → Pgx.Logic.State.Equivalent first third",
+    "Pgx.Typed.PreparedRowDispatchBenchmark.decodeCandidate_eq_decodeReference": "∀ {db : Pgx.Typed.DatabaseDesc} {Params Row : Type} (spec : Pgx.Typed.QuerySpec db Params Row Pgx.Cardinality.many) (plan : Pgx.Typed.PreparedQueryPlan db) (catalog : Pgx.Typed.ResolvedCatalog db) (columns : Array Pg.Protocol.ColumnDesc) (rows : Array Pg.Protocol.DataRowSpans), Pgx.Typed.PreparedRowDispatchBenchmark.decodeCandidate spec plan catalog columns rows = Pgx.Typed.PreparedRowDispatchBenchmark.decodeReference spec plan catalog columns rows",
 }

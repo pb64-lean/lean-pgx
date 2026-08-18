@@ -76,6 +76,23 @@ lean_test(
     strip_module_prefix = "lean",
 )
 
+lean_binary(
+    name = "prepared_row_dispatch_benchmark",
+    srcs = ["PreparedRowDispatchBenchmark.lean"],
+    testonly = True,
+    deps = ["//lean/Pgx/Typed:query"],
+    strip_module_prefix = "lean",
+    tags = ["manual"],
+)
+
+lean_test(
+    name = "prepared_row_dispatch_test",
+    srcs = ["PreparedRowDispatchBenchmark.lean"],
+    args = ["candidate", "span", "1", "0", "0"],
+    deps = ["//lean/Pgx/Typed:query"],
+    strip_module_prefix = "lean",
+)
+
 lean_test(
     name = "ir_test",
     srcs = ["IR.lean"],

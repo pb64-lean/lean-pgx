@@ -140,6 +140,101 @@ private def decodeRow (spec : QuerySpec db Params Row cardinality)
     | some decode => decode plan.resolve plan.results columns materialized
     | none => spec.decode catalog columns materialized
 
+private def decodeManyRowsReference (spec : QuerySpec db Params Row .many)
+    (plan : PreparedQueryPlan db) (catalog : ResolvedCatalog db)
+    (columns : Array Pg.Protocol.ColumnDesc)
+    (rows : Array Pg.Protocol.DataRowSpans) : Except Error (Array Row) :=
+  rows.mapM (decodeRow spec plan catalog columns)
+
+/-- Select the generated prepared decoder once for a complete result batch.
+The row-arity guard deliberately remains inside each specialized map so a
+malformed row has the same error and left-to-right precedence as `decodeRow`.
+The fallback branches retain the same per-row materialization behavior. -/
+private def decodeManyRowsCandidate (spec : QuerySpec db Params Row .many)
+    (plan : PreparedQueryPlan db) (catalog : ResolvedCatalog db)
+    (columns : Array Pg.Protocol.ColumnDesc)
+    (rows : Array Pg.Protocol.DataRowSpans) : Except Error (Array Row) :=
+  let expectedColumns := spec.columns.size
+  match spec.preparedSpanDecode with
+  | some decode =>
+    rows.mapM fun values => do
+      unless values.size == expectedColumns do
+        throw (.queryDrift
+          s!"data row has {values.size} fields; expected {expectedColumns}")
+      decode plan.resolve plan.results columns values
+  | none =>
+    match spec.preparedDecode with
+    | some decode =>
+      rows.mapM fun values => do
+        unless values.size == expectedColumns do
+          throw (.queryDrift
+            s!"data row has {values.size} fields; expected {expectedColumns}")
+        let materialized := values.materialize
+        decode plan.resolve plan.results columns materialized
+    | none =>
+      let decode := spec.decode
+      rows.mapM fun values => do
+        unless values.size == expectedColumns do
+          throw (.queryDrift
+            s!"data row has {values.size} fields; expected {expectedColumns}")
+        let materialized := values.materialize
+        decode catalog columns materialized
+
+private theorem decodeManyRowsCandidate_eq_reference
+    (spec : QuerySpec db Params Row .many) (plan : PreparedQueryPlan db)
+    (catalog : ResolvedCatalog db) (columns : Array Pg.Protocol.ColumnDesc)
+    (rows : Array Pg.Protocol.DataRowSpans) :
+    decodeManyRowsCandidate spec plan catalog columns rows =
+      decodeManyRowsReference spec plan catalog columns rows := by
+  unfold decodeManyRowsCandidate decodeManyRowsReference
+  split <;> rename_i spanCase
+  · apply congrArg (fun decode => rows.mapM decode)
+    funext values
+    simp [decodeRow, spanCase]
+  · split <;> rename_i preparedCase
+    · apply congrArg (fun decode => rows.mapM decode)
+      funext values
+      simp [decodeRow, spanCase, preparedCase]
+    · apply congrArg (fun decode => rows.mapM decode)
+      funext values
+      simp [decodeRow, spanCase, preparedCase]
+
+namespace PreparedRowDispatchBenchmark
+
+/-- Exact former per-row decoder dispatch for semantic and counter checks. -/
+@[noinline] def decodeReference (spec : QuerySpec db Params Row .many)
+    (plan : PreparedQueryPlan db) (catalog : ResolvedCatalog db)
+    (columns : Array Pg.Protocol.ColumnDesc)
+    (rows : Array Pg.Protocol.DataRowSpans) : Except Error (Array Row) :=
+  decodeManyRowsReference spec plan catalog columns rows
+
+/-- Exact selected-once production candidate for semantic and counter checks. -/
+@[noinline] def decodeCandidate (spec : QuerySpec db Params Row .many)
+    (plan : PreparedQueryPlan db) (catalog : ResolvedCatalog db)
+    (columns : Array Pg.Protocol.ColumnDesc)
+    (rows : Array Pg.Protocol.DataRowSpans) : Except Error (Array Row) :=
+  decodeManyRowsCandidate spec plan catalog columns rows
+
+/-- Hoisting decoder selection preserves every result and first error. -/
+theorem decodeCandidate_eq_decodeReference
+    (spec : QuerySpec db Params Row .many) (plan : PreparedQueryPlan db)
+    (catalog : ResolvedCatalog db) (columns : Array Pg.Protocol.ColumnDesc)
+    (rows : Array Pg.Protocol.DataRowSpans) :
+    decodeCandidate spec plan catalog columns rows =
+      decodeReference spec plan catalog columns rows := by
+  exact decodeManyRowsCandidate_eq_reference spec plan catalog columns rows
+
+end PreparedRowDispatchBenchmark
+
+/-- Logical production keeps the former per-row dispatch; compiled production
+uses the proved selected-once batch dispatcher. -/
+@[implemented_by decodeManyRowsCandidate]
+private def decodeManyRows (spec : QuerySpec db Params Row .many)
+    (plan : PreparedQueryPlan db) (catalog : ResolvedCatalog db)
+    (columns : Array Pg.Protocol.ColumnDesc)
+    (rows : Array Pg.Protocol.DataRowSpans) : Except Error (Array Row) :=
+  decodeManyRowsReference spec plan catalog columns rows
+
 /-- Execute a checked command that has no result columns. -/
 def execute (spec : QuerySpec db Params Row .execute)
     (conn : CheckedConnection db) (params : Params) :
@@ -182,6 +277,6 @@ def fetchMany (spec : QuerySpec db Params Row .many)
   match ← runChecked db spec conn params with
   | .error error => pure (.error error)
   | .ok (plan, rows) =>
-    pure (rows.rows.mapM (decodeRow spec plan conn.catalog rows.columns))
+    pure (decodeManyRows spec plan conn.catalog rows.columns rows.rows)
 
 end Pgx.Typed
