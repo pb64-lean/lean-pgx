@@ -466,6 +466,26 @@ def decodePlannedBuiltinSpan [Pg.PgDecode α] [Pg.PgDecodeSpan α] (typeOid : UI
   | .ok decoded => pure decoded
   | .error message => throw (.decode message)
 
+/-- Decode a built-in prepared result after the generated row decoder has
+proved that the result column is present.  This preserves the established
+`Error.decode` mapping while avoiding a second, impossible span-index check. -/
+def decodePlannedBuiltinSpanAt [Pg.PgDecode α] [Pg.PgDecodeSpan α]
+    (typeOid : UInt32) (format : UInt16) (row : @& Pg.Protocol.DataRowSpans)
+    (index : Nat) (h : index < row.size) : Except Error α :=
+  match Pg.decodeDataRowValueAt (α := α) typeOid format row index h with
+  | .ok decoded => pure decoded
+  | .error message => throw (.decode message)
+
+/-- Supplying the generated row-width proof changes neither decoded values nor
+the exact PGX error mapping. -/
+theorem decodePlannedBuiltinSpanAt_eq_decodePlannedBuiltinSpan
+    [Pg.PgDecode α] [Pg.PgDecodeSpan α] (typeOid : UInt32) (format : UInt16)
+    (row : Pg.Protocol.DataRowSpans) (index : Nat) (h : index < row.size) :
+    decodePlannedBuiltinSpanAt (α := α) typeOid format row index h =
+      decodePlannedBuiltinSpan (α := α) typeOid format row index := by
+  simp only [decodePlannedBuiltinSpanAt, decodePlannedBuiltinSpan,
+    Pg.decodeDataRowValueAt_eq_decodeDataRowValue]
+
 /-- Encode through a generated codec using its already-resolved outer
 parameter descriptor.  The connection plan has already matched the descriptor
 to the generated spec; avoiding another full static-descriptor comparison is

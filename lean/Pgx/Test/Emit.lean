@@ -874,7 +874,17 @@ def main : IO UInt32 := do
   assert! getUser.contents.contains
     "Pgx.Typed.decodePlannedBuiltin columns[0]!.typeOid columns[0]!.format values[0]!"
   assert! getUser.contents.contains
-    "Pgx.Typed.decodePlannedBuiltinSpan columns[0]!.typeOid columns[0]!.format values 0"
+    "if hColumns : columns.size = 3 then"
+  assert! getUser.contents.contains
+    "if hValues : values.size = 3 then"
+  assert! getUser.contents.contains
+    "let column0 := columns[0]'(by omega)"
+  assert! getUser.contents.contains
+    "Pgx.Typed.decodePlannedBuiltinSpanAt column0.typeOid column0.format values 0 (by omega)"
+  assert! !(getUser.contents.contains
+    "Pgx.Typed.decodePlannedBuiltinSpan columns[0]!.typeOid")
+  assert! getUser.contents.contains
+    "    else\n      throw (.queryDrift \"generated decoder expected 3 row values\")\n  else\n    throw (.queryDrift \"generated decoder expected 3 column descriptors\")"
   assert! !(getUser.contents.contains "Pg.binaryInt64 params.id")
   assert! getUser.contents.contains "structure RowData where"
   assert! getUser.contents.contains "email : AppDb.Types.AppEmailAddress"
@@ -894,6 +904,10 @@ def main : IO UInt32 := do
   assert! !(getUser.contents.contains "Pgx.Constraint.compareNullable .gt")
   assert! getUser.contents.contains "match validate rowData with"
   assert! getUser.contents.contains "Pgx.Typed.Error.constraintViolation violation"
+  let some deleteUser := sources.findModule? "AppDb.Queries.DeleteUser"
+    | throw (IO.userError "missing generated DeleteUser module")
+  assert! deleteUser.contents.contains
+    "if hColumns : columns.size = 0 then\n    if hValues : values.size = 0 then\n      let _ := hColumns\n      let _ := hValues"
   let some listUsers := sources.findModule? "AppDb.Queries.ListUsers"
     | throw (IO.userError "missing generated ListUsers module")
   assert! listUsers.contents.contains "email : Option (AppDb.Types.AppEmailAddress)"
@@ -942,9 +956,13 @@ def main : IO UInt32 := do
   assert! mixedFormats.contents.contains
     "decodePlanned External.citextCodec resolve types[1]!"
   assert! mixedFormats.contents.contains
-    "decodePlannedBuiltinSpan columns[0]!.typeOid columns[0]!.format values 0"
+    "let column0 := columns[0]'(by omega)"
   assert! mixedFormats.contents.contains
-    "decodePlannedSpan External.citextCodec resolve types[1]! columns[1]!.format values 1"
+    "decodePlannedBuiltinSpanAt column0.typeOid column0.format values 0 (by omega)"
+  assert! mixedFormats.contents.contains
+    "let column1 := columns[1]'(by omega)"
+  assert! mixedFormats.contents.contains
+    "decodePlannedSpan External.citextCodec resolve types[1]! column1.format values 1"
 
   -- Source contracts remain symbolic and unsupported types are hard errors.
   for source in sources.all do

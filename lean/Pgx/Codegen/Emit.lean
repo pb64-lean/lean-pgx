@@ -2948,13 +2948,14 @@ private def decodePlannedSpanValueExpr (plan : NamingPlan) (db : Pgx.DatabaseIR)
     (ref : Pgx.TypeRef) (nullable : Bool) (resolved : String) (index : Nat) :
     Except CodegenError String := do
   let use ← resolveTypeUse plan db ref.key
+  let column := s!"column{index}"
   match codecExpr use nullable with
   | some codec =>
       pure s!"Pgx.Typed.decodePlannedSpan {codec} resolve {resolved} \
-        columns[{index}]!.format values {index}"
+        {column}.format values {index}"
   | none =>
-      pure s!"Pgx.Typed.decodePlannedBuiltinSpan columns[{index}]!.typeOid \
-        columns[{index}]!.format values {index}"
+      pure s!"Pgx.Typed.decodePlannedBuiltinSpanAt {column}.typeOid \
+        {column}.format values {index} (by omega)"
 
 private partial def domainChainAux (db : Pgx.DatabaseIR) (key : Pgx.TypeKey)
     (seen : Array Pgx.TypeKey) : Except CodegenError (Array Pgx.DomainIR) := do
@@ -3211,17 +3212,22 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
     "    (values : Pg.Protocol.DataRowSpans) : Except Pgx.Typed.Error Row := do",
     "  let _ := resolve",
     "  let _ := types",
-    s!"  unless columns.size == {query.columns.size} do",
-    s!"    throw (.queryDrift \"generated decoder expected {query.columns.size} column descriptors\")",
-    s!"  unless values.size == {query.columns.size} do",
-    s!"    throw (.queryDrift \"generated decoder expected {query.columns.size} row values\")"
+    s!"  if hColumns : columns.size = {query.columns.size} then",
+    s!"    if hValues : values.size = {query.columns.size} then"
   ]
+  if query.columns.isEmpty then
+    -- Empty-result commands still establish both ordered arity facts, but
+    -- have no proof-indexed accesses through which the facts would be used.
+    lines := lines ++ ["      let _ := hColumns", "      let _ := hValues"]
   let mut preparedSpanDecodedNames : Array String := #[]
   for i in [0:query.columns.size] do
     let column := query.columns[i]!
     let wireName := s!"decodedWire{i}"
-    lines := lines ++ [s!"  let {wireName} ← {← decodePlannedSpanValueExpr plan db
-      column.ty column.nullable s!"types[{i}]!" i}"]
+    lines := lines ++ [
+      s!"      let column{i} := columns[{i}]'(by omega)",
+      s!"      let {wireName} ← {← decodePlannedSpanValueExpr plan db
+        column.ty column.nullable s!"types[{i}]!" i}"
+    ]
     match column.logicalType with
     | none => preparedSpanDecodedNames := preparedSpanDecodedNames.push wireName
     | some _ =>
@@ -3229,17 +3235,21 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
         preparedSpanDecodedNames := preparedSpanDecodedNames.push decodedName
         let refined ← refineLogicalColumnExpression plan db column wireName
           s!"query {query.name} result {column.name}"
-        lines := lines ++ [s!"  let {decodedName} ← {refined}"]
+        lines := lines ++ [s!"      let {decodedName} ← {refined}"]
   if query.columns.isEmpty then
-    lines := lines ++ ["  let rowData : RowData := RowData.mk"]
+    lines := lines ++ ["      let rowData : RowData := RowData.mk"]
   else
     let assignments := Array.range query.columns.size |>.map fun i =>
       columnNames[i]! ++ " := " ++ preparedSpanDecodedNames[i]!
-    lines := lines ++ ["  let rowData : RowData := { " ++ commaSep assignments ++ " }"]
+    lines := lines ++ ["      let rowData : RowData := { " ++ commaSep assignments ++ " }"]
   lines := lines ++ [
-    "  match validate rowData with",
-    "  | .ok refined => pure refined",
-    "  | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)"
+    "      match validate rowData with",
+    "      | .ok refined => pure refined",
+    "      | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)",
+    "    else",
+    s!"      throw (.queryDrift \"generated decoder expected {query.columns.size} row values\")",
+    "  else",
+    s!"    throw (.queryDrift \"generated decoder expected {query.columns.size} column descriptors\")"
   ]
   lines := lines ++ [
     "",

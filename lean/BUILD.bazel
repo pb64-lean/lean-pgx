@@ -50,6 +50,7 @@ lean_assurance_test(
         "Pgx.Logic.State.equivalent_refl",
         "Pgx.Logic.State.equivalent_symm",
         "Pgx.Logic.State.equivalent_trans",
+        "Pgx.Typed.decodePlannedBuiltinSpanAt_eq_decodePlannedBuiltinSpan",
         "Pgx.Typed.PreparedRowDispatchBenchmark.decodeCandidate_eq_decodeReference",
     ],
     principal_theorem_types = PGX_PRINCIPAL_TYPES,
