@@ -577,7 +577,20 @@ structure PreparedQueryPlan (db : DatabaseDesc) where
   /-- Validated Bind result-format vector, retained in its compact PostgreSQL
   representation (empty, one entry, or one per result). -/
   resultFormats : Array UInt16
+  /-- Statement-name bytes cached once with a proof index tying them to the
+  exact prepared statement.  The index and equality proof erase at runtime.
+  `optParam` preserves ordinary pre-field positional constructor calls. -/
+  statementNameUtf8 : optParam
+      (Pg.Protocol.Frontend.EncodedUtf8 statement.name)
+      (Pg.Protocol.Frontend.EncodedUtf8.ofString statement.name) :=
+    Pg.Protocol.Frontend.EncodedUtf8.ofString statement.name
   deriving Inhabited
+
+/-- The cached statement-name representation cannot drift from its prepared
+statement. -/
+theorem PreparedQueryPlan.statementNameUtf8_eq (plan : PreparedQueryPlan db) :
+    plan.statementNameUtf8.val = plan.statement.name.toUTF8 :=
+  plan.statementNameUtf8.property
 
 /-- Preserve the established malformed-row diagnostic at both the single-row
 and generated batch-decoder boundaries. -/
@@ -859,6 +872,8 @@ def createPreparedQueryPlan (catalog : ResolvedCatalog db) (cacheKey contractHas
       format := formats[i]!
     }
   verifyPreparedColumns preparedColumns statement.columns false
+  let statementNameUtf8 :=
+    Pg.Protocol.Frontend.EncodedUtf8.ofString statement.name
   pure {
     cacheKey
     contractHash
@@ -868,6 +883,7 @@ def createPreparedQueryPlan (catalog : ResolvedCatalog db) (cacheKey contractHas
     resolve := fun key => catalog.resolveType key
     columns := preparedColumns
     resultFormats
+    statementNameUtf8
   }
 
 /-- Constant-time defense against handing a ready plan to a different query

@@ -95,6 +95,11 @@ namespace ParameterValidationBenchmark
 
 end ParameterValidationBenchmark
 
+@[noinline] private def executePreparedSpans (conn : Pg.Connection)
+    (plan : @& PreparedQueryPlan db) (encoded : @& EncodedParams) :=
+  Pg.Connection.executeSpansUtf8 conn plan.statementNameUtf8 encoded.values
+    encoded.formats plan.resultFormats
+
 private def runChecked (db : DatabaseDesc)
     (spec : QuerySpec db Params Row cardinality) (conn : CheckedConnection db)
     (params : Params) : Async (Except Error (PreparedQueryPlan db × Pg.SpanRows)) := do
@@ -112,8 +117,7 @@ private def runChecked (db : DatabaseDesc)
     match validateEncodedParams spec.params.size encoded with
     | .error error => pure (.error error)
     | .ok () => do
-      let rows ← match ← Pg.Connection.executeSpans conn.raw plan.statement.name
-          encoded.values encoded.formats plan.resultFormats with
+      let rows ← match ← executePreparedSpans conn.raw plan encoded with
         | .error error =>
           let failure := executionFailure error
           Internal.markPreparedDrift conn plan.cacheKey failure

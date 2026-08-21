@@ -53,6 +53,9 @@ lean_assurance_test(
         "Pgx.Typed.decodePlannedBuiltinBinarySpanAt_eq_decodePlannedBuiltinSpanAt",
         "Pgx.Typed.decodePlannedBuiltinSpanAt_eq_decodePlannedBuiltinSpan",
         "Pgx.Typed.decodePlannedBuiltinTextSpanAt_eq_decodePlannedBuiltinSpanAt",
+        # A ready plan's cached name bytes remain indexed to its exact
+        # connection-local prepared statement.
+        "Pgx.Typed.PreparedQueryPlan.statementNameUtf8_eq",
         "Pgx.Typed.PreparedRowDispatchBenchmark.decodeCandidate_eq_decodeReference",
         "Pgx.Typed.PreparedSingleRowDispatchBenchmark.decodeCandidate_eq_decodeReference",
     ],

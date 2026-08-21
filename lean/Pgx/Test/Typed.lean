@@ -269,6 +269,14 @@ private def preparedPlanTests (catalog : ResolvedCatalog database) : IO Unit := 
   assert! textPlan.params[0]!.oid == 23
   assert! textPlan.results[0]!.oid == 23
   assert! textPlan.columns[0]!.origin == some { tableOid := 90001, attnum := 1 }
+  assert! textPlan.statementNameUtf8.val == statement.name.toUTF8
+  -- The cached field remains optional at ordinary constructor call sites, so
+  -- source using the former eight value arguments still elaborates.
+  let legacyPositional : PreparedQueryPlan database :=
+    PreparedQueryPlan.mk textPlan.cacheKey textPlan.contractHash textPlan.statement
+      textPlan.params textPlan.results textPlan.resolve textPlan.columns
+      textPlan.resultFormats
+  assert! legacyPositional.statementNameUtf8.val == statement.name.toUTF8
   assert! (verifyPreparedQueryIdentity textPlan "query-key" "query-contract" 1 1 0).isOk
   assert! isError (verifyPreparedQueryIdentity textPlan
     "query-key" "different-parameter-contract" 1 1 0)
@@ -279,6 +287,14 @@ private def preparedPlanTests (catalog : ResolvedCatalog database) : IO Unit := 
     #[{ idResult with typeOid := 25 }])
   assert! isError (verifyPreparedResultColumns textPlan
     #[{ idResult with tableOid := 90002 }])
+
+  let nul := String.singleton (Char.ofNat 0)
+  let unicodeStatement := { statement with name := "名" ++ nul ++ "🚀" }
+  let unicodePlan ← match createPreparedQueryPlan catalog "unicode-key"
+      "unicode-contract" #[param] resolvedParams #[column] #[] unicodeStatement with
+    | .ok value => pure value
+    | .error error => throw (IO.userError (toString error))
+  assert! unicodePlan.statementNameUtf8.val == unicodeStatement.name.toUTF8
 
   -- Bind format-vector validation is paid while constructing the plan.  The
   -- statement Describe remains text, while every portal description is still
@@ -323,7 +339,8 @@ private def preparedPlanTests (catalog : ResolvedCatalog database) : IO Unit := 
     | _ => false
   completePrepareCache cacheA "query-key" (.ok textPlan)
   assert! match ← beginPrepareCache cacheA "query-key" with
-    | .ready plan => plan.statement.name == statement.name
+    | .ready plan => plan.statement.name == statement.name &&
+        plan.statementNameUtf8.val == statement.name.toUTF8
     | _ => false
   assert! match ← beginPrepareCache cacheB "query-key" with
     | .owner => true
