@@ -5,8 +5,8 @@ Focused semantic test and differential benchmark for prepared row-decoder
 dispatch.  The reference performs callback selection for every row, the eager
 candidate preserves PGX-13's exact selected-once dispatcher, and the candidate
 is the staged dispatcher used by compiled `fetchMany`.  The `single` mode calls
-the exact compiled decoder used by `fetchOne` and `fetchOptional` so a later
-single-row staging change can be compared through an unchanged harness.
+the exact staged decoder used by compiled `fetchOne` and `fetchOptional`, while
+the reference selector preserves the former eager single-row dispatcher.
 
 The semantic corpus exercises the span, materialized-prepared, and generic
 callbacks, including priority, exact malformed-row diagnostics, first-error
@@ -20,7 +20,6 @@ namespace Pgx.Typed.PreparedRowDispatchBenchmarkHarness
 
 open PreparedRowDispatchBenchmark
 open PreparedRowDispatchBenchmarkEager
-open PreparedSingleRowDispatchBenchmark
 
 private def fixtureTypeKey : Pgx.TypeKey :=
   { schema := "pg_catalog", name := "text", kind := .base }
@@ -452,15 +451,28 @@ private def validateSingleCase (label : String)
     (cells : Array (Option ByteArray)) (expected : ResultSnapshot) : IO Unit := do
   let row := Pg.Protocol.DataRowSpans.ofCells cells
   let eager := snapshotSingle <| decodeSingleEager spec catalog columns row
+  let reference := snapshotSingle <|
+    PreparedSingleRowDispatchBenchmark.decodeReference
+      spec plan catalog columns row
+  let candidate := snapshotSingle <|
+    PreparedSingleRowDispatchBenchmark.decodeCandidate
+      spec plan catalog columns row
   let production := snapshotSingle <|
-    decodeProduction spec plan catalog columns row
+    PreparedSingleRowDispatchBenchmark.decodeProduction
+      spec plan catalog columns row
   unless eager == expected do
     throw (IO.userError s!"{label}: eager differs from expected: {reprStr eager}")
+  unless reference == expected do
+    throw (IO.userError
+      s!"{label}: reference differs from expected: {reprStr reference}")
+  unless candidate == expected do
+    throw (IO.userError
+      s!"{label}: candidate differs from expected: {reprStr candidate}")
   unless production == expected do
     throw (IO.userError
       s!"{label}: production differs from expected: {reprStr production}")
-  unless eager == production do
-    throw (IO.userError s!"{label}: eager and production differ")
+  unless eager == reference && reference == candidate && candidate == production do
+    throw (IO.userError s!"{label}: single-row selectors differ")
 
 private def validateSingleSemantics (catalog : ResolvedCatalog database) : IO Nat := do
   let first := successCells[0]!
@@ -604,7 +616,8 @@ private def benchmarkBundleMismatchSpec : QuerySpec database Unit Nat .many := {
     (row : @& Pg.Protocol.DataRowSpans) (iterations : Nat) : Except Error UInt64 := do
   let mut checksum : UInt64 := 0
   for _ in [0:iterations] do
-    let decoded ← decodeProduction spec plan catalog actualColumns (freshRow row)
+    let decoded ← PreparedSingleRowDispatchBenchmark.decodeProduction
+      spec plan catalog actualColumns (freshRow row)
     checksum := checksum + UInt64.ofNat decoded
   pure checksum
 

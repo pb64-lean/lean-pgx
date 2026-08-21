@@ -52,6 +52,7 @@ lean_assurance_test(
         "Pgx.Logic.State.equivalent_trans",
         "Pgx.Typed.decodePlannedBuiltinSpanAt_eq_decodePlannedBuiltinSpan",
         "Pgx.Typed.PreparedRowDispatchBenchmark.decodeCandidate_eq_decodeReference",
+        "Pgx.Typed.PreparedSingleRowDispatchBenchmark.decodeCandidate_eq_decodeReference",
     ],
     principal_theorem_types = PGX_PRINCIPAL_TYPES,
     expected_unsafe_constants = [],
@@ -62,6 +63,7 @@ lean_assurance_test(
     expected_opaque_constants = [],
     expected_implemented_by = {
         "Pgx.Typed.Descriptors.Pgx.Typed.verifyPreparedColumns": "Pgx.Typed.Descriptors.Pgx.Typed.verifyPreparedColumnsCandidate",
+        "Pgx.Typed.Query.Pgx.Typed.decodeRow": "Pgx.Typed.Query.Pgx.Typed.decodeRowCandidate",
         "Pgx.Typed.Query.Pgx.Typed.decodeManyRows": "Pgx.Typed.Query.Pgx.Typed.decodeManyRowsCandidate",
     },
     expected_extern_declarations = {},

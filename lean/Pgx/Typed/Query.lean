@@ -125,7 +125,7 @@ private def runChecked (db : DatabaseDesc)
         pure (.error error)
       | .ok () => pure (.ok (plan, rows))
 
-private def decodeRow (spec : QuerySpec db Params Row cardinality)
+private def decodeRowReference (spec : QuerySpec db Params Row cardinality)
     (plan : PreparedQueryPlan db)
     (catalog : ResolvedCatalog db) (columns : Array Pg.Protocol.ColumnDesc)
     (values : Pg.Protocol.DataRowSpans) : Except Error Row :=
@@ -143,11 +143,63 @@ private def decodeRow (spec : QuerySpec db Params Row cardinality)
   else
     throw (dataRowArityError values.size spec.columns.size)
 
+/-- Keep lower-priority callback projections outside prepared bundle dispatch.
+This helper is deliberately not inlined so each successful branch retains only
+the callback and prepared-plan fields that it actually consumes. -/
+@[noinline] private def decodeRowWithoutBundle
+    (spec : QuerySpec db Params Row cardinality)
+    (plan : PreparedQueryPlan db) (catalog : ResolvedCatalog db)
+    (columns : Array Pg.Protocol.ColumnDesc)
+    (values : Pg.Protocol.DataRowSpans) : Except Error Row :=
+  match spec.preparedSpanDecode with
+  | some decode => decode plan.resolve plan.results columns values
+  | none =>
+    match spec.preparedDecode with
+    | some decode =>
+      let materialized := values.materialize
+      decode plan.resolve plan.results columns materialized
+    | none =>
+      let materialized := values.materialize
+      spec.decode catalog columns materialized
+
+/-- Stage the single-row arity and prepared-bundle decisions before projecting
+callbacks that cannot be selected. -/
+private def decodeRowCandidate (spec : QuerySpec db Params Row cardinality)
+    (plan : PreparedQueryPlan db)
+    (catalog : ResolvedCatalog db) (columns : Array Pg.Protocol.ColumnDesc)
+    (values : Pg.Protocol.DataRowSpans) : Except Error Row :=
+  if values.size = spec.columns.size then
+    match spec.preparedSpanDecoderBundle with
+    | some bundle => bundle.row plan.resolve plan.results columns values
+    | none => decodeRowWithoutBundle spec plan catalog columns values
+  else
+    throw (dataRowArityError values.size spec.columns.size)
+
+private theorem decodeRowCandidate_eq_reference
+    (spec : QuerySpec db Params Row cardinality) (plan : PreparedQueryPlan db)
+    (catalog : ResolvedCatalog db) (columns : Array Pg.Protocol.ColumnDesc)
+    (values : Pg.Protocol.DataRowSpans) :
+    decodeRowCandidate spec plan catalog columns values =
+      decodeRowReference spec plan catalog columns values := by
+  by_cases hValues : values.size = spec.columns.size
+  · simp [decodeRowCandidate, decodeRowReference, decodeRowWithoutBundle,
+      hValues]
+  · simp [decodeRowCandidate, decodeRowReference, hValues]
+
+/-- Logical production retains the former eager single-row dispatcher; native
+production uses the proved staged dispatcher. -/
+@[implemented_by decodeRowCandidate]
+private def decodeRow (spec : QuerySpec db Params Row cardinality)
+    (plan : PreparedQueryPlan db)
+    (catalog : ResolvedCatalog db) (columns : Array Pg.Protocol.ColumnDesc)
+    (values : Pg.Protocol.DataRowSpans) : Except Error Row :=
+  decodeRowReference spec plan catalog columns values
+
 private def decodeManyRowsReference (spec : QuerySpec db Params Row .many)
     (plan : PreparedQueryPlan db) (catalog : ResolvedCatalog db)
     (columns : Array Pg.Protocol.ColumnDesc)
     (rows : Array Pg.Protocol.DataRowSpans) : Except Error (Array Row) :=
-  rows.mapM (decodeRow spec plan catalog columns)
+  rows.mapM (decodeRowReference spec plan catalog columns)
 
 /-- Keep legacy decoder projections outside the generated-bundle fast path.
 This helper is deliberately not inlined: a specification with a matching
@@ -223,13 +275,13 @@ private theorem decodeManyRowsCandidate_eq_reference
       unfold guardedPreparedSpanRows decodeManyRowsReference
       apply congrArg (fun decode => rows.mapM decode)
       funext values
-      simp [decodeRow, bundleCase]
+      simp [decodeRowReference, bundleCase]
     · simp only [decodeManyRowsCandidate, bundleCase, expectedCase, ↓reduceIte]
       unfold decodeManyRowsBundleWidthMismatch
       unfold guardedPreparedSpanRows decodeManyRowsReference
       apply congrArg (fun decode => rows.mapM decode)
       funext values
-      simp [decodeRow, bundleCase]
+      simp [decodeRowReference, bundleCase]
   | none =>
     simp only [decodeManyRowsCandidate, decodeManyRowsReference, bundleCase]
     unfold decodeManyRowsWithoutBundle
@@ -237,14 +289,14 @@ private theorem decodeManyRowsCandidate_eq_reference
     · unfold guardedPreparedSpanRows
       apply congrArg (fun decode => rows.mapM decode)
       funext values
-      simp [decodeRow, bundleCase, spanCase]
+      simp [decodeRowReference, bundleCase, spanCase]
     · split <;> rename_i preparedCase
       · apply congrArg (fun decode => rows.mapM decode)
         funext values
-        simp [decodeRow, bundleCase, spanCase, preparedCase]
+        simp [decodeRowReference, bundleCase, spanCase, preparedCase]
       · apply congrArg (fun decode => rows.mapM decode)
         funext values
-        simp [decodeRow, bundleCase, spanCase, preparedCase]
+        simp [decodeRowReference, bundleCase, spanCase, preparedCase]
 
 namespace PreparedRowDispatchBenchmark
 
@@ -274,6 +326,32 @@ theorem decodeCandidate_eq_decodeReference
 end PreparedRowDispatchBenchmark
 
 namespace PreparedSingleRowDispatchBenchmark
+
+/-- Exact former eager single-row decoder for semantic checks. -/
+@[noinline] def decodeReference
+    (spec : QuerySpec db Params Row cardinality)
+    (plan : PreparedQueryPlan db) (catalog : ResolvedCatalog db)
+    (columns : Array Pg.Protocol.ColumnDesc)
+    (values : Pg.Protocol.DataRowSpans) : Except Error Row :=
+  decodeRowReference spec plan catalog columns values
+
+/-- Exact staged single-row decoder for semantic and counter checks. -/
+@[noinline] def decodeCandidate
+    (spec : QuerySpec db Params Row cardinality)
+    (plan : PreparedQueryPlan db) (catalog : ResolvedCatalog db)
+    (columns : Array Pg.Protocol.ColumnDesc)
+    (values : Pg.Protocol.DataRowSpans) : Except Error Row :=
+  decodeRowCandidate spec plan catalog columns values
+
+/-- Staging callback ownership preserves every result and exact error. -/
+theorem decodeCandidate_eq_decodeReference
+    (spec : QuerySpec db Params Row cardinality)
+    (plan : PreparedQueryPlan db) (catalog : ResolvedCatalog db)
+    (columns : Array Pg.Protocol.ColumnDesc)
+    (values : Pg.Protocol.DataRowSpans) :
+    decodeCandidate spec plan catalog columns values =
+      decodeReference spec plan catalog columns values := by
+  exact decodeRowCandidate_eq_reference spec plan catalog columns values
 
 /-- Exact compiled single-row decoder seam for semantic and counter checks. -/
 @[noinline] def decodeProduction
