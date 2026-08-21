@@ -4,7 +4,9 @@ import Pgx.Test.PreparedRowDispatchEager
 Focused semantic test and differential benchmark for prepared row-decoder
 dispatch.  The reference performs callback selection for every row, the eager
 candidate preserves PGX-13's exact selected-once dispatcher, and the candidate
-is the staged dispatcher used by compiled `fetchMany`.
+is the staged dispatcher used by compiled `fetchMany`.  The `single` mode calls
+the exact compiled decoder used by `fetchOne` and `fetchOptional` so a later
+single-row staging change can be compared through an unchanged harness.
 
 The semantic corpus exercises the span, materialized-prepared, and generic
 callbacks, including priority, exact malformed-row diagnostics, first-error
@@ -18,6 +20,7 @@ namespace Pgx.Typed.PreparedRowDispatchBenchmarkHarness
 
 open PreparedRowDispatchBenchmark
 open PreparedRowDispatchBenchmarkEager
+open PreparedSingleRowDispatchBenchmark
 
 private def fixtureTypeKey : Pgx.TypeKey :=
   { schema := "pg_catalog", name := "text", kind := .base }
@@ -78,6 +81,26 @@ private def plan : PreparedQueryPlan database := {
   columns := #[]
   resultFormats := #[]
 }
+
+/-- Exact pre-staging single-row dispatcher used as the semantic oracle. -/
+@[noinline] private def decodeSingleEager
+    (spec : QuerySpec database Unit Row cardinality)
+    (catalog : ResolvedCatalog database)
+    (columns : Array Pg.Protocol.ColumnDesc)
+    (values : Pg.Protocol.DataRowSpans) : Except Error Row :=
+  if values.size = spec.columns.size then
+    match spec.preparedSpanDecoderBundle with
+    | some bundle => bundle.row plan.resolve plan.results columns values
+    | none =>
+      match spec.preparedSpanDecode with
+      | some decode => decode plan.resolve plan.results columns values
+      | none =>
+        let materialized := values.materialize
+        match spec.preparedDecode with
+        | some decode => decode plan.resolve plan.results columns materialized
+        | none => spec.decode catalog columns materialized
+  else
+    throw (dataRowArityError values.size spec.columns.size)
 
 private structure DecodedRow where
   path : Nat
@@ -163,6 +186,10 @@ private def snapshot : Except Error (Array DecodedRow) → ResultSnapshot
       cells := row.cells
       escaped := row.escaped.map (·.materialize)
     }
+  | .error error => .error error.kind error.toMessage
+
+private def snapshotSingle : Except Error DecodedRow → ResultSnapshot
+  | .ok row => snapshot (.ok #[row])
   | .error error => .error error.kind error.toMessage
 
 private def expectedSuccess (path : Nat) (escapes : Bool)
@@ -418,6 +445,46 @@ private def validateBundleSemantics (catalog : ResolvedCatalog database) : IO Na
         s!"{fixture.label}: bundle many and guarded row decoder differ")
   pure bundleSemanticCases.size
 
+private def validateSingleCase (label : String)
+    (spec : QuerySpec database Unit DecodedRow cardinality)
+    (catalog : ResolvedCatalog database)
+    (columns : Array Pg.Protocol.ColumnDesc)
+    (cells : Array (Option ByteArray)) (expected : ResultSnapshot) : IO Unit := do
+  let row := Pg.Protocol.DataRowSpans.ofCells cells
+  let eager := snapshotSingle <| decodeSingleEager spec catalog columns row
+  let production := snapshotSingle <|
+    decodeProduction spec plan catalog columns row
+  unless eager == expected do
+    throw (IO.userError s!"{label}: eager differs from expected: {reprStr eager}")
+  unless production == expected do
+    throw (IO.userError
+      s!"{label}: production differs from expected: {reprStr production}")
+  unless eager == production do
+    throw (IO.userError s!"{label}: eager and production differ")
+
+private def validateSingleSemantics (catalog : ResolvedCatalog database) : IO Nat := do
+  let first := successCells[0]!
+  validateSingleCase "single-span-priority-and-escape" (specFor .span)
+    catalog actualColumns first (expectedSuccess 3 true #[first])
+  validateSingleCase "single-prepared-priority" (specFor .prepared)
+    catalog actualColumns first (expectedSuccess 2 false #[first])
+  validateSingleCase "single-generic-fallback" (specFor .generic)
+    catalog actualColumns first (expectedSuccess 1 false #[first])
+  validateSingleCase "single-bundle-priority" (bundleSpecFor 2)
+    catalog actualColumns first (expectedSuccess 4 true #[first])
+  validateSingleCase "single-bundle-width-is-not-a-row-guard" (bundleSpecFor 1)
+    catalog actualColumns first (expectedSuccess 4 true #[first])
+  validateSingleCase "single-arity-precedes-callback" (specFor .span)
+    catalog actualColumns malformedRow
+    (.error .queryDrift "query drift: data row has 1 fields; expected 2")
+  validateSingleCase "single-callback-error" (specFor .span)
+    catalog actualColumns sentinelRow
+    (.error .decode "row decoding failed: prepared row dispatch sentinel")
+  validateSingleCase "single-bundle-column-error" (bundleSpecFor 2)
+    catalog (actualColumns.take 1) first
+    (.error .queryDrift "query drift: prepared bundle has 1 columns; expected 2")
+  pure 8
+
 private def benchmarkSpanDecode (_ : TypeResolver) (_ : Array ResolvedType)
     (_ : Array Pg.Protocol.ColumnDesc) (row : Pg.Protocol.DataRowSpans) :
     Except Error Nat :=
@@ -497,6 +564,10 @@ private def benchmarkBundleMismatchSpec : QuerySpec database Unit Nat .many := {
     Array Pg.Protocol.DataRowSpans :=
   rows
 
+@[noinline] private def freshRow (row : @& Pg.Protocol.DataRowSpans) :
+    Pg.Protocol.DataRowSpans :=
+  row
+
 @[noinline] private def runReference (spec : QuerySpec database Unit Nat .many)
     (catalog : ResolvedCatalog database)
     (rows : @& Array Pg.Protocol.DataRowSpans) (iterations : Nat) : Except Error UInt64 := do
@@ -527,10 +598,21 @@ private def benchmarkBundleMismatchSpec : QuerySpec database Unit Nat .many := {
       checksum := checksum + UInt64.ofNat value
   pure checksum
 
+@[noinline] private def runSingleProduction
+    (spec : QuerySpec database Unit Nat .many)
+    (catalog : ResolvedCatalog database)
+    (row : @& Pg.Protocol.DataRowSpans) (iterations : Nat) : Except Error UInt64 := do
+  let mut checksum : UInt64 := 0
+  for _ in [0:iterations] do
+    let decoded ← decodeProduction spec plan catalog actualColumns (freshRow row)
+    checksum := checksum + UInt64.ofNat decoded
+  pure checksum
+
 private inductive Mode where
   | reference
   | eager
   | candidate
+  | single
 
 private def runIterations (mode : Mode) (spec : QuerySpec database Unit Nat .many)
     (catalog : ResolvedCatalog database)
@@ -539,6 +621,10 @@ private def runIterations (mode : Mode) (spec : QuerySpec database Unit Nat .man
   | .reference => runReference spec catalog rows iterations
   | .eager => runEager spec catalog rows iterations
   | .candidate => runCandidate spec catalog rows iterations
+  | .single =>
+    match rows[0]? with
+    | some row => runSingleProduction spec catalog row iterations
+    | none => pure 0
 
 private def expectOk (label : String) : Except Error α → IO α
   | .ok value => pure value
@@ -564,14 +650,16 @@ def runMain (args : List String) : IO Unit := do
         ← parseNatural "warmup" warmup)
     | _ => throw (IO.userError <|
         "usage: prepared_row_dispatch_benchmark " ++
-          "(reference|eager|candidate) " ++
+          "(reference|eager|candidate|single) " ++
           "(bundle|bundle_mismatch|span|prepared|generic) " ++
           "(0|1|55) iterations warmup")
   let mode ← match modeName with
     | "reference" => pure Mode.reference
     | "eager" => pure Mode.eager
     | "candidate" => pure Mode.candidate
-    | _ => throw (IO.userError "mode must be reference, eager, or candidate")
+    | "single" => pure Mode.single
+    | _ => throw (IO.userError
+        "mode must be reference, eager, candidate, or single")
   let spec ← match decoderName with
     | "bundle" => pure benchmarkBundleSpec
     | "bundle_mismatch" => pure benchmarkBundleMismatchSpec
@@ -582,9 +670,15 @@ def runMain (args : List String) : IO Unit := do
         "decoder must be bundle, bundle_mismatch, span, prepared, or generic")
   unless pageSize == 0 || pageSize == 1 || pageSize == 55 do
     throw (IO.userError "page size must be 0, 1, or 55")
+  match mode with
+  | .single =>
+    unless pageSize == 1 do
+      throw (IO.userError "single mode requires page size 1")
+  | _ => pure ()
   let catalog ← expectOk "catalog fixture" catalogResult
   let legacyCases ← validateSemantics catalog
   let bundleCases ← validateBundleSemantics catalog
+  let singleCases ← validateSingleSemantics catalog
   let rows := Array.replicate pageSize fixtureRow
   let expectedWarmup := UInt64.ofNat (pageSize * 2 * warmup)
   let warmupChecksum ← expectOk "warmup" <|
@@ -596,10 +690,10 @@ def runMain (args : List String) : IO Unit := do
     runIterations mode spec catalog rows iterations
   unless checksum == expected do
     throw (IO.userError "measured checksum mismatch")
-  IO.println <| s!"benchmark=pgx_prepared_row_dispatch_v4 mode={modeName} decoder={decoderName} " ++
+  IO.println <| s!"benchmark=pgx_prepared_row_dispatch_v5 mode={modeName} decoder={decoderName} " ++
     s!"page_size={pageSize} iterations={iterations} warmup={warmup} checksum={checksum}"
-  IO.println <| s!"prepared_row_dispatch_validation=pass cases={legacyCases + bundleCases} " ++
-    "selectors=reference,eager,candidate " ++
+  IO.println <| s!"prepared_row_dispatch_validation=pass cases={legacyCases + bundleCases + singleCases} " ++
+    s!"single_cases={singleCases} selectors=reference,eager,candidate,single " ++
     "decoders=bundle,bundle_mismatch,span,prepared,generic " ++
     "malformed=pass first_error=pass escape=pass"
 

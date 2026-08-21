@@ -273,6 +273,18 @@ theorem decodeCandidate_eq_decodeReference
 
 end PreparedRowDispatchBenchmark
 
+namespace PreparedSingleRowDispatchBenchmark
+
+/-- Exact compiled single-row decoder seam for semantic and counter checks. -/
+@[noinline] def decodeProduction
+    (spec : QuerySpec db Params Row cardinality)
+    (plan : PreparedQueryPlan db) (catalog : ResolvedCatalog db)
+    (columns : Array Pg.Protocol.ColumnDesc)
+    (values : Pg.Protocol.DataRowSpans) : Except Error Row :=
+  decodeRow spec plan catalog columns values
+
+end PreparedSingleRowDispatchBenchmark
+
 /-- Logical production keeps the former per-row dispatch; compiled production
 uses the proved selected-once batch dispatcher. -/
 @[implemented_by decodeManyRowsCandidate]
