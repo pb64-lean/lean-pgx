@@ -1,6 +1,6 @@
 """Pure lean-pgx tests."""
 
-load("@rules_lean//lean:defs.bzl", "lean_binary", "lean_test")
+load("@rules_lean//lean:defs.bzl", "lean_binary", "lean_library", "lean_test")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -76,11 +76,19 @@ lean_test(
     strip_module_prefix = "lean",
 )
 
+lean_library(
+    name = "prepared_row_dispatch_eager",
+    srcs = ["PreparedRowDispatchEager.lean"],
+    testonly = True,
+    deps = ["//lean/Pgx/Typed:query"],
+    strip_module_prefix = "lean",
+)
+
 lean_binary(
     name = "prepared_row_dispatch_benchmark",
     srcs = ["PreparedRowDispatchBenchmark.lean"],
     testonly = True,
-    deps = ["//lean/Pgx/Typed:query"],
+    deps = [":prepared_row_dispatch_eager"],
     strip_module_prefix = "lean",
     tags = ["manual"],
 )
@@ -88,8 +96,8 @@ lean_binary(
 lean_test(
     name = "prepared_row_dispatch_test",
     srcs = ["PreparedRowDispatchBenchmark.lean"],
-    args = ["candidate", "span", "1", "0", "0"],
-    deps = ["//lean/Pgx/Typed:query"],
+    args = ["candidate", "bundle", "1", "1", "0"],
+    deps = [":prepared_row_dispatch_eager"],
     strip_module_prefix = "lean",
 )
 

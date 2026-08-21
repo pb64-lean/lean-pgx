@@ -149,10 +149,52 @@ private def decodeManyRowsReference (spec : QuerySpec db Params Row .many)
     (rows : Array Pg.Protocol.DataRowSpans) : Except Error (Array Row) :=
   rows.mapM (decodeRow spec plan catalog columns)
 
+/-- Keep legacy decoder projections outside the generated-bundle fast path.
+This helper is deliberately not inlined: a specification with a matching
+bundle must not retain callbacks that cannot be selected. -/
+@[noinline] private def decodeManyRowsWithoutBundle
+    (expectedColumns : Nat) (spec : QuerySpec db Params Row .many)
+    (plan : PreparedQueryPlan db) (catalog : ResolvedCatalog db)
+    (columns : Array Pg.Protocol.ColumnDesc)
+    (rows : Array Pg.Protocol.DataRowSpans) : Except Error (Array Row) :=
+  match spec.preparedSpanDecode with
+  | some decode =>
+    guardedPreparedSpanRows expectedColumns decode
+      plan.resolve plan.results columns rows
+  | none =>
+    match spec.preparedDecode with
+    | some decode =>
+      rows.mapM fun values =>
+        if values.size = expectedColumns then
+          let materialized := values.materialize
+          decode plan.resolve plan.results columns materialized
+        else
+          throw (dataRowArityError values.size expectedColumns)
+    | none =>
+      let decode := spec.decode
+      rows.mapM fun values =>
+        if values.size = expectedColumns then
+          let materialized := values.materialize
+          decode catalog columns materialized
+        else
+          throw (dataRowArityError values.size expectedColumns)
+
+/-- Keep the compatible row callback outside the matching-bundle fast path.
+The specification width, rather than the mismatched bundle width, continues
+to guard every row before the callback runs. -/
+@[noinline] private def decodeManyRowsBundleWidthMismatch
+    (expectedColumns : Nat) (bundle : PreparedSpanDecoderBundle Row)
+    (plan : PreparedQueryPlan db) (columns : Array Pg.Protocol.ColumnDesc)
+    (rows : Array Pg.Protocol.DataRowSpans) : Except Error (Array Row) :=
+  guardedPreparedSpanRows expectedColumns bundle.row
+    plan.resolve plan.results columns rows
+
 /-- Select the generated prepared decoder once for a complete result batch.
 The row-arity guard deliberately remains inside each specialized map so a
 malformed row has the same error and left-to-right precedence as `decodeRow`.
-The fallback branches retain the same per-row materialization behavior. -/
+The fallback branches retain the same per-row materialization behavior.  The
+staged helpers also keep unused legacy and row callbacks out of the matching
+generated-bundle ownership path. -/
 private def decodeManyRowsCandidate (spec : QuerySpec db Params Row .many)
     (plan : PreparedQueryPlan db) (catalog : ResolvedCatalog db)
     (columns : Array Pg.Protocol.ColumnDesc)
@@ -163,30 +205,9 @@ private def decodeManyRowsCandidate (spec : QuerySpec db Params Row .many)
     if bundle.expectedColumns = expectedColumns then
       bundle.many plan.resolve plan.results columns rows
     else
-      guardedPreparedSpanRows expectedColumns bundle.row
-        plan.resolve plan.results columns rows
+      decodeManyRowsBundleWidthMismatch expectedColumns bundle plan columns rows
   | none =>
-    match spec.preparedSpanDecode with
-    | some decode =>
-      guardedPreparedSpanRows expectedColumns decode
-        plan.resolve plan.results columns rows
-    | none =>
-      match spec.preparedDecode with
-      | some decode =>
-        rows.mapM fun values =>
-          if values.size = expectedColumns then
-            let materialized := values.materialize
-            decode plan.resolve plan.results columns materialized
-          else
-            throw (dataRowArityError values.size expectedColumns)
-      | none =>
-        let decode := spec.decode
-        rows.mapM fun values =>
-          if values.size = expectedColumns then
-            let materialized := values.materialize
-            decode catalog columns materialized
-          else
-            throw (dataRowArityError values.size expectedColumns)
+    decodeManyRowsWithoutBundle expectedColumns spec plan catalog columns rows
 
 private theorem decodeManyRowsCandidate_eq_reference
     (spec : QuerySpec db Params Row .many) (plan : PreparedQueryPlan db)
@@ -204,12 +225,14 @@ private theorem decodeManyRowsCandidate_eq_reference
       funext values
       simp [decodeRow, bundleCase]
     · simp only [decodeManyRowsCandidate, bundleCase, expectedCase, ↓reduceIte]
+      unfold decodeManyRowsBundleWidthMismatch
       unfold guardedPreparedSpanRows decodeManyRowsReference
       apply congrArg (fun decode => rows.mapM decode)
       funext values
       simp [decodeRow, bundleCase]
   | none =>
     simp only [decodeManyRowsCandidate, decodeManyRowsReference, bundleCase]
+    unfold decodeManyRowsWithoutBundle
     split <;> rename_i spanCase
     · unfold guardedPreparedSpanRows
       apply congrArg (fun decode => rows.mapM decode)
