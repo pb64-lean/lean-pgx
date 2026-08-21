@@ -627,6 +627,9 @@ def main : IO UInt32 := do
     assert! sameResult
       (decodePlannedBuiltinSpan (α := Int32) Pg.Oid.int4 1 binarySpanRow 1)
       (decodePlannedBuiltinSpanAt (α := Int32) Pg.Oid.int4 1 binarySpanRow 1 h)
+    assert! sameResult
+      (decodePlannedBuiltinSpanAt (α := Int32) Pg.Oid.int4 1 binarySpanRow 1 h)
+      (decodePlannedBuiltinBinarySpanAt (α := Int32) Pg.Oid.int4 binarySpanRow 1 h)
   else
     throw (IO.userError "binary span fixture lost its decoded cell")
   assert! okEq
@@ -635,6 +638,10 @@ def main : IO UInt32 := do
     assert! sameResult
       (decodePlannedBuiltinSpan (α := Option Int32) Pg.Oid.int4 1 binarySpanRow 2)
       (decodePlannedBuiltinSpanAt (α := Option Int32) Pg.Oid.int4 1 binarySpanRow 2 h)
+    assert! sameResult
+      (decodePlannedBuiltinSpanAt (α := Option Int32) Pg.Oid.int4 1 binarySpanRow 2 h)
+      (decodePlannedBuiltinBinarySpanAt (α := Option Int32)
+        Pg.Oid.int4 binarySpanRow 2 h)
   else
     throw (IO.userError "binary span fixture lost its NULL cell")
   assert! isError
@@ -656,6 +663,9 @@ def main : IO UInt32 := do
     assert! sameResult
       (decodePlannedBuiltinSpan (α := SpanProbe) Pg.Oid.int8 1 probeRow 1)
       (decodePlannedBuiltinSpanAt (α := SpanProbe) Pg.Oid.int8 1 probeRow 1 h)
+    assert! sameResult
+      (decodePlannedBuiltinSpanAt (α := SpanProbe) Pg.Oid.int8 1 probeRow 1 h)
+      (decodePlannedBuiltinBinarySpanAt (α := SpanProbe) Pg.Oid.int8 probeRow 1 h)
   else
     throw (IO.userError "span-probe fixture lost its decoded cell")
   let malformedBinaryRow := Pg.Protocol.DataRowSpans.ofCells
@@ -665,8 +675,13 @@ def main : IO UInt32 := do
       decodePlannedBuiltinSpan (α := Int32) Pg.Oid.int4 1 malformedBinaryRow 0
     let candidate :=
       decodePlannedBuiltinSpanAt (α := Int32) Pg.Oid.int4 1 malformedBinaryRow 0 h
+    let fixedCandidate :=
+      decodePlannedBuiltinBinarySpanAt (α := Int32) Pg.Oid.int4 malformedBinaryRow 0 h
     assert! sameResult reference candidate
+    assert! sameResult candidate fixedCandidate
     assert! exactError candidate .decode
+      "row decoding failed: unexpected integer width 1"
+    assert! exactError fixedCandidate .decode
       "row decoding failed: unexpected integer width 1"
   else
     throw (IO.userError "malformed-binary fixture lost its decoded cell")
@@ -677,13 +692,24 @@ def main : IO UInt32 := do
       decodePlannedBuiltinSpan (α := String) Pg.Oid.text 0 invalidUtf8Row 0
     let candidate :=
       decodePlannedBuiltinSpanAt (α := String) Pg.Oid.text 0 invalidUtf8Row 0 h
+    let fixedCandidate :=
+      decodePlannedBuiltinTextSpanAt (α := String) Pg.Oid.text invalidUtf8Row 0 h
     assert! sameResult reference candidate
+    assert! sameResult candidate fixedCandidate
     assert! exactError candidate .decode
+      "row decoding failed: text value is not valid UTF-8"
+    assert! exactError fixedCandidate .decode
       "row decoding failed: text value is not valid UTF-8"
   else
     throw (IO.userError "invalid-UTF8 fixture lost its decoded cell")
   let textSpanRow := Pg.Protocol.DataRowSpans.ofCells
     #[some "ignored".toUTF8, some "42".toUTF8]
+  if h : 1 < textSpanRow.size then
+    assert! sameResult
+      (decodePlannedBuiltinSpanAt (α := Int32) Pg.Oid.int4 0 textSpanRow 1 h)
+      (decodePlannedBuiltinTextSpanAt (α := Int32) Pg.Oid.int4 textSpanRow 1 h)
+  else
+    throw (IO.userError "text span fixture lost its decoded cell")
   assert! okEq
     (decodePlannedSpan int4Codec resolveTestType
       { expected := int4Desc, oid := Pg.Oid.int4 } 0 textSpanRow 1) 42

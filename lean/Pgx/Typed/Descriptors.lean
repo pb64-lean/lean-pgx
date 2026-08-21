@@ -476,6 +476,48 @@ def decodePlannedBuiltinSpanAt [Pg.PgDecode α] [Pg.PgDecodeSpan α]
   | .ok decoded => pure decoded
   | .error message => throw (.decode message)
 
+/-- Decode a built-in binary-format result after generated batch dispatch has
+proved both that the column is present and that the prepared format is binary.
+The fixed-format pg-lean entry point preserves NULL and span validation while
+removing the per-cell format test. -/
+@[inline] def decodePlannedBuiltinBinarySpanAt [Pg.PgDecode α] [Pg.PgDecodeSpan α]
+    (typeOid : UInt32) (row : @& Pg.Protocol.DataRowSpans)
+    (index : Nat) (h : index < row.size) : Except Error α :=
+  match Pg.decodeDataRowBinaryAt (α := α) typeOid row index h with
+  | .ok decoded => pure decoded
+  | .error message => throw (.decode message)
+
+/-- Decode a built-in text-format result after generated batch dispatch has
+proved both that the column is present and that the prepared format is text.
+The fixed-format pg-lean entry point preserves NULL, span, and UTF-8 validation
+while removing the per-cell format test. -/
+@[inline] def decodePlannedBuiltinTextSpanAt [Pg.PgDecode α]
+    (typeOid : UInt32) (row : @& Pg.Protocol.DataRowSpans)
+    (index : Nat) (h : index < row.size) : Except Error α :=
+  match Pg.decodeDataRowTextAt (α := α) typeOid row index h with
+  | .ok decoded => pure decoded
+  | .error message => throw (.decode message)
+
+/-- Selecting a prepared result's binary format once per batch changes neither
+the decoded value nor PGX's exact `Error.decode` mapping. -/
+theorem decodePlannedBuiltinBinarySpanAt_eq_decodePlannedBuiltinSpanAt
+    [Pg.PgDecode α] [Pg.PgDecodeSpan α] (typeOid : UInt32)
+    (row : Pg.Protocol.DataRowSpans) (index : Nat) (h : index < row.size) :
+    decodePlannedBuiltinBinarySpanAt (α := α) typeOid row index h =
+      decodePlannedBuiltinSpanAt (α := α) typeOid 1 row index h := by
+  simp only [decodePlannedBuiltinBinarySpanAt, decodePlannedBuiltinSpanAt,
+    Pg.decodeDataRowBinaryAt_eq_decodeDataRowValueAt]
+
+/-- Selecting a prepared result's text format once per batch changes neither
+the decoded value nor PGX's exact `Error.decode` mapping. -/
+theorem decodePlannedBuiltinTextSpanAt_eq_decodePlannedBuiltinSpanAt
+    [Pg.PgDecode α] [Pg.PgDecodeSpan α] (typeOid : UInt32)
+    (row : Pg.Protocol.DataRowSpans) (index : Nat) (h : index < row.size) :
+    decodePlannedBuiltinTextSpanAt (α := α) typeOid row index h =
+      decodePlannedBuiltinSpanAt (α := α) typeOid 0 row index h := by
+  simp only [decodePlannedBuiltinTextSpanAt, decodePlannedBuiltinSpanAt,
+    Pg.decodeDataRowTextAt_eq_decodeDataRowValueAt]
+
 /-- Supplying the generated row-width proof changes neither decoded values nor
 the exact PGX error mapping. -/
 theorem decodePlannedBuiltinSpanAt_eq_decodePlannedBuiltinSpan
