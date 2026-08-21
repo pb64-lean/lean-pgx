@@ -537,6 +537,42 @@ structure PreparedQueryPlan (db : DatabaseDesc) where
   resultFormats : Array UInt16
   deriving Inhabited
 
+/-- Preserve the established malformed-row diagnostic at both the single-row
+and generated batch-decoder boundaries. -/
+@[inline] def dataRowArityError (actual expected : Nat) : Error :=
+  .queryDrift s!"data row has {actual} fields; expected {expected}"
+
+abbrev PreparedSpanRowDecoder (Row : Type) :=
+  TypeResolver → Array ResolvedType → Array Pg.Protocol.ColumnDesc →
+    Pg.Protocol.DataRowSpans → Except Error Row
+
+abbrev PreparedSpanBatchDecoder (Row : Type) :=
+  TypeResolver → Array ResolvedType → Array Pg.Protocol.ColumnDesc →
+    Array Pg.Protocol.DataRowSpans → Except Error (Array Row)
+
+/-- Decode retained rows left-to-right after preserving the public dynamic
+row-arity guard and its exact error. -/
+abbrev guardedPreparedSpanRows (expectedColumns : Nat)
+    (decode : PreparedSpanRowDecoder Row) (resolve : TypeResolver)
+    (types : Array ResolvedType) (columns : Array Pg.Protocol.ColumnDesc)
+    (rows : Array Pg.Protocol.DataRowSpans) : Except Error (Array Row) :=
+  rows.mapM fun values =>
+    if values.size = expectedColumns then
+      decode resolve types columns values
+    else
+      throw (dataRowArityError values.size expectedColumns)
+
+/-- A generated retained-span decoder and its proof-equivalent batch path.
+The explicit expected count keeps ordinary `QuerySpec` record updates
+source-compatible; the runtime checks it once before selecting `many`. -/
+structure PreparedSpanDecoderBundle (Row : Type) where
+  expectedColumns : Nat
+  row : PreparedSpanRowDecoder Row
+  many : PreparedSpanBatchDecoder Row
+  many_eq_guardedRow : ∀ resolve types columns rows,
+    many resolve types columns rows =
+      guardedPreparedSpanRows expectedColumns row resolve types columns rows
+
 structure QuerySpec (db : DatabaseDesc) (Params Row : Type)
     (cardinality : Pgx.Cardinality) where
   name : String
@@ -576,6 +612,11 @@ structure QuerySpec (db : DatabaseDesc) (Params Row : Type)
   preparedSpanDecode : Option (TypeResolver → Array ResolvedType →
     Array Pg.Protocol.ColumnDesc → Pg.Protocol.DataRowSpans →
     Except Error Row) := none
+  /-- Generated `.many` path that may cache checked result descriptors once per
+  batch.  The trailing default preserves record-literal compatibility for
+  legacy and manually authored specs. -/
+  preparedSpanDecoderBundle :
+    Option (PreparedSpanDecoderBundle Row) := none
 
 /-- Resolve the parameter descriptors once before Parse. -/
 def resolvePreparedParams (catalog : ResolvedCatalog db)

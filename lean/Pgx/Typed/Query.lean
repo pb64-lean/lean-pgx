@@ -128,17 +128,20 @@ private def runChecked (db : DatabaseDesc)
 private def decodeRow (spec : QuerySpec db Params Row cardinality)
     (plan : PreparedQueryPlan db)
     (catalog : ResolvedCatalog db) (columns : Array Pg.Protocol.ColumnDesc)
-    (values : Pg.Protocol.DataRowSpans) : Except Error Row := do
-  unless values.size == spec.columns.size do
-    throw (.queryDrift
-      s!"data row has {values.size} fields; expected {spec.columns.size}")
-  match spec.preparedSpanDecode with
-  | some decode => decode plan.resolve plan.results columns values
-  | none =>
-    let materialized := values.materialize
-    match spec.preparedDecode with
-    | some decode => decode plan.resolve plan.results columns materialized
-    | none => spec.decode catalog columns materialized
+    (values : Pg.Protocol.DataRowSpans) : Except Error Row :=
+  if values.size = spec.columns.size then
+    match spec.preparedSpanDecoderBundle with
+    | some bundle => bundle.row plan.resolve plan.results columns values
+    | none =>
+      match spec.preparedSpanDecode with
+      | some decode => decode plan.resolve plan.results columns values
+      | none =>
+        let materialized := values.materialize
+        match spec.preparedDecode with
+        | some decode => decode plan.resolve plan.results columns materialized
+        | none => spec.decode catalog columns materialized
+  else
+    throw (dataRowArityError values.size spec.columns.size)
 
 private def decodeManyRowsReference (spec : QuerySpec db Params Row .many)
     (plan : PreparedQueryPlan db) (catalog : ResolvedCatalog db)
@@ -155,30 +158,35 @@ private def decodeManyRowsCandidate (spec : QuerySpec db Params Row .many)
     (columns : Array Pg.Protocol.ColumnDesc)
     (rows : Array Pg.Protocol.DataRowSpans) : Except Error (Array Row) :=
   let expectedColumns := spec.columns.size
-  match spec.preparedSpanDecode with
-  | some decode =>
-    rows.mapM fun values => do
-      unless values.size == expectedColumns do
-        throw (.queryDrift
-          s!"data row has {values.size} fields; expected {expectedColumns}")
-      decode plan.resolve plan.results columns values
+  match spec.preparedSpanDecoderBundle with
+  | some bundle =>
+    if bundle.expectedColumns = expectedColumns then
+      bundle.many plan.resolve plan.results columns rows
+    else
+      guardedPreparedSpanRows expectedColumns bundle.row
+        plan.resolve plan.results columns rows
   | none =>
-    match spec.preparedDecode with
+    match spec.preparedSpanDecode with
     | some decode =>
-      rows.mapM fun values => do
-        unless values.size == expectedColumns do
-          throw (.queryDrift
-            s!"data row has {values.size} fields; expected {expectedColumns}")
-        let materialized := values.materialize
-        decode plan.resolve plan.results columns materialized
+      guardedPreparedSpanRows expectedColumns decode
+        plan.resolve plan.results columns rows
     | none =>
-      let decode := spec.decode
-      rows.mapM fun values => do
-        unless values.size == expectedColumns do
-          throw (.queryDrift
-            s!"data row has {values.size} fields; expected {expectedColumns}")
-        let materialized := values.materialize
-        decode catalog columns materialized
+      match spec.preparedDecode with
+      | some decode =>
+        rows.mapM fun values =>
+          if values.size = expectedColumns then
+            let materialized := values.materialize
+            decode plan.resolve plan.results columns materialized
+          else
+            throw (dataRowArityError values.size expectedColumns)
+      | none =>
+        let decode := spec.decode
+        rows.mapM fun values =>
+          if values.size = expectedColumns then
+            let materialized := values.materialize
+            decode catalog columns materialized
+          else
+            throw (dataRowArityError values.size expectedColumns)
 
 private theorem decodeManyRowsCandidate_eq_reference
     (spec : QuerySpec db Params Row .many) (plan : PreparedQueryPlan db)
@@ -186,18 +194,34 @@ private theorem decodeManyRowsCandidate_eq_reference
     (rows : Array Pg.Protocol.DataRowSpans) :
     decodeManyRowsCandidate spec plan catalog columns rows =
       decodeManyRowsReference spec plan catalog columns rows := by
-  unfold decodeManyRowsCandidate decodeManyRowsReference
-  split <;> rename_i spanCase
-  · apply congrArg (fun decode => rows.mapM decode)
-    funext values
-    simp [decodeRow, spanCase]
-  · split <;> rename_i preparedCase
-    · apply congrArg (fun decode => rows.mapM decode)
+  cases bundleCase : spec.preparedSpanDecoderBundle with
+  | some bundle =>
+    by_cases expectedCase : bundle.expectedColumns = spec.columns.size
+    · simp only [decodeManyRowsCandidate, bundleCase, expectedCase, ↓reduceIte]
+      rw [bundle.many_eq_guardedRow, expectedCase]
+      unfold guardedPreparedSpanRows decodeManyRowsReference
+      apply congrArg (fun decode => rows.mapM decode)
       funext values
-      simp [decodeRow, spanCase, preparedCase]
-    · apply congrArg (fun decode => rows.mapM decode)
+      simp [decodeRow, bundleCase]
+    · simp only [decodeManyRowsCandidate, bundleCase, expectedCase, ↓reduceIte]
+      unfold guardedPreparedSpanRows decodeManyRowsReference
+      apply congrArg (fun decode => rows.mapM decode)
       funext values
-      simp [decodeRow, spanCase, preparedCase]
+      simp [decodeRow, bundleCase]
+  | none =>
+    simp only [decodeManyRowsCandidate, decodeManyRowsReference, bundleCase]
+    split <;> rename_i spanCase
+    · unfold guardedPreparedSpanRows
+      apply congrArg (fun decode => rows.mapM decode)
+      funext values
+      simp [decodeRow, bundleCase, spanCase]
+    · split <;> rename_i preparedCase
+      · apply congrArg (fun decode => rows.mapM decode)
+        funext values
+        simp [decodeRow, bundleCase, spanCase, preparedCase]
+      · apply congrArg (fun decode => rows.mapM decode)
+        funext values
+        simp [decodeRow, bundleCase, spanCase, preparedCase]
 
 namespace PreparedRowDispatchBenchmark
 

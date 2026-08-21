@@ -2957,6 +2957,49 @@ private def decodePlannedSpanValueExpr (plan : NamingPlan) (db : Pgx.DatabaseIR)
       pure s!"Pgx.Typed.decodePlannedBuiltinSpanAt {column}.typeOid \
         {column}.format values {index} (by omega)"
 
+private structure PreparedSpanCachedColumn where
+  parameter : String
+  bindings : List String
+  arguments : String
+  decodeExpr : String
+  deriving Inhabited
+
+/-- Describe the actual checked portal values that a generated `.many`
+decoder may retain as loop invariants.  Built-ins need the runtime OID and
+format; custom codecs need their resolved descriptor and runtime format. -/
+private def preparedSpanCachedColumn (plan : NamingPlan) (db : Pgx.DatabaseIR)
+    (ref : Pgx.TypeRef) (nullable : Bool) (index : Nat) :
+    Except CodegenError PreparedSpanCachedColumn := do
+  let use ← resolveTypeUse plan db ref.key
+  let column := s!"column{index}"
+  let format := s!"format{index}"
+  match codecExpr use nullable with
+  | some codec =>
+      let resolved := s!"resolved{index}"
+      pure {
+        parameter :=
+          s!"    ({resolved} : Pgx.Typed.ResolvedType) ({format} : UInt16)"
+        bindings := [
+          s!"let {resolved} := types[{index}]!",
+          s!"let {format} := {column}.format"
+        ]
+        arguments := s!"{resolved} {format}"
+        decodeExpr := s!"Pgx.Typed.decodePlannedSpan {codec} resolve {resolved} \
+          {format} values {index}"
+      }
+  | none =>
+      let typeOid := s!"typeOid{index}"
+      pure {
+        parameter := s!"    ({typeOid} : UInt32) ({format} : UInt16)"
+        bindings := [
+          s!"let {typeOid} := {column}.typeOid",
+          s!"let {format} := {column}.format"
+        ]
+        arguments := s!"{typeOid} {format}"
+        decodeExpr := s!"Pgx.Typed.decodePlannedBuiltinSpanAt {typeOid} \
+          {format} values {index} (by omega)"
+      }
+
 private partial def domainChainAux (db : Pgx.DatabaseIR) (key : Pgx.TypeKey)
     (seen : Array Pgx.TypeKey) : Except CodegenError (Array Pgx.DomainIR) := do
   if seen.contains key then throw (.cyclicDomain key)
@@ -3203,54 +3246,182 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
   lines := lines ++ [
     "  match validate rowData with",
     "  | .ok refined => pure refined",
-    "  | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)",
-    "",
-    "private def decodePreparedSpanRow",
-    "    (resolve : Pgx.Typed.TypeResolver)",
-    "    (types : Array Pgx.Typed.ResolvedType)",
-    "    (columns : Array Pg.Protocol.ColumnDesc)",
-    "    (values : Pg.Protocol.DataRowSpans) : Except Pgx.Typed.Error Row := do",
-    "  let _ := resolve",
-    "  let _ := types",
-    s!"  if hColumns : columns.size = {query.columns.size} then",
-    s!"    if hValues : values.size = {query.columns.size} then"
+    "  | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)"
   ]
-  if query.columns.isEmpty then
-    -- Empty-result commands still establish both ordered arity facts, but
-    -- have no proof-indexed accesses through which the facts would be used.
-    lines := lines ++ ["      let _ := hColumns", "      let _ := hValues"]
-  let mut preparedSpanDecodedNames : Array String := #[]
-  for i in [0:query.columns.size] do
-    let column := query.columns[i]!
-    let wireName := s!"decodedWire{i}"
+  match query.cardinality with
+  | .many =>
+    let mut cachedSpanColumns : Array PreparedSpanCachedColumn := #[]
+    for i in [0:query.columns.size] do
+      let column := query.columns[i]!
+      cachedSpanColumns := cachedSpanColumns.push (← preparedSpanCachedColumn plan db
+        column.ty column.nullable i)
+    let coreCallParts := ["decodePreparedSpanRowCore", "resolve"] ++
+      cachedSpanColumns.toList.map (fun cached => cached.arguments) ++
+      ["values", "hValues"]
+    let coreCall := String.intercalate " " coreCallParts
     lines := lines ++ [
-      s!"      let column{i} := columns[{i}]'(by omega)",
-      s!"      let {wireName} ← {← decodePlannedSpanValueExpr plan db
-        column.ty column.nullable s!"types[{i}]!" i}"
+      "",
+      "@[inline] private def decodePreparedSpanRowCore",
+      "    (resolve : Pgx.Typed.TypeResolver)"
     ]
-    match column.logicalType with
-    | none => preparedSpanDecodedNames := preparedSpanDecodedNames.push wireName
-    | some _ =>
-        let decodedName := s!"decoded{i}"
-        preparedSpanDecodedNames := preparedSpanDecodedNames.push decodedName
-        let refined ← refineLogicalColumnExpression plan db column wireName
-          s!"query {query.name} result {column.name}"
-        lines := lines ++ [s!"      let {decodedName} ← {refined}"]
-  if query.columns.isEmpty then
-    lines := lines ++ ["      let rowData : RowData := RowData.mk"]
-  else
-    let assignments := Array.range query.columns.size |>.map fun i =>
-      columnNames[i]! ++ " := " ++ preparedSpanDecodedNames[i]!
-    lines := lines ++ ["      let rowData : RowData := { " ++ commaSep assignments ++ " }"]
-  lines := lines ++ [
-    "      match validate rowData with",
-    "      | .ok refined => pure refined",
-    "      | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)",
-    "    else",
-    s!"      throw (.queryDrift \"generated decoder expected {query.columns.size} row values\")",
-    "  else",
-    s!"    throw (.queryDrift \"generated decoder expected {query.columns.size} column descriptors\")"
-  ]
+    for cached in cachedSpanColumns do
+      lines := lines ++ [cached.parameter]
+    lines := lines ++ [
+      "    (values : Pg.Protocol.DataRowSpans)",
+      s!"    (hValues : values.size = {query.columns.size}) : Except Pgx.Typed.Error Row := do",
+      "  let _ := resolve"
+    ]
+    let mut preparedSpanDecodedNames : Array String := #[]
+    for i in [0:query.columns.size] do
+      let column := query.columns[i]!
+      let wireName := s!"decodedWire{i}"
+      lines := lines ++ [s!"  let {wireName} ← {cachedSpanColumns[i]!.decodeExpr}"]
+      match column.logicalType with
+      | none => preparedSpanDecodedNames := preparedSpanDecodedNames.push wireName
+      | some _ =>
+          let decodedName := s!"decoded{i}"
+          preparedSpanDecodedNames := preparedSpanDecodedNames.push decodedName
+          let refined ← refineLogicalColumnExpression plan db column wireName
+            s!"query {query.name} result {column.name}"
+          lines := lines ++ [s!"  let {decodedName} ← {refined}"]
+    if query.columns.isEmpty then
+      lines := lines ++ ["  let rowData : RowData := RowData.mk"]
+    else
+      let assignments := Array.range query.columns.size |>.map fun i =>
+        columnNames[i]! ++ " := " ++ preparedSpanDecodedNames[i]!
+      lines := lines ++ ["  let rowData : RowData := { " ++ commaSep assignments ++ " }"]
+    lines := lines ++ [
+      "  match validate rowData with",
+      "  | .ok refined => pure refined",
+      "  | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)",
+      "",
+      "private def decodePreparedSpanRow",
+      "    (resolve : Pgx.Typed.TypeResolver)",
+      "    (types : Array Pgx.Typed.ResolvedType)",
+      "    (columns : Array Pg.Protocol.ColumnDesc)",
+      "    (values : Pg.Protocol.DataRowSpans) : Except Pgx.Typed.Error Row := do",
+      "  let _ := resolve",
+      "  let _ := types",
+      s!"  if hColumns : columns.size = {query.columns.size} then",
+      s!"    if hValues : values.size = {query.columns.size} then"
+    ]
+    if query.columns.isEmpty then
+      lines := lines ++ ["      let _ := hColumns", "      let _ := hValues"]
+    for i in [0:query.columns.size] do
+      lines := lines ++ [s!"      let column{i} := columns[{i}]'(by omega)"]
+      for binding in cachedSpanColumns[i]!.bindings do
+        lines := lines ++ ["      " ++ binding]
+    lines := lines ++ [
+      "      " ++ coreCall,
+      "    else",
+      s!"      throw (.queryDrift \"generated decoder expected {query.columns.size} row values\")",
+      "  else",
+      s!"    throw (.queryDrift \"generated decoder expected {query.columns.size} column descriptors\")",
+      "",
+      "private def decodePreparedSpanRows",
+      "    (resolve : Pgx.Typed.TypeResolver)",
+      "    (types : Array Pgx.Typed.ResolvedType)",
+      "    (columns : Array Pg.Protocol.ColumnDesc)",
+      "    (rows : Array Pg.Protocol.DataRowSpans) : Except Pgx.Typed.Error (Array Row) :=",
+      "  let _ := types",
+      s!"  if hColumns : columns.size = {query.columns.size} then"
+    ]
+    if query.columns.isEmpty then
+      lines := lines ++ ["    let _ := hColumns"]
+    for i in [0:query.columns.size] do
+      lines := lines ++ [s!"    let column{i} := columns[{i}]'(by omega)"]
+      for binding in cachedSpanColumns[i]!.bindings do
+        lines := lines ++ ["    " ++ binding]
+    lines := lines ++ [
+      "    rows.mapM fun values =>",
+      s!"      if hValues : values.size = {query.columns.size} then",
+      "        " ++ coreCall,
+      "      else",
+      s!"        throw (Pgx.Typed.dataRowArityError values.size {query.columns.size})",
+      "  else",
+      "    rows.mapM fun values =>",
+      s!"      if values.size = {query.columns.size} then",
+      s!"        throw (.queryDrift \"generated decoder expected {query.columns.size} column descriptors\")",
+      "      else",
+      s!"        throw (Pgx.Typed.dataRowArityError values.size {query.columns.size})",
+      "",
+      "private theorem decodePreparedSpanRows_eq_guarded",
+      "    (resolve : Pgx.Typed.TypeResolver)",
+      "    (types : Array Pgx.Typed.ResolvedType)",
+      "    (columns : Array Pg.Protocol.ColumnDesc)",
+      "    (rows : Array Pg.Protocol.DataRowSpans) :",
+      "    decodePreparedSpanRows resolve types columns rows =",
+      s!"      Pgx.Typed.guardedPreparedSpanRows {query.columns.size} decodePreparedSpanRow",
+      "        resolve types columns rows := by",
+      "  unfold decodePreparedSpanRows Pgx.Typed.guardedPreparedSpanRows",
+      s!"  by_cases hColumns : columns.size = {query.columns.size}",
+      "  · rw [dif_pos hColumns]",
+      "    apply congrArg (fun decode => rows.mapM decode)",
+      "    funext values",
+      s!"    by_cases hValues : values.size = {query.columns.size} <;>",
+      "      simp [decodePreparedSpanRow, hColumns, hValues]",
+      "  · rw [dif_neg hColumns]",
+      "    apply congrArg (fun decode => rows.mapM decode)",
+      "    funext values",
+      s!"    by_cases hValues : values.size = {query.columns.size} <;>",
+      "      simp [decodePreparedSpanRow, hColumns, hValues]",
+      "",
+      "private def preparedSpanDecoderBundle : Pgx.Typed.PreparedSpanDecoderBundle Row := {",
+      s!"  expectedColumns := {query.columns.size}",
+      "  row := decodePreparedSpanRow",
+      "  many := decodePreparedSpanRows",
+      "  many_eq_guardedRow := decodePreparedSpanRows_eq_guarded",
+      "}"
+    ]
+  | _ =>
+    lines := lines ++ [
+      "",
+      "private def decodePreparedSpanRow",
+      "    (resolve : Pgx.Typed.TypeResolver)",
+      "    (types : Array Pgx.Typed.ResolvedType)",
+      "    (columns : Array Pg.Protocol.ColumnDesc)",
+      "    (values : Pg.Protocol.DataRowSpans) : Except Pgx.Typed.Error Row := do",
+      "  let _ := resolve",
+      "  let _ := types",
+      s!"  if hColumns : columns.size = {query.columns.size} then",
+      s!"    if hValues : values.size = {query.columns.size} then"
+    ]
+    if query.columns.isEmpty then
+      -- Empty-result commands still establish both ordered arity facts, but
+      -- have no proof-indexed accesses through which the facts would be used.
+      lines := lines ++ ["      let _ := hColumns", "      let _ := hValues"]
+    let mut preparedSpanDecodedNames : Array String := #[]
+    for i in [0:query.columns.size] do
+      let column := query.columns[i]!
+      let wireName := s!"decodedWire{i}"
+      lines := lines ++ [
+        s!"      let column{i} := columns[{i}]'(by omega)",
+        s!"      let {wireName} ← {← decodePlannedSpanValueExpr plan db
+          column.ty column.nullable s!"types[{i}]!" i}"
+      ]
+      match column.logicalType with
+      | none => preparedSpanDecodedNames := preparedSpanDecodedNames.push wireName
+      | some _ =>
+          let decodedName := s!"decoded{i}"
+          preparedSpanDecodedNames := preparedSpanDecodedNames.push decodedName
+          let refined ← refineLogicalColumnExpression plan db column wireName
+            s!"query {query.name} result {column.name}"
+          lines := lines ++ [s!"      let {decodedName} ← {refined}"]
+    if query.columns.isEmpty then
+      lines := lines ++ ["      let rowData : RowData := RowData.mk"]
+    else
+      let assignments := Array.range query.columns.size |>.map fun i =>
+        columnNames[i]! ++ " := " ++ preparedSpanDecodedNames[i]!
+      lines := lines ++ ["      let rowData : RowData := { " ++ commaSep assignments ++ " }"]
+    lines := lines ++ [
+      "      match validate rowData with",
+      "      | .ok refined => pure refined",
+      "      | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)",
+      "    else",
+      s!"      throw (.queryDrift \"generated decoder expected {query.columns.size} row values\")",
+      "  else",
+      s!"    throw (.queryDrift \"generated decoder expected {query.columns.size} column descriptors\")"
+    ]
   lines := lines ++ [
     "",
     s!"/-- Static SQL, descriptor, codec, and cardinality contract for `{query.name}`. -/",
@@ -3267,7 +3438,13 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
     "  decode := decodeRow",
     "  preparedEncode := some encodePreparedParams",
     "  preparedDecode := some decodePreparedRow",
-    "  preparedSpanDecode := some decodePreparedSpanRow",
+    "  preparedSpanDecode := some decodePreparedSpanRow"
+  ]
+  if query.cardinality == .many then
+    lines := lines ++ [
+      "  preparedSpanDecoderBundle := some preparedSpanDecoderBundle"
+    ]
+  lines := lines ++ [
     "}",
     "",
     s!"/-- Execute `{query.name}` through a descriptor-checked prepared statement. -/",

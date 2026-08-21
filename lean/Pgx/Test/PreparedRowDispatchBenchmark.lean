@@ -256,6 +256,153 @@ private def validateSemantics (catalog : ResolvedCatalog database) : IO Nat := d
       throw (IO.userError s!"{fixture.label}: reference and candidate differ")
   pure semanticCases.size
 
+private def bundleDecode (_ : TypeResolver) (_ : Array ResolvedType)
+    (columns : Array Pg.Protocol.ColumnDesc) (row : Pg.Protocol.DataRowSpans) :
+    Except Error DecodedRow := do
+  unless columns.size == expectedColumns.size do
+    throw (.queryDrift
+      s!"prepared bundle has {columns.size} columns; expected {expectedColumns.size}")
+  let cells := row.materialize
+  rejectSentinel cells
+  pure { path := 4, cells, escaped := some row }
+
+private def decoderBundle (bundleExpectedColumns : Nat) :
+    PreparedSpanDecoderBundle DecodedRow := {
+  expectedColumns := bundleExpectedColumns
+  row := bundleDecode
+  many := guardedPreparedSpanRows bundleExpectedColumns bundleDecode
+  many_eq_guardedRow := by
+    intro resolve types columns rows
+    rfl
+}
+
+private def bundleSpecFor (bundleExpectedColumns : Nat) :
+    QuerySpec database Unit DecodedRow .many := {
+  specFor .span with
+  name := s!"bundle-{bundleExpectedColumns}"
+  contractHash := s!"bundle-{bundleExpectedColumns}"
+  preparedSpanDecoderBundle := some (decoderBundle bundleExpectedColumns)
+}
+
+private structure BundleSemanticCase where
+  label : String
+  bundleExpectedColumns : Nat
+  columns : Array Pg.Protocol.ColumnDesc
+  rows : Array (Array (Option ByteArray))
+  expected : ResultSnapshot
+
+private def malformedRow : Array (Option ByteArray) :=
+  #[some "short".toUTF8]
+
+private def sentinelRow : Array (Option ByteArray) :=
+  #[some sentinel, none]
+
+private def bundleSemanticCases : Array BundleSemanticCase := #[
+  {
+    label := "bundle-priority-over-legacy-callbacks"
+    bundleExpectedColumns := 2
+    columns := actualColumns
+    rows := successCells
+    expected := expectedSuccess 4 true successCells
+  },
+  {
+    label := "bundle-expected-columns-less-than-spec"
+    bundleExpectedColumns := 1
+    columns := actualColumns
+    rows := successCells
+    expected := expectedSuccess 4 true successCells
+  },
+  {
+    label := "bundle-expected-columns-greater-than-spec"
+    bundleExpectedColumns := 3
+    columns := actualColumns
+    rows := successCells
+    expected := expectedSuccess 4 true successCells
+  },
+  {
+    label := "bundle-width-row-less-than-spec"
+    bundleExpectedColumns := 1
+    columns := actualColumns
+    rows := #[#[some "bundle-width-one".toUTF8]]
+    expected := .error .queryDrift
+      "query drift: data row has 1 fields; expected 2"
+  },
+  {
+    label := "bundle-width-row-greater-than-spec"
+    bundleExpectedColumns := 3
+    columns := actualColumns
+    rows := #[#[some "bundle-width-three".toUTF8, none, none]]
+    expected := .error .queryDrift
+      "query drift: data row has 3 fields; expected 2"
+  },
+  {
+    label := "bad-columns-empty-batch"
+    bundleExpectedColumns := 2
+    columns := actualColumns.take 1
+    rows := #[]
+    expected := .ok #[]
+  },
+  {
+    label := "bad-columns-malformed-first-row"
+    bundleExpectedColumns := 2
+    columns := actualColumns.take 1
+    rows := #[malformedRow]
+    expected := .error .queryDrift
+      "query drift: data row has 1 fields; expected 2"
+  },
+  {
+    label := "bad-columns-valid-first-row"
+    bundleExpectedColumns := 2
+    columns := actualColumns.take 1
+    rows := #[successCells[0]!]
+    expected := .error .queryDrift
+      "query drift: prepared bundle has 1 columns; expected 2"
+  },
+  {
+    label := "later-malformed-row"
+    bundleExpectedColumns := 2
+    columns := actualColumns
+    rows := #[successCells[0]!, malformedRow]
+    expected := .error .queryDrift
+      "query drift: data row has 1 fields; expected 2"
+  },
+  {
+    label := "earlier-decode-error-precedes-later-malformed-row"
+    bundleExpectedColumns := 2
+    columns := actualColumns
+    rows := #[sentinelRow, malformedRow]
+    expected := .error .decode
+      "row decoding failed: prepared row dispatch sentinel"
+  }
+]
+
+private def validateBundleSemantics (catalog : ResolvedCatalog database) : IO Nat := do
+  for fixture in bundleSemanticCases do
+    let bundle := decoderBundle fixture.bundleExpectedColumns
+    let spec := bundleSpecFor fixture.bundleExpectedColumns
+    let rows := spanRows fixture.rows
+    let reference := snapshot <|
+      decodeReference spec plan catalog fixture.columns rows
+    let candidate := snapshot <|
+      decodeCandidate spec plan catalog fixture.columns rows
+    let directMany := snapshot <|
+      bundle.many plan.resolve plan.results fixture.columns rows
+    let guardedRows := snapshot <|
+      guardedPreparedSpanRows bundle.expectedColumns bundle.row
+        plan.resolve plan.results fixture.columns rows
+    unless reference == fixture.expected do
+      throw (IO.userError
+        s!"{fixture.label}: reference differs from expected: {reprStr reference}")
+    unless candidate == fixture.expected do
+      throw (IO.userError
+        s!"{fixture.label}: candidate differs from expected: {reprStr candidate}")
+    unless reference == candidate do
+      throw (IO.userError s!"{fixture.label}: reference and candidate differ")
+    unless directMany == guardedRows do
+      throw (IO.userError
+        s!"{fixture.label}: bundle many and guarded row decoder differ")
+  pure bundleSemanticCases.size
+
 private def benchmarkSpanDecode (_ : TypeResolver) (_ : Array ResolvedType)
     (_ : Array Pg.Protocol.ColumnDesc) (row : Pg.Protocol.DataRowSpans) :
     Except Error Nat :=
@@ -375,7 +522,8 @@ def runMain (args : List String) : IO Unit := do
   unless pageSize == 1 || pageSize == 55 do
     throw (IO.userError "page size must be 1 or 55")
   let catalog ← expectOk "catalog fixture" catalogResult
-  let cases ← validateSemantics catalog
+  let legacyCases ← validateSemantics catalog
+  let bundleCases ← validateBundleSemantics catalog
   let spec := benchmarkSpecFor decoderMode
   let rows := Array.replicate pageSize fixtureRow
   let expectedWarmup := UInt64.ofNat (pageSize * 2 * warmup)
@@ -390,8 +538,8 @@ def runMain (args : List String) : IO Unit := do
     throw (IO.userError "measured checksum mismatch")
   IO.println <| s!"benchmark=pgx_prepared_row_dispatch_v1 mode={modeName} decoder={decoderName} " ++
     s!"page_size={pageSize} iterations={iterations} warmup={warmup} checksum={checksum}"
-  IO.println <| s!"prepared_row_dispatch_validation=pass cases={cases} " ++
-    "callbacks=span,prepared,generic malformed=pass first_error=pass escape=pass"
+  IO.println <| s!"prepared_row_dispatch_validation=pass cases={legacyCases + bundleCases} " ++
+    "callbacks=bundle,span,prepared,generic malformed=pass first_error=pass escape=pass"
 
 end Pgx.Typed.PreparedRowDispatchBenchmarkHarness
 

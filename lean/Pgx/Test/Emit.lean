@@ -259,7 +259,7 @@ private def binaryFormatFixture : DatabaseIR := {
     ]
     columns := #[
       { name := "count", ty := int4, nullable := false },
-      { name := "label", ty := citext, nullable := false }
+      { name := "label", ty := citext, nullable := true }
     ]
     cardinality := .many
   }
@@ -869,6 +869,8 @@ def main : IO UInt32 := do
   assert! getUser.contents.contains "preparedEncode := some encodePreparedParams"
   assert! getUser.contents.contains "preparedDecode := some decodePreparedRow"
   assert! getUser.contents.contains "preparedSpanDecode := some decodePreparedSpanRow"
+  assert! !(getUser.contents.contains
+    "preparedSpanDecoderBundle := some preparedSpanDecoderBundle")
   assert! getUser.contents.contains
     "(values : Pg.Protocol.DataRowSpans) : Except Pgx.Typed.Error Row"
   assert! getUser.contents.contains
@@ -908,16 +910,38 @@ def main : IO UInt32 := do
     | throw (IO.userError "missing generated DeleteUser module")
   assert! deleteUser.contents.contains
     "if hColumns : columns.size = 0 then\n    if hValues : values.size = 0 then\n      let _ := hColumns\n      let _ := hValues"
+  assert! !(deleteUser.contents.contains
+    "preparedSpanDecoderBundle := some preparedSpanDecoderBundle")
   let some listUsers := sources.findModule? "AppDb.Queries.ListUsers"
     | throw (IO.userError "missing generated ListUsers module")
   assert! listUsers.contents.contains "email : Option (AppDb.Types.AppEmailAddress)"
   assert! listUsers.contents.contains "| none => pure none"
   assert! listUsers.contents.contains "| some present => some <$> (do"
   assert! listUsers.contents.contains "resultFormats := #[1, 0, 0]"
+  -- `.many` queries cache the checked runtime descriptors once per result
+  -- batch and publish a proof-backed row/batch decoder bundle.  The cached
+  -- values deliberately come from the actual portal columns, not static IR.
+  assert! listUsers.contents.contains "private def decodePreparedSpanRowCore"
+  assert! listUsers.contents.contains "private def decodePreparedSpanRows"
+  assert! listUsers.contents.contains
+    "theorem decodePreparedSpanRows_eq_guarded"
+  assert! listUsers.contents.contains "private def preparedSpanDecoderBundle"
+  assert! listUsers.contents.contains
+    "preparedSpanDecoderBundle := some preparedSpanDecoderBundle"
+  assert! listUsers.contents.contains "let typeOid0 := column0.typeOid"
+  assert! listUsers.contents.contains "let format0 := column0.format"
+  assert! listUsers.contents.contains "let resolved2 := types[2]!"
+  assert! listUsers.contents.contains "let format2 := column2.format"
+  assert! listUsers.contents.contains
+    "Pgx.Typed.decodePlannedBuiltinSpanAt typeOid0 format0 values 0"
+  assert! listUsers.contents.contains
+    "Pgx.Typed.decodePlannedSpan AppDb.Types.AppUserStatus.codec resolve resolved2 format2 values 2"
   let some countUsers := sources.findModule? "AppDb.Queries.CountUsers"
     | throw (IO.userError "missing generated CountUsers module")
   assert! countUsers.contents.contains "resultFormats := #[1]"
   assert! !(countUsers.contents.contains "def countUInt64")
+  assert! !(countUsers.contents.contains
+    "preparedSpanDecoderBundle := some preparedSpanDecoderBundle")
 
   -- Range recognition covers reversed operands, contradictory bounds and
   -- nullable SQL-unknown semantics.  Multiple recognized facts for `id`
@@ -939,7 +963,7 @@ def main : IO UInt32 := do
   assert! mixedFormats.contents.contains "Pg.binaryInt16 params.rank"
   assert! mixedFormats.contents.contains "resultFormats := #[1, 0]"
   assert! mixedFormats.contents.contains
-    "decodeResolved External.citextCodec"
+    "decodeResolved (External.citextCodec).option"
   assert! mixedFormats.contents.contains
     "Pg.PgEncode.encode (Option.map Pg.binaryInt32 params.count)"
   assert! mixedFormats.contents.contains
@@ -954,15 +978,19 @@ def main : IO UInt32 := do
     "formats := #[Pgx.Typed.plannedBuiltinFormat (Option.map Pg.binaryInt32 params.count), Pgx.Typed.plannedBuiltinFormat (Pg.binaryInt16 params.rank)]"
   assert! !(mixedFormats.contents.contains "encodePlannedBuiltin")
   assert! mixedFormats.contents.contains
-    "decodePlanned External.citextCodec resolve types[1]!"
+    "decodePlanned (External.citextCodec).option resolve types[1]!"
   assert! mixedFormats.contents.contains
     "let column0 := columns[0]'(by omega)"
+  assert! mixedFormats.contents.contains "let typeOid0 := column0.typeOid"
+  assert! mixedFormats.contents.contains "let format0 := column0.format"
   assert! mixedFormats.contents.contains
-    "decodePlannedBuiltinSpanAt column0.typeOid column0.format values 0 (by omega)"
+    "decodePlannedBuiltinSpanAt typeOid0 format0 values 0 (by omega)"
   assert! mixedFormats.contents.contains
     "let column1 := columns[1]'(by omega)"
+  assert! mixedFormats.contents.contains "let resolved1 := types[1]!"
+  assert! mixedFormats.contents.contains "let format1 := column1.format"
   assert! mixedFormats.contents.contains
-    "decodePlannedSpan External.citextCodec resolve types[1]! column1.format values 1"
+    "decodePlannedSpan (External.citextCodec).option resolve resolved1 format1 values 1"
 
   -- Source contracts remain symbolic and unsupported types are hard errors.
   for source in sources.all do

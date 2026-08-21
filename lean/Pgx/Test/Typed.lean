@@ -617,6 +617,7 @@ def main : IO UInt32 := do
   assert! okEq (decodeOwnedPlannedBytea (some escapedBytea)) escapedBytea
   assert! legacyPreparedSpec.preparedDecode.isSome
   assert! legacyPreparedSpec.preparedSpanDecode.isNone
+  assert! legacyPreparedSpec.preparedSpanDecoderBundle.isNone
   let binarySpanRow := Pg.Protocol.DataRowSpans.ofCells
     #[some "prefix".toUTF8,
       some (Pg.Protocol.putUInt32 ByteArray.empty (UInt32.ofNat 42)), none]
