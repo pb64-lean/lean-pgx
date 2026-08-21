@@ -249,20 +249,38 @@ private def generated : Except CodegenError GeneratedSources :=
 
 private def binaryFormatFixture : DatabaseIR := {
   fixture with
-  queries := fixture.queries.push {
-    name := "MixedFormats"
-    sql := "SELECT $1::int4 AS count, label::ext.citext FROM app.labels WHERE rank = $2"
-    sqlHash := "mixed-formats-v1"
-    params := #[
-      { position := 1, name := "count", ty := int4, nullable := true },
-      { position := 2, name := "rank", ty := int2, nullable := false }
-    ]
-    columns := #[
-      { name := "count", ty := int4, nullable := false },
-      { name := "label", ty := citext, nullable := true }
-    ]
-    cardinality := .many
-  }
+  queries := fixture.queries ++ #[
+    {
+      name := "MixedFormats"
+      sql := "SELECT $1::int4 AS count, label::ext.citext FROM app.labels WHERE rank = $2"
+      sqlHash := "mixed-formats-v1"
+      params := #[
+        { position := 1, name := "count", ty := int4, nullable := true },
+        { position := 2, name := "rank", ty := int2, nullable := false }
+      ]
+      columns := #[
+        { name := "count", ty := int4, nullable := false },
+        { name := "label", ty := citext, nullable := true }
+      ]
+      cardinality := .many
+    },
+    {
+      name := "AllTextFormats"
+      sql := "SELECT 'text'::text AS value"
+      sqlHash := "all-text-formats-v1"
+      params := #[]
+      columns := #[{ name := "value", ty := text, nullable := false }]
+      cardinality := .many
+    },
+    {
+      name := "AllBinaryFormats"
+      sql := "SELECT 1::int8 AS value"
+      sqlHash := "all-binary-formats-v1"
+      params := #[]
+      columns := #[{ name := "value", ty := int8, nullable := false }]
+      cardinality := .many
+    }
+  ]
 }
 
 private def int8Scalar : Pgx.Constraint.ScalarType := scalar int8 .int64
@@ -925,6 +943,8 @@ def main : IO UInt32 := do
   assert! listUsers.contents.contains "private def decodePreparedSpanRows"
   assert! listUsers.contents.contains
     "theorem decodePreparedSpanRows_eq_guarded"
+  assert! listUsers.contents.contains
+    "theorem decodePreparedSpanRowPreferred_eq_core"
   assert! listUsers.contents.contains "private def preparedSpanDecoderBundle"
   assert! listUsers.contents.contains
     "preparedSpanDecoderBundle := some preparedSpanDecoderBundle"
@@ -935,7 +955,13 @@ def main : IO UInt32 := do
   assert! listUsers.contents.contains
     "Pgx.Typed.decodePlannedBuiltinSpanAt typeOid0 format0 values 0"
   assert! listUsers.contents.contains
+    "Pgx.Typed.decodePlannedBuiltinBinarySpanAt typeOid0 values 0"
+  assert! listUsers.contents.contains
+    "Pgx.Typed.decodePlannedBuiltinTextSpanAt typeOid1 values 1"
+  assert! listUsers.contents.contains
     "Pgx.Typed.decodePlannedSpan AppDb.Types.AppUserStatus.codec resolve resolved2 format2 values 2"
+  assert! listUsers.contents.contains
+    "if hFormats : format0 = 1 ∧ format1 = 0 then"
   let some countUsers := sources.findModule? "AppDb.Queries.CountUsers"
     | throw (IO.userError "missing generated CountUsers module")
   assert! countUsers.contents.contains "resultFormats := #[1]"
@@ -991,6 +1017,28 @@ def main : IO UInt32 := do
   assert! mixedFormats.contents.contains "let format1 := column1.format"
   assert! mixedFormats.contents.contains
     "decodePlannedSpan (External.citextCodec).option resolve resolved1 format1 values 1"
+  assert! mixedFormats.contents.contains
+    "decodePlannedBuiltinBinarySpanAt typeOid0 values 0 (by omega)"
+  assert! mixedFormats.contents.contains
+    "if hFormats : format0 = 1 then"
+  assert! !(mixedFormats.contents.contains
+    "if hFormats : format0 = 1 ∧ format1 = 0 then")
+  assert! mixedFormats.contents.contains
+    "decodePreparedSpanRowCore resolve typeOid0 format0 resolved1 format1 values hValues"
+  let some allTextFormats := binaryFormatSources.findModule?
+      "AppDb.Queries.AllTextFormats"
+    | throw (IO.userError "missing generated AllTextFormats module")
+  assert! allTextFormats.contents.contains "resultFormats := #[]"
+  assert! allTextFormats.contents.contains "if hFormats : format0 = 0 then"
+  assert! allTextFormats.contents.contains
+    "decodePlannedBuiltinTextSpanAt typeOid0 values 0 (by omega)"
+  let some allBinaryFormats := binaryFormatSources.findModule?
+      "AppDb.Queries.AllBinaryFormats"
+    | throw (IO.userError "missing generated AllBinaryFormats module")
+  assert! allBinaryFormats.contents.contains "resultFormats := #[1]"
+  assert! allBinaryFormats.contents.contains "if hFormats : format0 = 1 then"
+  assert! allBinaryFormats.contents.contains
+    "decodePlannedBuiltinBinarySpanAt typeOid0 values 0 (by omega)"
 
   -- Source contracts remain symbolic and unsupported types are hard errors.
   for source in sources.all do

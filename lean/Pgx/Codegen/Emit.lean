@@ -2962,6 +2962,8 @@ private structure PreparedSpanCachedColumn where
   bindings : List String
   arguments : String
   decodeExpr : String
+  preferredDecodeExpr : String
+  preferredFormat : Option UInt16
   deriving Inhabited
 
 /-- Describe the actual checked portal values that a generated `.many`
@@ -2971,6 +2973,7 @@ private def preparedSpanCachedColumn (plan : NamingPlan) (db : Pgx.DatabaseIR)
     (ref : Pgx.TypeRef) (nullable : Bool) (index : Nat) :
     Except CodegenError PreparedSpanCachedColumn := do
   let use ← resolveTypeUse plan db ref.key
+  let expectedFormat ← resultFormat plan db ref
   let column := s!"column{index}"
   let format := s!"format{index}"
   match codecExpr use nullable with
@@ -2986,9 +2989,19 @@ private def preparedSpanCachedColumn (plan : NamingPlan) (db : Pgx.DatabaseIR)
         arguments := s!"{resolved} {format}"
         decodeExpr := s!"Pgx.Typed.decodePlannedSpan {codec} resolve {resolved} \
           {format} values {index}"
+        preferredDecodeExpr := s!"Pgx.Typed.decodePlannedSpan {codec} resolve {resolved} \
+          {format} values {index}"
+        preferredFormat := none
       }
   | none =>
       let typeOid := s!"typeOid{index}"
+      let preferredDecodeExpr ← match expectedFormat with
+        | 0 => pure s!"Pgx.Typed.decodePlannedBuiltinTextSpanAt {typeOid} \
+            values {index} (by omega)"
+        | 1 => pure s!"Pgx.Typed.decodePlannedBuiltinBinarySpanAt {typeOid} \
+            values {index} (by omega)"
+        | other => throw (.malformedIR s!"logical type {ref.key}"
+            s!"unsupported generated result format {other}; expected 0 or 1")
       pure {
         parameter := s!"    ({typeOid} : UInt32) ({format} : UInt16)"
         bindings := [
@@ -2998,6 +3011,8 @@ private def preparedSpanCachedColumn (plan : NamingPlan) (db : Pgx.DatabaseIR)
         arguments := s!"{typeOid} {format}"
         decodeExpr := s!"Pgx.Typed.decodePlannedBuiltinSpanAt {typeOid} \
           {format} values {index} (by omega)"
+        preferredDecodeExpr
+        preferredFormat := some expectedFormat
       }
 
 private partial def domainChainAux (db : Pgx.DatabaseIR) (key : Pgx.TypeKey)
@@ -3259,6 +3274,17 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
       cachedSpanColumns.toList.map (fun cached => cached.arguments) ++
       ["values", "hValues"]
     let coreCall := String.intercalate " " coreCallParts
+    let preferredRowEqualityCall := String.intercalate " " <|
+      ["decodePreparedSpanRowPreferred_eq_core", "resolve"] ++
+        cachedSpanColumns.toList.map (fun cached => cached.arguments) ++
+        ["values", "hValues", "hFormats"]
+    let preferredIndices := (Array.range cachedSpanColumns.size).filter fun index =>
+      cachedSpanColumns[index]!.preferredFormat.isSome
+    let preferredFormatConditions := preferredIndices.map fun index =>
+      let format := cachedSpanColumns[index]!.preferredFormat.get!
+      s!"format{index} = {format}"
+    let preferredFormatCondition :=
+      String.intercalate " ∧ " preferredFormatConditions.toList
     lines := lines ++ [
       "",
       "@[inline] private def decodePreparedSpanRowCore",
@@ -3293,7 +3319,60 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
     lines := lines ++ [
       "  match validate rowData with",
       "  | .ok refined => pure refined",
-      "  | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)",
+      "  | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)"
+    ]
+    if !preferredIndices.isEmpty then
+      lines := lines ++ [
+        "",
+        "private theorem decodePreparedSpanRowPreferred_eq_core",
+        "    (resolve : Pgx.Typed.TypeResolver)"
+      ]
+      for cached in cachedSpanColumns do
+        lines := lines ++ [cached.parameter]
+      lines := lines ++ [
+        "    (values : Pg.Protocol.DataRowSpans)",
+        s!"    (hValues : values.size = {query.columns.size})",
+        s!"    (hFormats : {preferredFormatCondition}) :",
+        "    (do"
+      ]
+      let mut preferredTheoremDecodedNames : Array String := #[]
+      for i in [0:query.columns.size] do
+        let column := query.columns[i]!
+        let wireName := s!"decodedWire{i}"
+        lines := lines ++ [s!"      let {wireName} ← {cachedSpanColumns[i]!.preferredDecodeExpr}"]
+        match column.logicalType with
+        | none => preferredTheoremDecodedNames := preferredTheoremDecodedNames.push wireName
+        | some _ =>
+            let decodedName := s!"decoded{i}"
+            preferredTheoremDecodedNames := preferredTheoremDecodedNames.push decodedName
+            let refined ← refineLogicalColumnExpression plan db column wireName
+              s!"query {query.name} result {column.name}"
+            lines := lines ++ [s!"      let {decodedName} ← {refined}"]
+      if query.columns.isEmpty then
+        lines := lines ++ ["      let rowData : RowData := RowData.mk"]
+      else
+        let assignments := Array.range query.columns.size |>.map fun i =>
+          columnNames[i]! ++ " := " ++ preferredTheoremDecodedNames[i]!
+        lines := lines ++ ["      let rowData : RowData := { " ++ commaSep assignments ++ " }"]
+      lines := lines ++ [
+        "      match validate rowData with",
+        "      | .ok refined => pure refined",
+        "      | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)",
+        "    ) = " ++ coreCall ++ " := by"
+      ]
+      let formatHypotheses := preferredIndices.map fun index => s!"hFormat{index}"
+      if preferredIndices.size > 1 then
+        lines := lines ++ [
+          "  rcases hFormats with ⟨" ++ String.intercalate ", " formatHypotheses.toList ++ "⟩"
+        ]
+      for index in preferredIndices do
+        lines := lines ++ [s!"  subst format{index}"]
+      lines := lines ++ [
+        "  simp only [decodePreparedSpanRowCore,",
+        "    Pgx.Typed.decodePlannedBuiltinBinarySpanAt_eq_decodePlannedBuiltinSpanAt,",
+        "    Pgx.Typed.decodePlannedBuiltinTextSpanAt_eq_decodePlannedBuiltinSpanAt]"
+      ]
+    lines := lines ++ [
       "",
       "private def decodePreparedSpanRow",
       "    (resolve : Pgx.Typed.TypeResolver)",
@@ -3332,12 +3411,53 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
       lines := lines ++ [s!"    let column{i} := columns[{i}]'(by omega)"]
       for binding in cachedSpanColumns[i]!.bindings do
         lines := lines ++ ["    " ++ binding]
+    if !preferredIndices.isEmpty then
+      lines := lines ++ [
+        s!"    if hFormats : {preferredFormatCondition} then",
+        "      rows.mapM fun values =>",
+        s!"        if hValues : values.size = {query.columns.size} then do"
+      ]
+      let mut preferredSpanDecodedNames : Array String := #[]
+      for i in [0:query.columns.size] do
+        let column := query.columns[i]!
+        let wireName := s!"decodedWire{i}"
+        lines := lines ++ [s!"          let {wireName} ← {cachedSpanColumns[i]!.preferredDecodeExpr}"]
+        match column.logicalType with
+        | none => preferredSpanDecodedNames := preferredSpanDecodedNames.push wireName
+        | some _ =>
+            let decodedName := s!"decoded{i}"
+            preferredSpanDecodedNames := preferredSpanDecodedNames.push decodedName
+            let refined ← refineLogicalColumnExpression plan db column wireName
+              s!"query {query.name} result {column.name}"
+            lines := lines ++ [s!"          let {decodedName} ← {refined}"]
+      if query.columns.isEmpty then
+        lines := lines ++ ["          let rowData : RowData := RowData.mk"]
+      else
+        let assignments := Array.range query.columns.size |>.map fun i =>
+          columnNames[i]! ++ " := " ++ preferredSpanDecodedNames[i]!
+        lines := lines ++ ["          let rowData : RowData := { " ++ commaSep assignments ++ " }"]
+      lines := lines ++ [
+        "          match validate rowData with",
+        "          | .ok refined => pure refined",
+        "          | .error violation => throw (Pgx.Typed.Error.constraintViolation violation)",
+        "        else",
+        s!"          throw (Pgx.Typed.dataRowArityError values.size {query.columns.size})",
+        "    else",
+        "      rows.mapM fun values =>",
+        s!"        if hValues : values.size = {query.columns.size} then",
+        "          " ++ coreCall,
+        "        else",
+        s!"          throw (Pgx.Typed.dataRowArityError values.size {query.columns.size})"
+      ]
+    else
+      lines := lines ++ [
+        "    rows.mapM fun values =>",
+        s!"      if hValues : values.size = {query.columns.size} then",
+        "        " ++ coreCall,
+        "      else",
+        s!"        throw (Pgx.Typed.dataRowArityError values.size {query.columns.size})"
+      ]
     lines := lines ++ [
-      "    rows.mapM fun values =>",
-      s!"      if hValues : values.size = {query.columns.size} then",
-      "        " ++ coreCall,
-      "      else",
-      s!"        throw (Pgx.Typed.dataRowArityError values.size {query.columns.size})",
       "  else",
       "    rows.mapM fun values =>",
       s!"      if values.size = {query.columns.size} then",
@@ -3355,11 +3475,36 @@ private def emitQuery (plan : NamingPlan) (db : Pgx.DatabaseIR)
       "        resolve types columns rows := by",
       "  unfold decodePreparedSpanRows Pgx.Typed.guardedPreparedSpanRows",
       s!"  by_cases hColumns : columns.size = {query.columns.size}",
-      "  · rw [dif_pos hColumns]",
-      "    apply congrArg (fun decode => rows.mapM decode)",
-      "    funext values",
-      s!"    by_cases hValues : values.size = {query.columns.size} <;>",
-      "      simp [decodePreparedSpanRow, hColumns, hValues]",
+      "  · rw [dif_pos hColumns]"
+    ]
+    if !preferredIndices.isEmpty then
+      for i in [0:query.columns.size] do
+        lines := lines ++ [s!"    let column{i} := columns[{i}]'(by omega)"]
+        for binding in cachedSpanColumns[i]!.bindings do
+          lines := lines ++ ["    " ++ binding]
+      lines := lines ++ [
+        s!"    by_cases hFormats : {preferredFormatCondition}",
+        "    · rw [dif_pos hFormats]",
+        "      apply congrArg (fun decode => rows.mapM decode)",
+        "      funext values",
+        s!"      by_cases hValues : values.size = {query.columns.size}",
+        "      · simp only [decodePreparedSpanRow, hColumns, hValues]",
+        "        exact " ++ preferredRowEqualityCall,
+        "      · simp [hValues]",
+        "    · rw [dif_neg hFormats]",
+        "      apply congrArg (fun decode => rows.mapM decode)",
+        "      funext values",
+        s!"      by_cases hValues : values.size = {query.columns.size} <;>",
+        "        simp [decodePreparedSpanRow, hColumns, hValues]"
+      ]
+    else
+      lines := lines ++ [
+        "    apply congrArg (fun decode => rows.mapM decode)",
+        "    funext values",
+        s!"    by_cases hValues : values.size = {query.columns.size} <;>",
+        "      simp [decodePreparedSpanRow, hColumns, hValues]"
+      ]
+    lines := lines ++ [
       "  · rw [dif_neg hColumns]",
       "    apply congrArg (fun decode => rows.mapM decode)",
       "    funext values",
