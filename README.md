@@ -90,8 +90,8 @@ lean = use_extension("@rules_lean//lean:extensions.bzl", "lean")
 lean.nix_toolchain(
     name = "lean4",
     attr = "lean4_upstream_std",
-    nix_file = "@rules_lean//:nixpkgs.nix",
-    nix_file_deps = ["@rules_lean//:nixpkgs.json"],
+    nix_file = "@lean-pgx//third_party/lean:nixpkgs.nix",
+    nix_file_deps = ["@lean-pgx//third_party/lean:nixpkgs.json"],
 )
 use_repo(lean, "lean4_toolchain")
 register_toolchains("@lean4_toolchain//:all")
