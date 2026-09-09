@@ -1,21 +1,23 @@
-import Pgx.Typed.Query
+import Pgx.Test.PreparedRowDispatchEager
 
 /-!
 Focused semantic test and differential benchmark for prepared row-decoder
-dispatch.  The reference performs the former callback selection for every
-row; the candidate is the exact selected-once batch dispatcher used by
-compiled `fetchMany`.
+dispatch.  The reference performs callback selection for every row, the eager
+candidate preserves PGX-13's exact selected-once dispatcher, and the candidate
+is the staged dispatcher used by compiled `fetchMany`.
 
 The semantic corpus exercises the span, materialized-prepared, and generic
 callbacks, including priority, exact malformed-row diagnostics, first-error
-ordering, and a span value that escapes the decoder.  The measured region
-contains only row dispatch/decoding and result consumption; query execution,
-I/O, and fixture construction are outside it.
+ordering, and a span value that escapes the decoder.  Each repeated hot-loop
+iteration contains only row dispatch/decoding and result consumption.  Process
+counters also include fixed fixture construction, semantic preflight, checksum
+verification, and output; query execution and I/O are absent.
 -/
 
 namespace Pgx.Typed.PreparedRowDispatchBenchmarkHarness
 
 open PreparedRowDispatchBenchmark
+open PreparedRowDispatchBenchmarkEager
 
 private def fixtureTypeKey : Pgx.TypeKey :=
   { schema := "pg_catalog", name := "text", kind := .base }
@@ -246,12 +248,18 @@ private def validateSemantics (catalog : ResolvedCatalog database) : IO Nat := d
     let spec := specFor fixture.mode
     let reference := snapshot <|
       decodeReference spec plan catalog actualColumns (spanRows fixture.rows)
+    let eager := snapshot <|
+      decodeEagerCandidate spec plan catalog actualColumns (spanRows fixture.rows)
     let candidate := snapshot <|
       decodeCandidate spec plan catalog actualColumns (spanRows fixture.rows)
     unless reference == fixture.expected do
       throw (IO.userError s!"{fixture.label}: reference differs from expected: {reprStr reference}")
     unless candidate == fixture.expected do
       throw (IO.userError s!"{fixture.label}: candidate differs from expected: {reprStr candidate}")
+    unless eager == fixture.expected do
+      throw (IO.userError s!"{fixture.label}: eager differs from expected: {reprStr eager}")
+    unless reference == eager do
+      throw (IO.userError s!"{fixture.label}: reference and eager differ")
     unless reference == candidate do
       throw (IO.userError s!"{fixture.label}: reference and candidate differ")
   pure semanticCases.size
@@ -383,6 +391,8 @@ private def validateBundleSemantics (catalog : ResolvedCatalog database) : IO Na
     let rows := spanRows fixture.rows
     let reference := snapshot <|
       decodeReference spec plan catalog fixture.columns rows
+    let eager := snapshot <|
+      decodeEagerCandidate spec plan catalog fixture.columns rows
     let candidate := snapshot <|
       decodeCandidate spec plan catalog fixture.columns rows
     let directMany := snapshot <|
@@ -396,6 +406,11 @@ private def validateBundleSemantics (catalog : ResolvedCatalog database) : IO Na
     unless candidate == fixture.expected do
       throw (IO.userError
         s!"{fixture.label}: candidate differs from expected: {reprStr candidate}")
+    unless eager == fixture.expected do
+      throw (IO.userError
+        s!"{fixture.label}: eager differs from expected: {reprStr eager}")
+    unless reference == eager do
+      throw (IO.userError s!"{fixture.label}: reference and eager differ")
     unless reference == candidate do
       throw (IO.userError s!"{fixture.label}: reference and candidate differ")
     unless directMany == guardedRows do
@@ -450,6 +465,34 @@ private def benchmarkSpecFor : DecoderMode → QuerySpec database Unit Nat .many
       decode := benchmarkGenericDecode
     }
 
+private def benchmarkBundle (bundleExpectedColumns : Nat) :
+    PreparedSpanDecoderBundle Nat := {
+  expectedColumns := bundleExpectedColumns
+  row := benchmarkSpanDecode
+  many := guardedPreparedSpanRows bundleExpectedColumns benchmarkSpanDecode
+  many_eq_guardedRow := by
+    intro resolve types columns rows
+    rfl
+}
+
+/-- Matching-bundle fixture deliberately retains every legacy callback so an
+eager QuerySpec projection is visible in the fixed per-batch counter. -/
+private def benchmarkBundleSpec : QuerySpec database Unit Nat .many := {
+  benchmarkSpecFor .span with
+  name := "benchmark-bundle"
+  contractHash := "benchmark-bundle"
+  preparedSpanDecoderBundle := some (benchmarkBundle expectedColumns.size)
+}
+
+/-- Nonmatching-width control keeps the specification-width row guard while
+forcing the staged cold helper on every batch. -/
+private def benchmarkBundleMismatchSpec : QuerySpec database Unit Nat .many := {
+  benchmarkSpecFor .span with
+  name := "benchmark-bundle-mismatch"
+  contractHash := "benchmark-bundle-mismatch"
+  preparedSpanDecoderBundle := some (benchmarkBundle 1)
+}
+
 @[noinline] private def freshRows (rows : @& Array Pg.Protocol.DataRowSpans) :
     Array Pg.Protocol.DataRowSpans :=
   rows
@@ -474,8 +517,19 @@ private def benchmarkSpecFor : DecoderMode → QuerySpec database Unit Nat .many
       checksum := checksum + UInt64.ofNat value
   pure checksum
 
+@[noinline] private def runEager (spec : QuerySpec database Unit Nat .many)
+    (catalog : ResolvedCatalog database)
+    (rows : @& Array Pg.Protocol.DataRowSpans) (iterations : Nat) : Except Error UInt64 := do
+  let mut checksum : UInt64 := 0
+  for _ in [0:iterations] do
+    let decoded ← decodeEagerCandidate spec plan catalog actualColumns (freshRows rows)
+    for value in decoded do
+      checksum := checksum + UInt64.ofNat value
+  pure checksum
+
 private inductive Mode where
   | reference
+  | eager
   | candidate
 
 private def runIterations (mode : Mode) (spec : QuerySpec database Unit Nat .many)
@@ -483,6 +537,7 @@ private def runIterations (mode : Mode) (spec : QuerySpec database Unit Nat .man
     (rows : Array Pg.Protocol.DataRowSpans) (iterations : Nat) : Except Error UInt64 :=
   match mode with
   | .reference => runReference spec catalog rows iterations
+  | .eager => runEager spec catalog rows iterations
   | .candidate => runCandidate spec catalog rows iterations
 
 private def expectOk (label : String) : Except Error α → IO α
@@ -509,22 +564,27 @@ def runMain (args : List String) : IO Unit := do
         ← parseNatural "warmup" warmup)
     | _ => throw (IO.userError <|
         "usage: prepared_row_dispatch_benchmark " ++
-          "(reference|candidate) (span|prepared|generic) (1|55) iterations warmup")
+          "(reference|eager|candidate) " ++
+          "(bundle|bundle_mismatch|span|prepared|generic) " ++
+          "(0|1|55) iterations warmup")
   let mode ← match modeName with
     | "reference" => pure Mode.reference
+    | "eager" => pure Mode.eager
     | "candidate" => pure Mode.candidate
-    | _ => throw (IO.userError "mode must be reference or candidate")
-  let decoderMode ← match decoderName with
-    | "span" => pure DecoderMode.span
-    | "prepared" => pure DecoderMode.prepared
-    | "generic" => pure DecoderMode.generic
-    | _ => throw (IO.userError "decoder must be span, prepared, or generic")
-  unless pageSize == 1 || pageSize == 55 do
-    throw (IO.userError "page size must be 1 or 55")
+    | _ => throw (IO.userError "mode must be reference, eager, or candidate")
+  let spec ← match decoderName with
+    | "bundle" => pure benchmarkBundleSpec
+    | "bundle_mismatch" => pure benchmarkBundleMismatchSpec
+    | "span" => pure (benchmarkSpecFor .span)
+    | "prepared" => pure (benchmarkSpecFor .prepared)
+    | "generic" => pure (benchmarkSpecFor .generic)
+    | _ => throw (IO.userError
+        "decoder must be bundle, bundle_mismatch, span, prepared, or generic")
+  unless pageSize == 0 || pageSize == 1 || pageSize == 55 do
+    throw (IO.userError "page size must be 0, 1, or 55")
   let catalog ← expectOk "catalog fixture" catalogResult
   let legacyCases ← validateSemantics catalog
   let bundleCases ← validateBundleSemantics catalog
-  let spec := benchmarkSpecFor decoderMode
   let rows := Array.replicate pageSize fixtureRow
   let expectedWarmup := UInt64.ofNat (pageSize * 2 * warmup)
   let warmupChecksum ← expectOk "warmup" <|
@@ -536,10 +596,12 @@ def runMain (args : List String) : IO Unit := do
     runIterations mode spec catalog rows iterations
   unless checksum == expected do
     throw (IO.userError "measured checksum mismatch")
-  IO.println <| s!"benchmark=pgx_prepared_row_dispatch_v1 mode={modeName} decoder={decoderName} " ++
+  IO.println <| s!"benchmark=pgx_prepared_row_dispatch_v4 mode={modeName} decoder={decoderName} " ++
     s!"page_size={pageSize} iterations={iterations} warmup={warmup} checksum={checksum}"
   IO.println <| s!"prepared_row_dispatch_validation=pass cases={legacyCases + bundleCases} " ++
-    "callbacks=bundle,span,prepared,generic malformed=pass first_error=pass escape=pass"
+    "selectors=reference,eager,candidate " ++
+    "decoders=bundle,bundle_mismatch,span,prepared,generic " ++
+    "malformed=pass first_error=pass escape=pass"
 
 end Pgx.Typed.PreparedRowDispatchBenchmarkHarness
 
