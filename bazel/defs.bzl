@@ -438,7 +438,15 @@ def _lean_pg_generate_impl(ctx):
             contract_hash = depset([contract_out]),
             compatibility_hash = depset([compatibility_out]),
         ),
-        _LeanGeneratedSourceInfo(lean_srcs = depset(lean_srcs)),
+        _LeanGeneratedSourceInfo(
+            lean_srcs = depset(lean_srcs),
+            module_deps = {
+                types_out: [],
+                schema_out: [types_out],
+                constraints_out: [schema_out],
+                root_out: [types_out, schema_out, constraints_out] + query_outs,
+            } | {query: [schema_out] for query in query_outs},
+        ),
         LeanPgGenInfo(
             lean_srcs = depset(lean_srcs),
             schema_ir = ir_out,
@@ -866,16 +874,9 @@ def lean_pg_library(
         server_majors = selected_majors,
         visibility = visibility,
     )
-    srcs_name = name + "_srcs"
-    native.filegroup(
-        name = srcs_name,
-        srcs = [":" + gen_name],
-        output_group = "lean_srcs",
-        visibility = ["//visibility:private"],
-    )
     lean_library(
         name = name,
-        srcs = [":" + srcs_name],
+        srcs = [":" + gen_name],
         strip_module_prefix = native.package_name(),
         deps = [
             _PGX_TYPED,
