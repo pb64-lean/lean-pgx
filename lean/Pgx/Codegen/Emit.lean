@@ -140,7 +140,8 @@ private def commaSep (values : Array String) : String :=
   String.intercalate ", " values.toList
 
 private def arrayExpr (values : Array String) : String :=
-  "#[" ++ commaSep values ++ "]"
+  -- Separate elements to keep the parser's column scans short.
+  "#[" ++ String.intercalate ",\n    " values.toList ++ "]"
 
 private def recordExpr (body : String) : String :=
   "{ " ++ body ++ " }"

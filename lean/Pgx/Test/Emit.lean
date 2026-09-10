@@ -821,7 +821,7 @@ def main : IO UInt32 := do
     "abbrev AppEmailAddress := AppEmailAddress.Value"
   assert! sources.schema.contents.contains "def database : Pgx.Typed.DatabaseDesc"
   assert! sources.schema.contents.contains "serverMajors := #[18]"
-  assert! !(sources.schema.contents.contains "serverMajors := #[17, 18]")
+  assert! !(sources.schema.contents.contains "serverMajors := #[17,\n    18]")
   assert! legacySources.schema.contents.contains "serverMajors := #[18]"
   assert! sources.schema.contents.contains "def attach (conn : Pg.Connection)"
   assert! sources.schema.contents.contains "abbrev Row := { value : Data // ValidPred value }"
@@ -883,7 +883,7 @@ def main : IO UInt32 := do
   assert! !(getUser.contents.contains "Pgx.Typed.queryCacheKey")
   -- The exact int8 wire result opts into binary, while the domain parameter
   -- and text/custom result codecs remain on their declared text path.
-  assert! getUser.contents.contains "resultFormats := #[1, 0, 0]"
+  assert! getUser.contents.contains "resultFormats := #[1,\n    0,\n    0]"
   assert! getUser.contents.contains "preparedEncode := some encodePreparedParams"
   assert! getUser.contents.contains "preparedDecode := some decodePreparedRow"
   assert! getUser.contents.contains "preparedSpanDecode := some decodePreparedSpanRow"
@@ -935,7 +935,7 @@ def main : IO UInt32 := do
   assert! listUsers.contents.contains "email : Option (AppDb.Types.AppEmailAddress)"
   assert! listUsers.contents.contains "| none => pure none"
   assert! listUsers.contents.contains "| some present => some <$> (do"
-  assert! listUsers.contents.contains "resultFormats := #[1, 0, 0]"
+  assert! listUsers.contents.contains "resultFormats := #[1,\n    0,\n    0]"
   -- `.many` queries cache the checked runtime descriptors once per result
   -- batch and publish a proof-backed row/batch decoder bundle.  The cached
   -- values deliberately come from the actual portal columns, not static IR.
@@ -987,7 +987,7 @@ def main : IO UInt32 := do
   assert! mixedFormats.contents.contains
     "Option.map Pg.binaryInt32 params.count"
   assert! mixedFormats.contents.contains "Pg.binaryInt16 params.rank"
-  assert! mixedFormats.contents.contains "resultFormats := #[1, 0]"
+  assert! mixedFormats.contents.contains "resultFormats := #[1,\n    0]"
   assert! mixedFormats.contents.contains
     "decodeResolved (External.citextCodec).option"
   assert! mixedFormats.contents.contains
@@ -999,9 +999,9 @@ def main : IO UInt32 := do
   assert! mixedFormats.contents.contains
     "plannedBuiltinFormat (Pg.binaryInt16 params.rank)"
   assert! mixedFormats.contents.contains
-    "values := #[Pg.PgEncode.encode (Option.map Pg.binaryInt32 params.count), Pg.PgEncode.encode (Pg.binaryInt16 params.rank)]"
+    "values := #[Pg.PgEncode.encode (Option.map Pg.binaryInt32 params.count),\n    Pg.PgEncode.encode (Pg.binaryInt16 params.rank)]"
   assert! mixedFormats.contents.contains
-    "formats := #[Pgx.Typed.plannedBuiltinFormat (Option.map Pg.binaryInt32 params.count), Pgx.Typed.plannedBuiltinFormat (Pg.binaryInt16 params.rank)]"
+    "formats := #[Pgx.Typed.plannedBuiltinFormat (Option.map Pg.binaryInt32 params.count),\n    Pgx.Typed.plannedBuiltinFormat (Pg.binaryInt16 params.rank)]"
   assert! !(mixedFormats.contents.contains "encodePlannedBuiltin")
   assert! mixedFormats.contents.contains
     "decodePlanned (External.citextCodec).option resolve types[1]!"
